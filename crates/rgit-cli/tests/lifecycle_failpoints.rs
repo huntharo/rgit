@@ -16,7 +16,7 @@ use lifecycle_support::crash::{
     Published, assert_unpublished_untouched, classify_head, classify_index, expect_abort,
     expect_injected, with_failpoint,
 };
-use lifecycle_support::driver::{Driver, ok, ok_quiet, refused};
+use lifecycle_support::driver::{self, Driver, ok, ok_quiet, refused};
 use lifecycle_support::model::{Hash, Head, Model};
 use lifecycle_support::observe::{self, assert_state_with};
 use lifecycle_support::proc::{
@@ -237,18 +237,30 @@ fn commit_case(hash: Hash, shape: Shape, point: &str, mode: Mode) -> Result {
     if classify_index(&old, &new, 0)? != Published::Old {
         return Err("commit changed index entries".into());
     }
+    // Never infer "unchanged" from the failure: classify from a fresh
+    // process, then hold it to the documented expectation for the point.
     let head_state = classify_head(&old, &new, 0)?;
-    match point {
-        // The first lock taken has not been renamed: nothing is published.
-        "lock.acquired" | "lock.before-rename" | "commit.objects-written" | "commit.ref-locked"
-            if head_state != Published::Old =>
-        {
-            return Err(format!("HEAD published at {point}").into());
-        }
-        _ => {}
+    // The ref lock is commit's first (and only) lock: before its rename
+    // nothing is published; lock.after-rename fires after the rename, before
+    // the directory sync and reflog append, so the new value is visible.
+    let expected = if point == "lock.after-rename" {
+        Published::New
+    } else {
+        Published::Old
+    };
+    if head_state != expected {
+        return Err(
+            format!("HEAD is {head_state:?} after {point}, expected {expected:?} ({oid})").into(),
+        );
     }
-    if head_state == Published::New {
-        eprintln!("NOTE: {hash:?} {shape:?} {point} {mode:?}: commit {oid} already published");
+    let log = reflog_path(&s, shape);
+    let log_rel = log.strip_prefix(s.dir())?.to_path_buf();
+    if snapshot(s.dir())?.get(&log_rel) != before.get(&log_rel) {
+        return Err(format!(
+            "{} changed although the crash precedes reflog append",
+            log.display()
+        )
+        .into());
     }
     assert_unpublished_untouched(
         &before,
@@ -300,22 +312,181 @@ fn commit_case(hash: Hash, shape: Shape, point: &str, mode: Mode) -> Result {
     if (mode == Mode::Error || point == "commit.objects-written") && !locks.is_empty() {
         return Err(format!("{point} {mode:?} left locks {locks:?}").into());
     }
-    let root = s.root();
-    stale_locks_refuse_then_clear(&s, &locks, &mut || {
-        Driver::Rgit.commit(&root, &["interrupted"], when)
-    })?;
-
     if head_state == Published::Old {
+        let root = s.root();
+        stale_locks_refuse_then_clear(&s, &locks, &mut || {
+            Driver::Rgit.commit(&root, &["interrupted"], when)
+        })?;
         ok_quiet(
             &Driver::Rgit.commit(&s.root(), &["interrupted"], when)?,
             "retry commit",
         )?;
+        if let Head::Detached(_) = &new.checkouts[0].head {
+            assert_eq!(observe::symbolic_head(&s.root())?, None);
+        }
+        s.model = new;
+        return assert_state_with(&s.model, false);
     }
-    if let Head::Detached(_) = &new.checkouts[0].head {
-        assert_eq!(observe::symbolic_head(&s.root())?, None);
+
+    // Published (lock.after-rename): the published ref's own lock is gone by
+    // definition. Requirement (coordinator, G1 WP3 item 2): no lock at all
+    // remains. Checked last so the recovery path below still runs and
+    // reports; ADR 0003 invariant 2 alone would tolerate a stale lock.
+    if locks.contains(&ref_lock) {
+        return Err(format!("published ref still has its lock {}", ref_lock.display()).into());
     }
+    let leftover = (!locks.is_empty()).then(|| {
+        format!(
+            "{point} {mode:?}: ref published but stale lock(s) {locks:?} remain; \
+             requirement is no leftover lock after publication"
+        )
+    });
     s.model = new;
-    assert_state_with(&s.model, head_state == Published::New)?;
+    // Published without its reflog entry; a further commit must be refused
+    // by any stale lock, then succeed and log from the published value.
+    follow_up_commit_logs_from(&mut s, shape, &oid, &locks)?;
+    match leftover {
+        Some(message) => Err(message.into()),
+        None => Ok(()),
+    }
+}
+
+fn reflog_path(s: &Scenario, shape: Shape) -> PathBuf {
+    match shape {
+        Shape::Detached => s.root().join(".git/logs/HEAD"),
+        _ => s.root().join(".git/logs/refs/heads/main"),
+    }
+}
+
+/// Commit a further change with rgit and require its reflog line to chain
+/// from `published` (the value whose own entry is missing).
+fn follow_up_commit_logs_from(
+    s: &mut Scenario,
+    shape: Shape,
+    published: &str,
+    stale_locks: &[PathBuf],
+) -> Result {
+    s.model
+        .write(0, b"follow-up", b"after partial publication\n")?;
+    s.add(0, &[b"follow-up"])?;
+    let when = s.model.tick();
+    let root = s.root();
+    stale_locks_refuse_then_clear(s, stale_locks, &mut || {
+        Driver::Rgit.commit(&root, &["follow-up"], when)
+    })?;
+    ok_quiet(
+        &Driver::Rgit.commit(&s.root(), &["follow-up"], when)?,
+        "follow-up commit",
+    )?;
+    let next = s.model.commit(0, &["follow-up"], when);
+    assert_state_with(&s.model, true)?;
+    let text = fs::read_to_string(reflog_path(s, shape))?;
+    let last = text.lines().last().unwrap_or_default();
+    if !last.starts_with(&format!("{published} {next} ")) {
+        return Err(
+            format!("follow-up reflog line {last:?} should be {published} -> {next}").into(),
+        );
+    }
+    Ok(())
+}
+
+/// Restores a file's permissions however the test exits.
+#[cfg(unix)]
+struct ReadOnly(PathBuf);
+
+#[cfg(unix)]
+impl ReadOnly {
+    fn new(path: PathBuf) -> Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444))?;
+        Ok(Self(path))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReadOnly {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o644));
+    }
+}
+
+/// Partial success: the ref is published but the reflog append fails
+/// (existing reflog made read-only). rgit exits 128 saying the reference
+/// "was updated"; a fresh process must see the new ref, an exact model tree,
+/// no new reflog entry, fsck clean and no lock; after restoring permissions
+/// the next commit succeeds.
+#[cfg(unix)]
+fn reflog_append_failure_after_publication(driver: Driver) -> Result {
+    if driver::lacks(
+        driver,
+        &["commit"],
+        "reflog_append_failure_after_publication",
+    ) {
+        return Ok(());
+    }
+    for hash in Hash::ALL {
+        for shape in [Shape::Branch, Shape::Detached] {
+            let mut s = based(hash, shape)?;
+            let log = reflog_path(&s, shape);
+            if !log.is_file() {
+                return Err(format!(
+                    "{hash:?} {shape:?}: no reflog at {} after base commit",
+                    log.display()
+                )
+                .into());
+            }
+            s.model.write(0, b"a", b"published without reflog\n")?;
+            s.add(0, &[b"a"])?;
+            let old = s.model.clone();
+            let mut new = s.model.clone();
+            let when = new.tick();
+            let oid = new.commit(0, &["partial"], when);
+            let log_before = fs::read(&log)?;
+            let head_log = s.root().join(".git/logs/HEAD");
+            let head_log_before = fs::read(&head_log).ok();
+            let guard = ReadOnly::new(log.clone())?;
+            let output = Driver::Rgit.commit(&s.root(), &["partial"], when)?;
+            let context = format!("{hash:?} {shape:?} reflog append failure");
+            refused(&output, 128, &context)?;
+            if !String::from_utf8_lossy(&output.stderr).contains("was updated") {
+                return Err(format!(
+                    "{context}: stderr must say the ref was updated: {}",
+                    describe(&output)
+                )
+                .into());
+            }
+            // Fresh-process classification, not inference from the exit code.
+            if classify_head(&old, &new, 0)? != Published::New {
+                return Err(format!("{context}: ref not published").into());
+            }
+            if classify_index(&old, &new, 0)? != Published::Old {
+                return Err(format!("{context}: index entries changed").into());
+            }
+            if fs::read(&log)? != log_before {
+                return Err(format!("{context}: reflog gained an entry").into());
+            }
+            if shape == Shape::Branch {
+                let head_log_after = fs::read(&head_log).ok();
+                eprintln!(
+                    "NOTE: {context}: HEAD reflog {}",
+                    if head_log_after == head_log_before {
+                        "unchanged"
+                    } else {
+                        "appended"
+                    }
+                );
+            }
+            let locks = observe::locks(&s.root().join(".git"))?;
+            if !locks.is_empty() {
+                return Err(format!("{context}: leftover locks {locks:?}").into());
+            }
+            drop(guard);
+            s.model = new;
+            assert_state_with(&s.model, true)?; // commit body/tree, fsck, status
+            follow_up_commit_logs_from(&mut s, shape, &oid, &[])?;
+        }
+    }
     Ok(())
 }
 
@@ -368,11 +539,17 @@ fn run_matrix(f: impl Fn(Hash, &str, Mode) -> Result, points: &[&str], label: &s
     matrix(cases)
 }
 
-fn interrupted_add(_: Driver) -> Result {
+fn interrupted_add(driver: Driver) -> Result {
+    if driver::lacks(driver, &["add"], "interrupted_add") {
+        return Ok(());
+    }
     run_matrix(add_case, &ADD_POINTS, "add")
 }
 
-fn interrupted_commit_on_branch(_: Driver) -> Result {
+fn interrupted_commit_on_branch(driver: Driver) -> Result {
+    if driver::lacks(driver, &["commit"], "interrupted_commit_on_branch") {
+        return Ok(());
+    }
     run_matrix(
         |h, p, m| commit_case(h, Shape::Branch, p, m),
         &COMMIT_POINTS,
@@ -380,7 +557,14 @@ fn interrupted_commit_on_branch(_: Driver) -> Result {
     )
 }
 
-fn interrupted_root_commit_on_unborn_branch(_: Driver) -> Result {
+fn interrupted_root_commit_on_unborn_branch(driver: Driver) -> Result {
+    if driver::lacks(
+        driver,
+        &["commit"],
+        "interrupted_root_commit_on_unborn_branch",
+    ) {
+        return Ok(());
+    }
     run_matrix(
         |h, p, m| commit_case(h, Shape::Unborn, p, m),
         &COMMIT_POINTS,
@@ -388,7 +572,10 @@ fn interrupted_root_commit_on_unborn_branch(_: Driver) -> Result {
     )
 }
 
-fn interrupted_commit_on_detached_head(_: Driver) -> Result {
+fn interrupted_commit_on_detached_head(driver: Driver) -> Result {
+    if driver::lacks(driver, &["commit"], "interrupted_commit_on_detached_head") {
+        return Ok(());
+    }
     run_matrix(
         |h, p, m| commit_case(h, Shape::Detached, p, m),
         &COMMIT_POINTS,
@@ -396,8 +583,17 @@ fn interrupted_commit_on_detached_head(_: Driver) -> Result {
     )
 }
 
-fn interrupted_init(_: Driver) -> Result {
+fn interrupted_init(driver: Driver) -> Result {
+    if driver::lacks(driver, &["init"], "interrupted_init") {
+        return Ok(());
+    }
     run_matrix(|h, _, m| init_case(h, m), &["init.before-publish"], "init")
+}
+
+#[cfg(unix)]
+mod partial {
+    use super::*;
+    rgit_only!(reflog_append_failure_after_publication);
 }
 
 rgit_only!(

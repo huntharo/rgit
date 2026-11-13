@@ -198,11 +198,18 @@ mod apfs {
 
 #[cfg(target_os = "macos")]
 fn apfs_live_mapping_add_commit(driver: Driver) -> Result {
+    if lifecycle_support::driver::lacks(driver, &["add", "commit"], "apfs_live_mapping_add_commit")
+    {
+        return Ok(());
+    }
     apfs::gate(driver, "live")
 }
 
 #[cfg(target_os = "macos")]
 fn apfs_final_unmap_add_commit(driver: Driver) -> Result {
+    if lifecycle_support::driver::lacks(driver, &["add", "commit"], "apfs_final_unmap_add_commit") {
+        return Ok(());
+    }
     apfs::gate(driver, "final-unmap")
 }
 
@@ -377,11 +384,17 @@ mod special {
 
 #[cfg(unix)]
 fn explicit_fifo_and_socket_paths_never_block_or_stage(driver: Driver) -> Result {
+    if lifecycle_support::driver::lacks(driver, &["add"], "explicit_fifo_and_socket_paths") {
+        return Ok(());
+    }
     special::explicit(driver)
 }
 
 #[cfg(unix)]
 fn directory_pathspec_with_fifo_and_socket_never_blocks(driver: Driver) -> Result {
+    if lifecycle_support::driver::lacks(driver, &["add"], "directory_pathspec_with_fifo") {
+        return Ok(());
+    }
     special::directory(driver)
 }
 

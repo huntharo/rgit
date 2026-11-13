@@ -8,7 +8,7 @@ mod lifecycle_support;
 use std::fs;
 
 use lifecycle_support::Scenario;
-use lifecycle_support::driver::{Driver, ok, refused};
+use lifecycle_support::driver::{self, Driver, ok, refused};
 use lifecycle_support::model::{Hash, Model, tree_id};
 use lifecycle_support::observe::{self, assert_state, c_git_hash_object};
 use lifecycle_support::proc::{Preserve, Result, assert_preserved, git, git_text, snapshot};
@@ -149,6 +149,9 @@ fn init_stage_commit(driver: Driver) -> Result {
 }
 
 fn init_reports_and_refuses_existing(driver: Driver) -> Result {
+    if driver::lacks(driver, &["init"], "init_reports_and_refuses_existing") {
+        return Ok(());
+    }
     let s = Scenario::init(driver, Hash::Sha1, "main")?;
     // Non-quiet init prints the absolute Git directory (rgit CLI contract).
     let output = driver.init(s.dir(), &["second"])?;
@@ -495,6 +498,9 @@ fn linked_worktree_isolation(driver: Driver) -> Result {
 }
 
 fn nothing_to_commit_and_allow_empty(driver: Driver) -> Result {
+    if driver::lacks(driver, &["commit"], "nothing_to_commit_and_allow_empty") {
+        return Ok(());
+    }
     let mut s = Scenario::init(driver, Hash::Sha1, "main")?;
     s.model.write(0, b"f", b"x\n")?;
     s.add(0, &[b"f"])?;
@@ -531,6 +537,9 @@ fn nothing_to_commit_and_allow_empty(driver: Driver) -> Result {
 /// Same-size rewrite in the same second with mtime restored right after add
 /// (racy-clean): status must report it and the next add must stage it.
 fn racy_same_second_edit(driver: Driver) -> Result {
+    if driver::lacks(driver, &["add"], "racy_same_second_edit") {
+        return Ok(());
+    }
     for hash in Hash::ALL {
         let mut s = Scenario::init(driver, hash, "main")?;
         let path = s.root().join("racy");

@@ -8,10 +8,12 @@ use std::sync::OnceLock;
 
 use super::proc::{Result, describe, home_for, identity, isolate, run};
 
-/// THE integration switch. While false, rgit-driver tests probe whether the
-/// binary implements init/add/commit and print an honest SKIP line if it
-/// still returns the "not implemented" stub or lacks the subcommand. Flip to
-/// true at integration: every rgit-driver test then runs unconditionally.
+/// THE integration switch. While false, each of `rgit init/add/commit` is
+/// probed: a command that still returns the "not implemented" stub (or is
+/// missing) is performed by C Git for *setup steps only*, with a NOTE line,
+/// and scenarios whose subject is that command print an explicit SKIP. Flip
+/// to true at integration: every rgit-driver step then uses rgit, the
+/// fallback is unreachable and nothing is skipped.
 pub const RGIT_WRITES_INTEGRATED: bool = false;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,8 +45,19 @@ impl Driver {
         command
     }
 
+    /// The driver that actually performs `cmd` (C Git stands in for an rgit
+    /// command that is not implemented yet; see RGIT_WRITES_INTEGRATED).
+    pub fn performer(self, cmd: &str) -> Driver {
+        if self == Driver::Rgit && !supports(cmd) {
+            note_fallback(cmd);
+            Driver::CGit
+        } else {
+            self
+        }
+    }
+
     pub fn init_cmd<S: AsRef<OsStr>>(self, parent: &Path, args: &[S]) -> Command {
-        let mut command = self.command(parent);
+        let mut command = self.performer("init").command(parent);
         command.arg("init").args(args);
         command
     }
@@ -54,7 +67,7 @@ impl Driver {
     }
 
     pub fn add_cmd<S: AsRef<OsStr>>(self, dir: &Path, paths: &[S]) -> Command {
-        let mut command = self.command(dir);
+        let mut command = self.performer("add").command(dir);
         command.arg("add").arg("--").args(paths);
         command
     }
@@ -64,7 +77,7 @@ impl Driver {
     }
 
     pub fn commit_cmd(self, dir: &Path, parts: &[&str], when: i64, extra: &[&str]) -> Command {
-        let mut command = self.command(dir);
+        let mut command = self.performer("commit").command(dir);
         command.args(["commit", "-q"]).args(extra);
         for part in parts {
             command.arg("-m").arg(part);
@@ -142,53 +155,96 @@ fn brief(what: &str, output: &Output) -> String {
     )
 }
 
-fn probe() -> std::result::Result<(), String> {
-    let run_probe = || -> Result<Option<String>> {
+/// Probe one command in a fresh sandbox; prerequisites come from C Git so
+/// each command is judged on its own. `None` means implemented (any result
+/// other than the stub counts, so genuine bugs fail scenarios rather than
+/// skipping them).
+fn probe(cmd: &str) -> Option<String> {
+    let attempt = || -> Result<Option<String>> {
         let sandbox = super::proc::sandbox()?;
         let parent = sandbox.path();
-        let output = Driver::Rgit.init(parent, &["-q", "probe"])?;
-        if stub_refusal(&output) {
-            return Ok(Some(brief("init", &output)));
-        }
         let repo = parent.join("probe");
-        std::fs::create_dir_all(&repo)?;
-        std::fs::write(repo.join("probe-file"), b"probe\n")?;
-        let output = Driver::Rgit.add(&repo, &["probe-file"])?;
-        if stub_refusal(&output) {
-            return Ok(Some(brief("add", &output)));
+        if cmd == "init" {
+            // Judge the stub by its refusal, not by directory creation.
+            std::fs::create_dir(&repo)?;
+        } else {
+            ok(&Driver::CGit.init(parent, &["-q", "probe"])?, "probe init")?;
+            std::fs::write(repo.join("probe-file"), b"probe\n")?;
         }
-        let output = Driver::Rgit.commit(&repo, &["probe"], 1_767_225_600)?;
-        if stub_refusal(&output) {
-            return Ok(Some(brief("commit", &output)));
+        if cmd == "commit" {
+            ok(&Driver::CGit.add(&repo, &["probe-file"])?, "probe add")?;
         }
-        // Any other result, including a genuine failure, counts as
-        // implemented so real bugs fail the scenarios instead of skipping.
-        Ok(None)
+        let mut command = Driver::Rgit.command(if cmd == "init" { parent } else { &repo });
+        match cmd {
+            "init" => command.args(["init", "-q", "probe"]),
+            "add" => command.args(["add", "probe-file"]),
+            _ => {
+                identity(&mut command, 1_767_225_600);
+                command.args(["commit", "-q", "-m", "probe"])
+            }
+        };
+        let output = run(&mut command)?;
+        Ok(stub_refusal(&output).then(|| brief(cmd, &output)))
     };
-    match run_probe() {
-        Ok(None) => Ok(()),
-        Ok(Some(reason)) => Err(reason),
-        Err(error) => Err(format!("probe error: {error}")),
+    attempt().unwrap_or_else(|error| Some(format!("probe error: {error}")))
+}
+
+fn capability(cmd: &str) -> &'static Option<String> {
+    static INIT: OnceLock<Option<String>> = OnceLock::new();
+    static ADD: OnceLock<Option<String>> = OnceLock::new();
+    static COMMIT: OnceLock<Option<String>> = OnceLock::new();
+    let cell = match cmd {
+        "init" => &INIT,
+        "add" => &ADD,
+        _ => &COMMIT,
+    };
+    cell.get_or_init(|| probe(cmd))
+}
+
+/// Whether `rgit <cmd>` is implemented (always true once integrated).
+pub fn supports(cmd: &str) -> bool {
+    RGIT_WRITES_INTEGRATED || capability(cmd).is_none()
+}
+
+fn note_fallback(cmd: &str) {
+    static NOTED: OnceLock<std::sync::Mutex<Vec<String>>> = OnceLock::new();
+    let noted = NOTED.get_or_init(Default::default);
+    if let Ok(mut noted) = noted.lock()
+        && !noted.iter().any(|c| c == cmd)
+    {
+        noted.push(cmd.to_owned());
+        eprintln!(
+            "NOTE: rgit {cmd} not implemented yet; C Git performs rgit-driver {cmd} setup steps ({})",
+            capability(cmd).as_deref().unwrap_or_default()
+        );
     }
 }
 
-/// `Some(Driver::Rgit)` if rgit-driver scenarios must run; otherwise prints
-/// an explicit SKIP line naming `scenario` and returns None.
+/// `Some(Driver::Rgit)` if at least one rgit write command is implemented;
+/// otherwise prints an explicit SKIP line naming `scenario`.
 pub fn rgit_or_skip(scenario: &str) -> Option<Driver> {
-    if RGIT_WRITES_INTEGRATED {
+    if ["init", "add", "commit"].iter().any(|cmd| supports(cmd)) {
         return Some(Driver::Rgit);
     }
-    static PROBE: OnceLock<std::result::Result<(), String>> = OnceLock::new();
-    match PROBE.get_or_init(probe) {
-        Ok(()) => Some(Driver::Rgit),
-        Err(reason) => {
-            eprintln!(
-                "SKIP: rgit driver for {scenario}: rgit write commands not integrated yet ({})",
-                reason
-            );
-            None
-        }
+    eprintln!(
+        "SKIP: rgit driver for {scenario}: rgit write commands not integrated yet ({})",
+        capability("init").as_deref().unwrap_or_default()
+    );
+    None
+}
+
+/// For scenarios whose subject is specific rgit commands: true (after an
+/// explicit SKIP line) if `driver` is rgit and any of `cmds` is still a stub.
+pub fn lacks(driver: Driver, cmds: &[&str], scenario: &str) -> bool {
+    if driver != Driver::Rgit {
+        return false;
     }
+    let missing: Vec<&str> = cmds.iter().copied().filter(|cmd| !supports(cmd)).collect();
+    if missing.is_empty() {
+        return false;
+    }
+    eprintln!("SKIP: rgit driver for {scenario}: rgit {missing:?} not implemented yet");
+    true
 }
 
 pub fn os(bytes: &[u8]) -> OsString {

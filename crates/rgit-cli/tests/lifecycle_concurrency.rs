@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 
 use lifecycle_support::Scenario;
 use lifecycle_support::crash::{Paused, exists, run_expect_no_pause};
-use lifecycle_support::driver::{Driver, ok, refused};
+use lifecycle_support::driver::{self, Driver, ok, refused};
 use lifecycle_support::model::Hash;
+use lifecycle_support::observe;
 use lifecycle_support::proc::{Preserve, Result, Snap, assert_preserved, describe, git, snapshot};
 
 /// Committed `a`, `b` on `main`.
@@ -51,6 +52,9 @@ fn inode(_path: &Path) -> Result<u64> {
 // Pre-existing locks (both drivers).
 
 fn preexisting_index_lock_refuses_add(driver: Driver) -> Result {
+    if driver::lacks(driver, &["add"], "preexisting_index_lock_refuses_add") {
+        return Ok(());
+    }
     for hash in Hash::ALL {
         let mut s = based(driver, hash)?;
         let lock = s.root().join(".git/index.lock");
@@ -85,6 +89,9 @@ enum HeadShape {
 }
 
 fn preexisting_ref_lock_refuses_commit(driver: Driver) -> Result {
+    if driver::lacks(driver, &["commit"], "preexisting_ref_lock_refuses_commit") {
+        return Ok(());
+    }
     for hash in Hash::ALL {
         for shape in [HeadShape::Branch, HeadShape::Unborn, HeadShape::Detached] {
             let mut s = match shape {
@@ -164,6 +171,9 @@ both_drivers!(
 /// `commit.ref-locked`); the second is refused with exit 128, never reaches
 /// the pause, and leaves the ref and the first writer's lock untouched.
 fn concurrent_commits_one_winner(driver: Driver) -> Result {
+    if driver::lacks(driver, &["commit"], "concurrent_commits_one_winner") {
+        return Ok(());
+    }
     for hash in Hash::ALL {
         let mut s = based(driver, hash)?;
         s.model.write(0, b"a", b"race\n")?;
@@ -179,27 +189,43 @@ fn concurrent_commits_one_winner(driver: Driver) -> Result {
         if !exists(&lock) {
             return Err("commit.ref-locked paused without refs/heads/main.lock".into());
         }
-        let held = fs::read(&lock)?;
-        let held_inode = inode(&lock)?;
+        // Every lock the winner holds (the branch lock, plus HEAD.lock when
+        // the implementation also locks HEAD for its reflog, as C Git does).
+        let held: Vec<(PathBuf, Vec<u8>, u64)> = observe::locks(&s.root().join(".git"))?
+            .into_iter()
+            .map(|path| Ok((fs::read(&path)?, inode(&path)?, path)))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(|(bytes, ino, path)| (path, bytes, ino))
+            .collect();
         let before = snapshot(s.dir())?;
         let loser = run_expect_no_pause(
             &mut driver.commit_cmd(&s.root(), &["writer B"], when_b, &[]),
             "commit.ref-locked",
         )?;
         refused(&loser, 128, "losing concurrent commit")?;
-        mentions(&loser, "main.lock")?;
+        let stderr = String::from_utf8_lossy(&loser.stderr).into_owned();
+        if !held.iter().any(|(path, _, _)| {
+            stderr.contains(&*path.to_string_lossy())
+                || path
+                    .file_name()
+                    .is_some_and(|n| stderr.contains(&*n.to_string_lossy()))
+        }) {
+            return Err(format!(
+                "loser's diagnostic names none of the held locks {held:?}: {stderr}"
+            )
+            .into());
+        }
         assert_preserved(
             &before,
             &snapshot(s.dir())?,
             Preserve::AllowNewObjects,
             "loser",
         )?;
-        assert_eq!(fs::read(&lock)?, held, "loser touched the winner's lock");
-        assert_eq!(
-            inode(&lock)?,
-            held_inode,
-            "loser replaced the winner's lock"
-        );
+        for (path, bytes, ino) in &held {
+            assert_eq!(&fs::read(path)?, bytes, "loser touched {}", path.display());
+            assert_eq!(inode(path)?, *ino, "loser replaced {}", path.display());
+        }
         let output = winner.release()?;
         ok(&output, "winning commit")?;
         let winner_oid = s.model.commit(0, &["writer A"], when_a);
@@ -215,6 +241,9 @@ fn concurrent_commits_one_winner(driver: Driver) -> Result {
 /// exactly as the competitor left it. Covers born and unborn branches and
 /// both rgit and C Git competitors.
 fn cas_loser_leaves_refs_byte_identical(driver: Driver) -> Result {
+    if driver::lacks(driver, &["commit"], "cas_loser_leaves_refs_byte_identical") {
+        return Ok(());
+    }
     for hash in Hash::ALL {
         for unborn in [false, true] {
             for competitor in [Driver::Rgit, Driver::CGit] {
@@ -256,6 +285,9 @@ fn cas_loser_leaves_refs_byte_identical(driver: Driver) -> Result {
 /// The second `add` is refused while the first holds `index.lock` and never
 /// unlinks it; the first then publishes only its own change.
 fn second_add_refused_while_index_locked(driver: Driver) -> Result {
+    if driver::lacks(driver, &["add"], "second_add_refused_while_index_locked") {
+        return Ok(());
+    }
     for hash in Hash::ALL {
         let mut s = based(driver, hash)?;
         s.model.write(0, b"a", b"first writer\n")?;
@@ -293,6 +325,10 @@ fn second_add_refused_while_index_locked(driver: Driver) -> Result {
 fn replaced_lock_never_published_or_unlinked(driver: Driver) -> Result {
     for hash in Hash::ALL {
         for commit in [false, true] {
+            let subject = if commit { "commit" } else { "add" };
+            if driver::lacks(driver, &[subject], &format!("replaced_lock ({subject})")) {
+                continue;
+            }
             let mut s = based(driver, hash)?;
             s.model.write(0, b"a", b"paused writer\n")?;
             let (lock, mut command, point) = if commit {
