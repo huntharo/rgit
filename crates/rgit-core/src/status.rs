@@ -34,6 +34,8 @@ impl Repository {
         let head_id = self.inner.head_tree_id_or_empty()?.detach();
         let head = self.tree_entries(crate::BStr::new(head_id.to_string().as_bytes()))?;
         let staged = staged_changes(&head, &entries);
+        let indexed_paths: BTreeSet<_> =
+            entries.iter().map(|entry| entry.path.as_slice()).collect();
         let entries_by_path: BTreeMap<_, _> = entries
             .iter()
             .filter(|entry| entry.stage == 0)
@@ -114,6 +116,11 @@ impl Repository {
             };
             let mut path = item.rela_path().to_vec();
             if matches!(summary, Summary::Added) {
+                // Some directory walkers classify paths without stage two as
+                // untracked. Any conflict stage still makes the path tracked.
+                if indexed_paths.contains(path.as_slice()) {
+                    continue;
+                }
                 if let gix::status::index_worktree::Item::DirectoryContents { entry, .. } = &item
                     && entry.disk_kind.is_some_and(|kind| kind.is_dir())
                 {
