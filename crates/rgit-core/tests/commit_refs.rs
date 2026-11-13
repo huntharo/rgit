@@ -958,41 +958,125 @@ fn reflogs_follow_core_log_all_ref_updates() -> Result {
     Ok(())
 }
 
-/// A reflog append that fails after the rename reports that the reference
-/// was updated (never a conflict or "unchanged"), and the new value is live.
+/// Reflog lines are appended before the rename, so a failed append leaves
+/// the reference unchanged. If the branch log was appended but HEAD's failed,
+/// the error says the update was partially logged.
 #[cfg(unix)]
 #[test]
-fn reflog_failure_after_publication_reports_the_update() -> Result {
+fn reflog_failure_leaves_the_ref_unchanged() -> Result {
+    use rgit_core::write::ReflogAppendError;
     use std::os::unix::fs::PermissionsExt;
-    let temp = tempfile::tempdir()?;
-    let dir = temp.path();
-    let first = oid(&repo_with_commit(dir, "sha1")?)?;
-    git(dir, &["commit", "-q", "--allow-empty", "-m", "second"])?;
-    let second = oid(&rev(dir, "HEAD")?)?;
-    let log = dir.join(".git/logs/refs/heads/main");
-    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o444))?;
-    let before = read(&log)?;
-    let result = Repository::discover(dir)?.update_ref(&RefUpdate {
-        name: b"refs/heads/main".to_vec(),
-        new: first,
-        expected: RefExpectation::MustEqual(second),
-        log: Some(RefLog {
-            committer: signature(),
-            message: b"rewind".to_vec(),
-        }),
-    });
-    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644))?;
-    match result {
-        Err(Error::Other(error)) => {
-            assert!(error.to_string().contains("was updated"), "{error}");
-            assert!(std::error::Error::source(error.as_ref()).is_some());
+    for (readonly, partial) in [("logs/refs/heads/main", false), ("logs/HEAD", true)] {
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path();
+        let first = oid(&repo_with_commit(dir, "sha1")?)?;
+        git(dir, &["commit", "-q", "--allow-empty", "-m", "second"])?;
+        let second = oid(&rev(dir, "HEAD")?)?;
+        let git_dir = dir.join(".git");
+        let branch_log = read(git_dir.join("logs/refs/heads/main"))?;
+        let head_log = read(git_dir.join("logs/HEAD"))?;
+        let locked = git_dir.join(readonly);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o444))?;
+        let result = Repository::discover(dir)?.update_ref(&RefUpdate {
+            name: b"refs/heads/main".to_vec(),
+            new: first,
+            expected: RefExpectation::MustEqual(second),
+            log: Some(RefLog {
+                committer: signature(),
+                message: b"rewind".to_vec(),
+            }),
+        });
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644))?;
+        match result {
+            Err(Error::Other(error)) => {
+                assert!(error.to_string().contains("was not updated"), "{error}");
+                let typed = error
+                    .downcast_ref::<ReflogAppendError>()
+                    .ok_or("ReflogAppendError")?;
+                assert_eq!(typed.reference(), b"refs/heads/main");
+                assert_eq!(typed.partially_logged(), partial, "{readonly}");
+            }
+            other => panic!("expected a reflog error, got {other:?}"),
         }
-        other => panic!("expected a reflog error, got {other:?}"),
+        assert_eq!(
+            rev(dir, "refs/heads/main")?,
+            second.to_string(),
+            "{readonly}"
+        );
+        assert_eq!(read(git_dir.join("logs/HEAD"))?, head_log);
+        if partial {
+            // The branch log gained the line before HEAD's append failed.
+            let now = read(git_dir.join("logs/refs/heads/main"))?;
+            assert!(now.starts_with(&branch_log) && now.len() > branch_log.len());
+        } else {
+            assert_eq!(read(git_dir.join("logs/refs/heads/main"))?, branch_log);
+        }
+        assert!(!git_dir.join("refs/heads/main.lock").exists());
+        assert!(!git_dir.join("HEAD.lock").exists());
+        fsck(dir)?;
     }
-    assert_eq!(rev(dir, "refs/heads/main")?, first.to_string());
-    assert_eq!(read(&log)?, before);
-    assert!(!dir.join(".git/refs/heads/main.lock").exists());
-    fsck(dir)?;
+    Ok(())
+}
+
+/// HEAD's reflog follows the HEAD target observed under HEAD.lock: after
+/// HEAD is retargeted away, an update of the old branch logs nothing to
+/// HEAD; once it names the branch again, HEAD's log gets the line.
+#[test]
+fn head_reflog_follows_the_current_head_target() -> Result {
+    for format in FORMATS {
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path();
+        let first = oid(&repo_with_commit(dir, format)?)?;
+        git(dir, &["commit", "-q", "--allow-empty", "-m", "second"])?;
+        let second = oid(&rev(dir, "HEAD")?)?;
+        git(dir, &["branch", "other"])?;
+        git(dir, &["symbolic-ref", "HEAD", "refs/heads/other"])?;
+        let head_log = read(dir.join(".git/logs/HEAD"))?;
+        let repo = Repository::discover(dir)?;
+        let update = |new, old, message: &[u8]| RefUpdate {
+            name: b"refs/heads/main".to_vec(),
+            new,
+            expected: RefExpectation::MustEqual(old),
+            log: Some(RefLog {
+                committer: signature(),
+                message: message.to_vec(),
+            }),
+        };
+        repo.update_ref(&update(first, second, b"while elsewhere"))?;
+        assert_eq!(read(dir.join(".git/logs/HEAD"))?, head_log, "{format}");
+        assert_eq!(
+            reflog_subjects(dir, "refs/heads/main")?.first(),
+            Some(&format!("{first} while elsewhere"))
+        );
+        git(dir, &["symbolic-ref", "HEAD", "refs/heads/main"])?;
+        repo.update_ref(&update(second, first, b"while current"))?;
+        assert_eq!(
+            reflog_subjects(dir, "HEAD")?.first(),
+            Some(&format!("{second} while current"))
+        );
+        fsck(dir)?;
+    }
+    Ok(())
+}
+
+/// Each reflog line's old value equals the previous line's new value.
+fn assert_reflog_chain(path: &Path) -> Result {
+    let text = String::from_utf8(read(path)?)?;
+    let mut previous: Option<String> = None;
+    for line in text.lines() {
+        let mut fields = line.split(' ');
+        let old = fields.next().ok_or("old")?.to_owned();
+        let new = fields.next().ok_or("new")?.to_owned();
+        if let Some(previous) = &previous {
+            assert_eq!(
+                &old,
+                previous,
+                "{}: chain broken at {line:?}",
+                path.display()
+            );
+        }
+        previous = Some(new);
+    }
     Ok(())
 }
 
@@ -1144,9 +1228,28 @@ mod failpoints {
         else {
             return Ok(());
         };
-        let outcome = Repository::discover(&repo)?.commit(&request(b"child commit\n"));
+        let repo = Repository::discover(&repo)?;
+        let outcome = match std::env::var("RGIT_TEST_CHILD_UPDATE") {
+            // "<old> <new>": update_ref of main with a reflog message.
+            Ok(spec) => {
+                let (old, new) = spec.split_once(' ').ok_or("update spec")?;
+                repo.update_ref(&RefUpdate {
+                    name: b"refs/heads/main".to_vec(),
+                    new: oid(new)?,
+                    expected: RefExpectation::MustEqual(oid(old)?),
+                    log: Some(RefLog {
+                        committer: signature(),
+                        message: b"child update".to_vec(),
+                    }),
+                })
+                .map(|()| new.to_owned())
+            }
+            Err(_) => repo
+                .commit(&request(b"child commit\n"))
+                .map(|outcome| outcome.id.to_string()),
+        };
         let line = match outcome {
-            Ok(outcome) => format!("ok {}", outcome.id),
+            Ok(id) => format!("ok {id}"),
             Err(error) => format!("err {error:?} | {error}"),
         };
         std::fs::write(result, line)?;
@@ -1188,13 +1291,25 @@ mod failpoints {
     #[test]
     fn aborts_leave_old_or_new_state() -> Result {
         for format in FORMATS {
-            for (point, published, stale_lock) in [
-                ("commit.objects-written", false, None),
+            // (point, ref published, reflog line appended, stale ref lock)
+            for (point, published, logged, stale_lock) in [
+                ("commit.objects-written", false, false, None),
                 // The first lock a branch commit takes is HEAD.lock.
-                ("lock.acquired", false, None),
-                ("commit.ref-locked", false, Some("refs/heads/main.lock")),
-                ("lock.before-rename", false, Some("refs/heads/main.lock")),
-                ("lock.after-rename", true, None),
+                ("lock.acquired", false, false, None),
+                (
+                    "commit.ref-locked",
+                    false,
+                    false,
+                    Some("refs/heads/main.lock"),
+                ),
+                ("ref.logged", false, true, Some("refs/heads/main.lock")),
+                (
+                    "lock.before-rename",
+                    false,
+                    true,
+                    Some("refs/heads/main.lock"),
+                ),
+                ("lock.after-rename", true, true, None),
             ] {
                 let temp = tempfile::tempdir()?;
                 let (dir, head) = staged_repo(temp.path(), format)?;
@@ -1211,10 +1326,21 @@ mod failpoints {
                 if published {
                     assert_ne!(now, head, "{point}");
                     assert_eq!(rev(&dir, &format!("{now}^"))?, head);
-                    // The reflog append follows the rename, so it is absent.
-                    assert_eq!(reflog_subjects(&dir, "refs/heads/main")?.len(), 1);
                 } else {
                     assert_eq!(now, head, "{point}");
+                }
+                // Reflogs are appended under the locks, before the rename: a
+                // crash after the append leaves a line even if the ref kept
+                // its old value (as in C Git); its object exists.
+                let expected_lines = if logged { 2 } else { 1 };
+                for log in ["refs/heads/main", "HEAD"] {
+                    let lines = reflog_subjects(&dir, log)?;
+                    assert_eq!(lines.len(), expected_lines, "{point} {log}");
+                    if logged {
+                        let id = lines[0].split(' ').next().ok_or("id")?;
+                        git(&dir, &["cat-file", "-e", id])?;
+                        assert!(lines[0].ends_with("commit: child commit"), "{point}");
+                    }
                 }
                 let git_dir = dir.join(".git");
                 // A crash while holding HEAD.lock leaves it, as in C Git.
@@ -1271,6 +1397,249 @@ mod failpoints {
             assert_eq!(reflog_subjects(&dir, "HEAD")?.first(), Some(&entry));
             assert!(!dir.join(".git/refs/heads/main.lock").exists());
             assert!(!dir.join(".git/HEAD.lock").exists());
+            fsck(&dir)?;
+        }
+        Ok(())
+    }
+
+    /// A commit object that is not on any branch, for update_ref tests.
+    fn detached_commit(dir: &Path, parent: &str, message: &str) -> Result<String> {
+        Ok(text(&git(
+            dir,
+            &[
+                "commit-tree",
+                &format!("{parent}^{{tree}}"),
+                "-p",
+                parent,
+                "-m",
+                message,
+            ],
+        )?))
+    }
+
+    fn update_child(
+        dir: &Path,
+        failpoint: &str,
+        sync: Option<&Path>,
+        old: &str,
+        new: &str,
+    ) -> Result<Command> {
+        let mut command = child(dir, failpoint, sync)?;
+        command.env("RGIT_TEST_CHILD_UPDATE", format!("{old} {new}"));
+        Ok(command)
+    }
+
+    /// (A) While update_ref of the branch HEAD names holds its locks, HEAD
+    /// cannot be retargeted (HEAD.lock is held), so the HEAD log line it
+    /// appends matches HEAD's target at publication.
+    #[test]
+    fn head_cannot_be_retargeted_during_update_ref() -> Result {
+        for format in FORMATS {
+            let temp = tempfile::tempdir()?;
+            let dir = temp.path().join("repo");
+            std::fs::create_dir(&dir)?;
+            let head = repo_with_commit(&dir, format)?;
+            git(&dir, &["branch", "other"])?;
+            let next = detached_commit(&dir, &head, "next")?;
+            let sync = temp.path().join("sync");
+            std::fs::create_dir(&sync)?;
+            let mut running =
+                update_child(&dir, "ref.locked:pause", Some(&sync), &head, &next)?.spawn()?;
+            wait_for(&sync.join("ready"))?;
+            let retarget = git_command(&dir)
+                .args(["symbolic-ref", "HEAD", "refs/heads/other"])
+                .output()?;
+            assert!(!retarget.status.success(), "HEAD retargeted mid-update");
+            std::fs::write(sync.join("release"), b"")?;
+            assert!(running.wait()?.success());
+            assert_eq!(child_result(&dir)?, format!("ok {next}"));
+            assert_eq!(
+                text(&git(&dir, &["symbolic-ref", "HEAD"])?),
+                "refs/heads/main"
+            );
+            let entry = format!("{next} child update");
+            assert_eq!(reflog_subjects(&dir, "HEAD")?.first(), Some(&entry));
+            assert_eq!(
+                reflog_subjects(&dir, "refs/heads/main")?.first(),
+                Some(&entry)
+            );
+            assert_reflog_chain(&dir.join(".git/logs/HEAD"))?;
+            fsck(&dir)?;
+        }
+        Ok(())
+    }
+
+    /// (B) A second writer (rgit or C Git) cannot update the ref while the
+    /// first holds its locks after appending its reflog line, so the final
+    /// reflog chains stay strictly ordered.
+    #[test]
+    fn concurrent_updates_keep_the_reflog_chain_ordered() -> Result {
+        for format in FORMATS {
+            let temp = tempfile::tempdir()?;
+            let dir = temp.path().join("repo");
+            std::fs::create_dir(&dir)?;
+            let head = repo_with_commit(&dir, format)?;
+            let x = detached_commit(&dir, &head, "x")?;
+            let y = detached_commit(&dir, &x, "y")?;
+            let z = detached_commit(&dir, &y, "z")?;
+            let sync = temp.path().join("sync");
+            std::fs::create_dir(&sync)?;
+            let mut running =
+                update_child(&dir, "ref.logged:pause", Some(&sync), &head, &x)?.spawn()?;
+            wait_for(&sync.join("ready"))?;
+            let repo = Repository::discover(&dir)?;
+            let rival = repo.update_ref(&RefUpdate {
+                name: b"refs/heads/main".to_vec(),
+                new: oid(&y)?,
+                expected: RefExpectation::Any,
+                log: Some(RefLog {
+                    committer: signature(),
+                    message: b"rival".to_vec(),
+                }),
+            });
+            assert!(matches!(rival, Err(Error::Locked(_))), "{rival:?}");
+            let c_git = git_command(&dir)
+                .args(["update-ref", "-m", "c git rival", "refs/heads/main", &y])
+                .output()?;
+            assert!(!c_git.status.success(), "C Git updated a locked ref");
+            std::fs::write(sync.join("release"), b"")?;
+            assert!(running.wait()?.success());
+            assert_eq!(child_result(&dir)?, format!("ok {x}"));
+            // Sequential follow-ups from both implementations.
+            repo.update_ref(&RefUpdate {
+                name: b"refs/heads/main".to_vec(),
+                new: oid(&y)?,
+                expected: RefExpectation::MustEqual(oid(&x)?),
+                log: Some(RefLog {
+                    committer: signature(),
+                    message: b"after".to_vec(),
+                }),
+            })?;
+            git(
+                &dir,
+                &["update-ref", "-m", "c git after", "refs/heads/main", &z, &y],
+            )?;
+            assert_eq!(rev(&dir, "refs/heads/main")?, z);
+            for log in ["logs/refs/heads/main", "logs/HEAD"] {
+                let path = dir.join(".git").join(log);
+                assert_reflog_chain(&path)?;
+                assert_eq!(String::from_utf8(read(&path)?)?.lines().count(), 4, "{log}");
+            }
+            fsck(&dir)?;
+        }
+        Ok(())
+    }
+
+    /// If the held ref lock is removed and replaced by another writer while
+    /// paused, the update is refused before any reflog line is appended and
+    /// the foreign lock is neither published nor unlinked.
+    #[test]
+    fn replaced_lock_refuses_before_logging() -> Result {
+        for format in FORMATS {
+            let temp = tempfile::tempdir()?;
+            let (dir, head) = staged_repo(temp.path(), format)?;
+            let git_dir = dir.join(".git");
+            let logs = ["logs/HEAD", "logs/refs/heads/main"]
+                .map(|log| read(git_dir.join(log)))
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+            let sync = temp.path().join("sync");
+            std::fs::create_dir(&sync)?;
+            let mut running = child(&dir, "commit.ref-locked:pause", Some(&sync))?.spawn()?;
+            wait_for(&sync.join("ready"))?;
+            let lock = git_dir.join("refs/heads/main.lock");
+            std::fs::remove_file(&lock)?;
+            std::fs::write(&lock, b"foreign\n")?;
+            std::fs::write(sync.join("release"), b"")?;
+            assert!(running.wait()?.success());
+            let result = child_result(&dir)?;
+            assert!(result.starts_with("err Locked"), "{result}");
+            assert_eq!(read(&lock)?, b"foreign\n");
+            assert_eq!(rev(&dir, "refs/heads/main")?, head);
+            for (log, before) in ["logs/HEAD", "logs/refs/heads/main"].iter().zip(&logs) {
+                assert_eq!(&read(git_dir.join(log))?, before, "{log}");
+            }
+            assert!(!git_dir.join("HEAD.lock").exists());
+            std::fs::remove_file(&lock)?;
+            fsck(&dir)?;
+        }
+        Ok(())
+    }
+
+    /// An error after the reflog append but before the rename is reported as
+    /// "not updated, but logged"; no locks are left.
+    #[test]
+    fn error_after_reflog_append_reports_logged_not_published() -> Result {
+        for format in FORMATS {
+            let temp = tempfile::tempdir()?;
+            let dir = temp.path().join("repo");
+            std::fs::create_dir(&dir)?;
+            let head = repo_with_commit(&dir, format)?;
+            let next = detached_commit(&dir, &head, "next")?;
+            for point in ["ref.logged:error", "lock.before-rename:error"] {
+                let status = update_child(&dir, point, None, &head, &next)?.status()?;
+                assert!(status.success(), "{point}");
+                let result = child_result(&dir)?;
+                assert!(
+                    result.starts_with("err Other(RefLoggedNotPublishedError"),
+                    "{point}: {result}"
+                );
+                assert!(result.contains("was not updated"), "{result}");
+                assert_eq!(rev(&dir, "refs/heads/main")?, head);
+                assert!(!dir.join(".git/refs/heads/main.lock").exists());
+                assert!(!dir.join(".git/HEAD.lock").exists());
+            }
+            // Two logged attempts, neither published.
+            assert_eq!(reflog_subjects(&dir, "refs/heads/main")?.len(), 3);
+            fsck(&dir)?;
+        }
+        Ok(())
+    }
+
+    /// A crash after the reflog append but before the rename: the ref keeps
+    /// its old value, both logs have the extra line, fsck accepts it, and a
+    /// retry succeeds once the stale locks are removed.
+    #[test]
+    fn crash_after_reflog_append_keeps_the_old_ref() -> Result {
+        for format in FORMATS {
+            let temp = tempfile::tempdir()?;
+            let dir = temp.path().join("repo");
+            std::fs::create_dir(&dir)?;
+            let head = repo_with_commit(&dir, format)?;
+            let next = detached_commit(&dir, &head, "next")?;
+            let status = update_child(&dir, "ref.logged", None, &head, &next)?.status()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(status.signal(), Some(6), "{status:?}");
+            }
+            assert_eq!(rev(&dir, "refs/heads/main")?, head);
+            let entry = format!("{next} child update");
+            for log in ["refs/heads/main", "HEAD"] {
+                assert_eq!(reflog_subjects(&dir, log)?.first(), Some(&entry), "{log}");
+            }
+            fsck(&dir)?;
+            let git_dir = dir.join(".git");
+            for lock in ["refs/heads/main.lock", "HEAD.lock"] {
+                assert!(git_dir.join(lock).exists(), "{lock} left by the crash");
+            }
+            assert!(matches!(
+                Repository::discover(&dir)?.update_ref(&RefUpdate {
+                    name: b"refs/heads/main".to_vec(),
+                    new: oid(&next)?,
+                    expected: RefExpectation::MustEqual(oid(&head)?),
+                    log: None,
+                }),
+                Err(Error::Locked(_))
+            ));
+            for lock in ["refs/heads/main.lock", "HEAD.lock"] {
+                std::fs::remove_file(git_dir.join(lock))?;
+            }
+            let status = update_child(&dir, "none", None, &head, &next)?.status()?;
+            assert!(status.success());
+            assert_eq!(child_result(&dir)?, format!("ok {next}"));
+            assert_eq!(rev(&dir, "refs/heads/main")?, next);
+            assert_eq!(reflog_subjects(&dir, "refs/heads/main")?.len(), 3);
             fsck(&dir)?;
         }
         Ok(())
