@@ -274,7 +274,7 @@ fn write_entry_path(out: &mut impl Write, path: &[u8], nul: bool, quote_space: b
         return Ok(());
     }
     let quote = path.iter().any(|&byte| {
-        byte < 32 || byte >= 127 || byte == b'"' || byte == b'\\' || (quote_space && byte == b' ')
+        !(32..127).contains(&byte) || byte == b'"' || byte == b'\\' || (quote_space && byte == b' ')
     });
     if quote {
         out.write_all(b"\"")?;

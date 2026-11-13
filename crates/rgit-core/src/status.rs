@@ -27,6 +27,7 @@ impl Repository {
         }
         self.inspection_execution_policy()?;
         let entries = self.index_entries()?;
+        self.preflight_status_paths(&entries)?;
         if entries.iter().any(|entry| entry.mode == 0o160000) {
             return Err(Error::UnsupportedCapability("submodule worktree status"));
         }
@@ -104,10 +105,10 @@ impl Repository {
             };
             let mut path = item.rela_path().to_vec();
             if matches!(summary, Summary::Added) {
-                if let gix::status::index_worktree::Item::DirectoryContents { entry, .. } = &item {
-                    if entry.disk_kind.is_some_and(|kind| kind.is_dir()) {
-                        path.push(b'/');
-                    }
+                if let gix::status::index_worktree::Item::DirectoryContents { entry, .. } = &item
+                    && entry.disk_kind.is_some_and(|kind| kind.is_dir())
+                {
+                    path.push(b'/');
                 }
                 result.entry(path.clone()).or_insert(StatusEntry {
                     path,
@@ -137,6 +138,13 @@ impl Repository {
     pub(crate) fn inspection_execution_policy(&self) -> Result<(), Error> {
         let snapshot = self.inner.config_snapshot();
         let config = snapshot.plumbing();
+        if config.string("core.attributesfile").is_some()
+            || config.string("core.excludesfile").is_some()
+        {
+            return Err(Error::UnsupportedCapability(
+                "custom attribute/ignore paths require a file-access policy",
+            ));
+        }
         if let Some(sections) = config.sections_by_name("filter") {
             for section in sections {
                 for name in section.value_names() {
@@ -152,6 +160,104 @@ impl Repository {
             }
         }
         Ok(())
+    }
+
+    fn preflight_status_paths(&self, entries: &[IndexEntry]) -> Result<(), Error> {
+        use std::fs;
+        let root = self
+            .inner
+            .workdir()
+            .ok_or(Error::UnsupportedCapability("worktree required"))?;
+        for entry in entries {
+            crate::inspection::validate_path(&entry.path)?;
+            let mut path = root.to_owned();
+            let parts: Vec<_> = entry.path.split(|&byte| byte == b'/').collect();
+            for (index, part) in parts.iter().enumerate() {
+                path.push(gix::path::from_bstr(crate::BStr::new(part))?);
+                let metadata = match fs::symlink_metadata(&path) {
+                    Ok(value) => value,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        break;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                if index + 1 < parts.len() && metadata.is_symlink() {
+                    return Err(Error::UnsupportedCapability("symlinked tracked parent"));
+                }
+                if !(metadata.is_file() || metadata.is_dir() || metadata.is_symlink()) {
+                    return Err(Error::UnsupportedCapability(
+                        "special tracked worktree file",
+                    ));
+                }
+            }
+        }
+        let info_dir = self.inner.common_dir().join("info");
+        match fs::symlink_metadata(&info_dir) {
+            Ok(metadata) if metadata.is_symlink() || !metadata.is_dir() => {
+                return Err(Error::UnsupportedCapability(
+                    "symlink or special repository info directory",
+                ));
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
+        for metadata in [
+            self.inner.common_dir().join("info/attributes"),
+            self.inner.common_dir().join("info/exclude"),
+        ] {
+            regular_metadata_file(&metadata)?;
+        }
+        // Metadata loaders can follow symlinks or block on special files. Inspect
+        // directory entries without following links before allowing the walk.
+        // This conservative scan includes ignored directories; it reads no file
+        // content and never descends into another repository or a symlink.
+        let mut pending = vec![root.to_owned()];
+        let mut seen = 0usize;
+        while let Some(directory) = pending.pop() {
+            for child in fs::read_dir(directory)? {
+                let child = child?;
+                seen += 1;
+                if seen > 1_000_000 {
+                    return Err(Error::UnsupportedCapability(
+                        "worktree metadata preflight entry limit",
+                    ));
+                }
+                let name = child.file_name();
+                if name == ".git" {
+                    continue;
+                }
+                if name == ".gitattributes" || name == ".gitignore" {
+                    regular_metadata_file(&child.path())?;
+                }
+                if child.file_type()?.is_dir() {
+                    let nested = child.path().join(".git");
+                    match fs::symlink_metadata(nested) {
+                        Ok(_) => continue,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            pending.push(child.path())
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn regular_metadata_file(path: &std::path::Path) -> Result<(), Error> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+        Ok(metadata) if metadata.is_file() && metadata.len() <= 8 * 1024 * 1024 => Ok(()),
+        Ok(_) => Err(Error::UnsupportedCapability(
+            "symlink, special or oversized attribute/ignore file",
+        )),
     }
 }
 
