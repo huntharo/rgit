@@ -67,6 +67,7 @@ fn preexisting_index_lock_refuses_add(driver: Driver) -> Result {
         refused(&output, 128, "add with held index.lock")?;
         mentions(&output, "index.lock")?;
         assert_preserved(
+            s.dir(),
             &before,
             &snapshot(s.dir())?,
             Preserve::AllowNewObjects,
@@ -125,7 +126,13 @@ fn preexisting_ref_lock_refuses_commit(driver: Driver) -> Result {
             )?;
             let after = snapshot(s.dir())?;
             if driver.index_bytes_stable_on_refusal() {
-                assert_preserved(&before, &after, Preserve::AllowNewObjects, &context)?;
+                assert_preserved(
+                    s.dir(),
+                    &before,
+                    &after,
+                    Preserve::AllowNewObjects,
+                    &context,
+                )?;
             } else {
                 // C Git refreshes the index cache-tree and writes
                 // COMMIT_EDITMSG even when the ref update fails; compare
@@ -143,6 +150,7 @@ fn preexisting_ref_lock_refuses_commit(driver: Driver) -> Result {
                     snap
                 };
                 assert_preserved(
+                    s.dir(),
                     &strip(&before),
                     &strip(&after),
                     Preserve::AllowNewObjects,
@@ -217,6 +225,7 @@ fn concurrent_commits_one_winner(driver: Driver) -> Result {
             .into());
         }
         assert_preserved(
+            s.dir(),
             &before,
             &snapshot(s.dir())?,
             Preserve::AllowNewObjects,
@@ -270,6 +279,7 @@ fn cas_loser_leaves_refs_byte_identical(driver: Driver) -> Result {
                 let context = format!("{hash:?} unborn={unborn} vs {}", competitor.name());
                 refused(&output, 128, &format!("CAS loser {context}"))?;
                 assert_preserved(
+                    s.dir(),
                     &before,
                     &snapshot(s.dir())?,
                     Preserve::AllowNewObjects,
@@ -305,6 +315,7 @@ fn second_add_refused_while_index_locked(driver: Driver) -> Result {
         refused(&second, 128, "second add")?;
         mentions(&second, "index.lock")?;
         assert_preserved(
+            s.dir(),
             &before,
             &snapshot(s.dir())?,
             Preserve::AllowNewObjects,
@@ -367,7 +378,13 @@ fn replaced_lock_never_published_or_unlinked(driver: Driver) -> Result {
             let mut after = snapshot(s.dir())?;
             let lock_rel = relative(&s, &lock)?;
             after.remove(&lock_rel);
-            assert_preserved(&before_spawn, &after, Preserve::AllowNewObjects, &context)?;
+            assert_preserved(
+                s.dir(),
+                &before_spawn,
+                &after,
+                Preserve::AllowNewObjects,
+                &context,
+            )?;
             fs::remove_file(&lock)?;
             s.check()?;
         }

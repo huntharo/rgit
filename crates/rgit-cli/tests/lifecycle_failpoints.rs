@@ -71,7 +71,13 @@ fn based(hash: Hash, shape: Shape) -> Result<Scenario> {
 fn matrix(cases: Vec<(String, Result)>) -> Result {
     let failures: Vec<String> = cases
         .into_iter()
-        .filter_map(|(name, result)| result.err().map(|e| format!("{name}: {e}")))
+        .filter_map(|(name, result)| {
+            eprintln!(
+                "CASE {}: {name}",
+                if result.is_ok() { "PASS" } else { "FAIL" }
+            );
+            result.err().map(|e| format!("{name}: {e}"))
+        })
         .collect();
     if failures.is_empty() {
         Ok(())
@@ -114,7 +120,13 @@ fn stale_locks_refuse_then_clear(
     }) {
         return Err(format!("diagnostic names none of {locks:?}: {}", describe(&output)).into());
     }
-    assert_preserved(&before, &snapshot(s.dir())?, preserve, "stale lock refusal")?;
+    assert_preserved(
+        s.dir(),
+        &before,
+        &snapshot(s.dir())?,
+        preserve,
+        "stale lock refusal",
+    )?;
     for lock in locks {
         fs::remove_file(lock)?;
     }
@@ -177,6 +189,7 @@ fn add_case(hash: Hash, point: &str, mode: Mode) -> Result {
         return Err("add moved HEAD".into());
     }
     assert_unpublished_untouched(
+        s.dir(),
         &before,
         &snapshot(s.dir())?,
         &published_paths(&s, false)?,
@@ -221,6 +234,7 @@ fn commit_case(hash: Hash, shape: Shape, point: &str, mode: Mode) -> Result {
     let mut new = s.model.clone();
     let when = new.tick();
     let oid = new.commit(0, &["interrupted"], when);
+    let foreign = Foreign::plant(&s.root().join(".git"))?;
     let before = snapshot(s.dir())?;
     let mut command = Driver::Rgit.commit_cmd(&s.root(), &["interrupted"], when, &[]);
     with_failpoint(&mut command, &spec(point, mode));
@@ -249,16 +263,25 @@ fn commit_case(hash: Hash, shape: Shape, point: &str, mode: Mode) -> Result {
             format!("HEAD is {head_state:?} after {point}, expected {expected:?} ({oid})").into(),
         );
     }
-    let log = reflog_path(&s, shape);
-    let log_rel = log.strip_prefix(s.dir())?.to_path_buf();
-    if snapshot(s.dir())?.get(&log_rel) != before.get(&log_rel) {
-        return Err(format!(
-            "{} changed although the crash precedes reflog append",
-            log.display()
-        )
-        .into());
+    // No reflog (branch or HEAD) has a new entry: every crash point precedes
+    // the reflog append. HEAD's own bytes are unchanged unless HEAD itself is
+    // the published ref (detached).
+    let observed = snapshot(s.dir())?;
+    let git_rel = s.root().join(".git").strip_prefix(s.dir())?.to_path_buf();
+    for log in ["logs/HEAD", "logs/refs/heads/main"] {
+        let rel = git_rel.join(log);
+        if observed.get(&rel) != before.get(&rel) {
+            return Err(format!("{log} changed although the crash precedes reflog append").into());
+        }
     }
+    if shape != Shape::Detached
+        && observed.get(&git_rel.join("HEAD")) != before.get(&git_rel.join("HEAD"))
+    {
+        return Err("HEAD target changed during a branch commit".into());
+    }
+    foreign.verify()?;
     assert_unpublished_untouched(
+        s.dir(),
         &before,
         &snapshot(s.dir())?,
         &published_paths(&s, head_state == Published::New)?,
@@ -286,7 +309,10 @@ fn commit_case(hash: Hash, shape: Shape, point: &str, mode: Mode) -> Result {
         git_dir.join("HEAD.lock"),
         git_dir.join("index.lock"),
     ];
-    let locks = observe::locks(&git_dir)?;
+    let locks: Vec<PathBuf> = observe::locks(&git_dir)?
+        .into_iter()
+        .filter(|l| *l != foreign.path)
+        .collect();
     if let Some(stray) = locks.iter().find(|l| !allowed.contains(l)) {
         return Err(format!("unexpected lock {}", stray.display()).into());
     }
@@ -321,6 +347,7 @@ fn commit_case(hash: Hash, shape: Shape, point: &str, mode: Mode) -> Result {
             assert_eq!(observe::symbolic_head(&s.root())?, None);
         }
         s.model = new;
+        foreign.verify_and_withdraw()?;
         return assert_state_with(&s.model, false);
     }
 
@@ -350,7 +377,111 @@ fn commit_case(hash: Hash, shape: Shape, point: &str, mode: Mode) -> Result {
     // Published without its reflog entry; a further commit must be refused
     // by the stale HEAD.lock (exit 128, named, byte-identical), then succeed
     // once it is removed and log from the published value.
-    follow_up_commit_logs_from(&mut s, shape, &oid, &locks)
+    follow_up_commit_logs_from(&mut s, shape, &oid, &locks, Some(&foreign))
+}
+
+/// A lock planted by the fixture on behalf of some other (live) writer. No
+/// rgit operation or recovery step may touch it.
+struct Foreign {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn inode(path: &std::path::Path) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(fs::symlink_metadata(path)?.ino())
+}
+
+#[cfg(not(unix))]
+fn inode(_path: &std::path::Path) -> Result<u64> {
+    Ok(0)
+}
+
+impl Foreign {
+    fn plant(git_dir: &std::path::Path) -> Result<Self> {
+        let path = git_dir.join("refs/tags/foreign-writer.lock");
+        fs::create_dir_all(path.parent().ok_or("parent")?)?;
+        let bytes = b"held by another writer\n".to_vec();
+        fs::write(&path, &bytes)?;
+        Ok(Self {
+            inode: inode(&path)?,
+            path,
+            bytes,
+        })
+    }
+
+    fn verify(&self) -> Result {
+        if fs::read(&self.path)? != self.bytes || inode(&self.path)? != self.inode {
+            return Err(format!(
+                "foreign lock {} was modified or replaced",
+                self.path.display()
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// The fixture (not rgit) withdraws its own lock before the final
+    /// no-leftover-lock state check.
+    fn verify_and_withdraw(&self) -> Result {
+        self.verify()?;
+        fs::remove_file(&self.path)?;
+        Ok(())
+    }
+}
+
+/// While the orphaned HEAD.lock exists, a C Git operation that must contend
+/// for HEAD is refused as well. Exact command (staged change present, so it
+/// really tries to move HEAD's branch):
+///   git commit -q -m c-git-contender   (GIT_* identity/date from the model)
+/// Only this HEAD-contending operation is asserted; unrelated ref writers
+/// are not claimed to be blocked. Afterwards every pre-existing byte (refs,
+/// HEAD, index, logs, the stale lock, existing objects, worktree) is
+/// unchanged; only new, valid, unreferenced loose objects may appear.
+fn c_git_commit_refused(s: &Scenario, when: i64) -> Result {
+    let before = snapshot(s.dir())?;
+    let index_before = observe::index(&s.root())?;
+    let mut command = lifecycle_support::proc::git_cmd(&s.root());
+    command.args(["commit", "-q", "-m", "c-git-contender"]);
+    lifecycle_support::proc::identity(&mut command, when);
+    let output = run(&mut command)?;
+    if output.status.success() || !String::from_utf8_lossy(&output.stderr).contains("HEAD.lock") {
+        return Err(format!(
+            "`git commit` not refused by the stale HEAD.lock: {}",
+            describe(&output)
+        )
+        .into());
+    }
+    // C Git's own refused commit rewrites the index cache-tree and its
+    // COMMIT_EDITMSG scratch file (C Git behaviour, also modelled by
+    // Driver::index_bytes_stable_on_refusal). The index must still verify
+    // and hold exactly the same entries; every other byte is exact.
+    let git_rel = s.root().join(".git").strip_prefix(s.dir())?.to_path_buf();
+    let scratch = [git_rel.join("index"), git_rel.join("COMMIT_EDITMSG")];
+    let strip = |mut snap: std::collections::BTreeMap<PathBuf, lifecycle_support::proc::Snap>| {
+        for path in &scratch {
+            snap.remove(path);
+        }
+        snap
+    };
+    let added = assert_preserved(
+        s.dir(),
+        &strip(before),
+        &strip(snapshot(s.dir())?),
+        Preserve::AllowNewObjects,
+        "C Git commit behind HEAD.lock",
+    )?;
+    if observe::index(&s.root())? != index_before {
+        return Err("C Git's refused commit changed index entries".into());
+    }
+    eprintln!(
+        "NOTE: `git commit` refused by stale HEAD.lock (exit {:?}); {} new unreferenced object(s)",
+        output.status.code(),
+        added.iter().filter(|p| p.components().count() > 4).count()
+    );
+    Ok(())
 }
 
 fn reflog_path(s: &Scenario, shape: Shape) -> PathBuf {
@@ -367,12 +498,16 @@ fn follow_up_commit_logs_from(
     shape: Shape,
     published: &str,
     stale_locks: &[PathBuf],
+    foreign: Option<&Foreign>,
 ) -> Result {
     s.model
         .write(0, b"follow-up", b"after partial publication\n")?;
     s.add(0, &[b"follow-up"])?;
     let when = s.model.tick();
     let root = s.root();
+    if !stale_locks.is_empty() {
+        c_git_commit_refused(s, when)?;
+    }
     // The refused follow-up leaves every existing byte (refs, HEAD, index,
     // logs, the stale lock, existing objects) identical. It may add only new
     // unreferenced loose objects: ADR 0003 writes objects before taking the
@@ -385,6 +520,9 @@ fn follow_up_commit_logs_from(
         "follow-up commit",
     )?;
     let next = s.model.commit(0, &["follow-up"], when);
+    if let Some(foreign) = foreign {
+        foreign.verify_and_withdraw()?;
+    }
     assert_state_with(&s.model, true)?;
     let text = fs::read_to_string(reflog_path(s, shape))?;
     let last = text.lines().last().unwrap_or_default();
@@ -490,16 +628,63 @@ fn reflog_append_failure_after_publication(driver: Driver) -> Result {
             drop(guard);
             s.model = new;
             assert_state_with(&s.model, true)?; // commit body/tree, fsck, status
-            follow_up_commit_logs_from(&mut s, shape, &oid, &[])?;
+            follow_up_commit_logs_from(&mut s, shape, &oid, &[], None)?;
         }
     }
     Ok(())
 }
 
-fn init_case(hash: Hash, mode: Mode) -> Result {
+/// Entries of `snap` beneath `dir` (relative to the snapshot root).
+fn subtree(
+    snap: &std::collections::BTreeMap<PathBuf, lifecycle_support::proc::Snap>,
+    dir: &std::path::Path,
+) -> std::collections::BTreeMap<PathBuf, lifecycle_support::proc::Snap> {
+    snap.iter()
+        .filter(|(p, _)| p.starts_with(dir))
+        .map(|(p, v)| (p.clone(), v.clone()))
+        .collect()
+}
+
+fn without(
+    snap: &std::collections::BTreeMap<PathBuf, lifecycle_support::proc::Snap>,
+    dirs: &[&std::path::Path],
+) -> std::collections::BTreeMap<PathBuf, lifecycle_support::proc::Snap> {
+    snap.iter()
+        .filter(|(p, _)| !dirs.iter().any(|d| p.starts_with(d)))
+        .map(|(p, v)| (p.clone(), v.clone()))
+        .collect()
+}
+
+/// `init.before-publish`: abort leaves exactly one private assembled
+/// directory (`.git.rgit-init-*` in the worktree, or `.<name>.rgit-init-*`
+/// beside a bare target) and nothing else; pre-existing user files stay
+/// byte-identical; a later init neither consumes nor changes the orphan.
+/// `:error` (handled) leaves no temporary directory.
+fn init_case(hash: Hash, mode: Mode, bare: bool) -> Result {
     let point = "init.before-publish";
     let sandbox = sandbox()?;
-    let args = ["-q", "-b", "main", "--object-format", hash.name(), "repo"];
+    let name = if bare { "repo.git" } else { "repo" };
+    let target = sandbox.path().join(name);
+    let mut model = Model::new(hash, &target, "main");
+    // User files, including names init's own filesystem probes use.
+    if bare {
+        fs::write(sandbox.path().join("user.txt"), b"user data\n")?;
+    } else {
+        for (path, bytes) in [
+            (&b"config"[..], &b"user config file\n"[..]),
+            (b"tXXXXXX", b"user probe-named file\n"),
+            (b"\xc3\xa4", b"precomposed name\n"),
+            (b"sub/file", b"nested user file\n"),
+        ] {
+            model.write(0, path, bytes)?;
+        }
+    }
+    let mut args = vec!["-q", "-b", "main", "--object-format", hash.name()];
+    if bare {
+        args.push("--bare");
+    }
+    args.push(name);
+    let before = snapshot(sandbox.path())?;
     let mut command = Driver::Rgit.init_cmd(sandbox.path(), &args);
     with_failpoint(&mut command, &spec(point, mode));
     let output = run(&mut command)?;
@@ -507,115 +692,174 @@ fn init_case(hash: Hash, mode: Mode) -> Result {
         Mode::Abort => expect_abort(&output, point)?,
         Mode::Error => expect_injected(&output, point)?,
     }
-    let repo = sandbox.path().join("repo");
-    if fs::symlink_metadata(repo.join(".git")).is_ok() {
-        return Err("init published .git before init.before-publish".into());
-    }
-    // Documented: the private `.git.rgit-init-*` directory is removed only
-    // if the process survives. Abort leaves exactly one; :error leaves none.
-    let private: Vec<PathBuf> = match fs::read_dir(&repo) {
-        Ok(entries) => entries
-            .map(|e| e.map(|e| e.path()))
-            .collect::<std::io::Result<Vec<_>>>()?
-            .into_iter()
-            .filter(|p| {
-                p.file_name()
-                    .is_some_and(|n| n.to_string_lossy().starts_with(".git.rgit-init-"))
-            })
-            .collect(),
-        Err(_) => vec![],
+    let published = if bare {
+        target.clone()
+    } else {
+        target.join(".git")
     };
-    let expected_private = usize::from(mode == Mode::Abort);
-    if private.len() != expected_private || private.iter().any(|p| !p.is_dir()) {
+    if bare && before.contains_key(std::path::Path::new(name)) {
+        return Err("fixture: bare target pre-existed".into());
+    }
+    if fs::symlink_metadata(&published).is_ok() {
+        return Err(format!("init published {} before {point}", published.display()).into());
+    }
+    let (orphan_parent, prefix) = if bare {
+        (sandbox.path().to_path_buf(), format!(".{name}.rgit-init-"))
+    } else {
+        (target.clone(), ".git.rgit-init-".to_owned())
+    };
+    let orphans: Vec<PathBuf> = fs::read_dir(&orphan_parent)?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(&prefix))
+        })
+        .collect();
+    let expected_orphans = usize::from(mode == Mode::Abort);
+    if orphans.len() != expected_orphans {
         return Err(format!(
-            "{mode:?}: expected {expected_private} private init dir(s), found {private:?}"
+            "{mode:?}: expected {expected_orphans} {prefix}* dir(s), found {orphans:?}"
         )
         .into());
     }
-    let others: Vec<_> = snapshot(sandbox.path())?
-        .into_keys()
-        .filter(|p| {
-            p.as_os_str() != ".lifecycle-home"
-                && p.as_os_str() != "repo"
-                && !private
-                    .iter()
-                    .any(|d| sandbox.path().join(p).starts_with(d))
-        })
-        .collect();
-    if !others.is_empty() {
-        return Err(format!("{mode:?}: unexpected init leftovers {others:?}").into());
-    }
-    if let Some(dir) = private.first() {
+    let after_crash = snapshot(sandbox.path())?;
+    let orphan_rel: Vec<PathBuf> = orphans
+        .iter()
+        .map(|o| Ok(o.strip_prefix(sandbox.path())?.to_path_buf()))
+        .collect::<Result<_>>()?;
+    let orphan_refs: Vec<&std::path::Path> = orphan_rel.iter().map(|p| p.as_path()).collect();
+    // No other destination state changed: user files byte-identical, no
+    // other new entry.
+    assert_preserved(
+        sandbox.path(),
+        &before,
+        &without(&after_crash, &orphan_refs),
+        Preserve::Exact,
+        "init crash",
+    )?;
+    let orphan_before = orphan_refs
+        .first()
+        .map_or_else(Default::default, |d| subtree(&after_crash, d));
+    if let Some(orphan) = orphans.first() {
+        // Observed assembled layout.
+        if fs::read(orphan.join("HEAD"))? != b"ref: refs/heads/main\n" {
+            return Err("orphan HEAD is not the assembled symbolic ref".into());
+        }
+        let config = fs::read_to_string(orphan.join("config"))?;
+        let bare_line = format!("bare = {bare}");
+        if !config.contains("[core]") || !config.contains(&bare_line) {
+            return Err(format!("orphan config not as assembled: {config:?}").into());
+        }
+        for dir in ["objects", "refs", "refs/heads"] {
+            if !orphan.join(dir).is_dir() {
+                return Err(format!("orphan lacks {dir}/").into());
+            }
+        }
         eprintln!(
-            "NOTE: init {hash:?} {mode:?}: crash left documented private dir {}",
-            dir.display()
+            "NOTE: init {} {mode:?} bare={bare}: orphan {} layout {:?}",
+            hash.name(),
+            orphan.display(),
+            orphan_before.keys().collect::<Vec<_>>()
         );
     }
-    // Neither rgit nor C Git discovers a repository there.
-    if repo.is_dir() {
+    // Nothing discovers a repository from the destination.
+    if !bare {
         let rgit = run(Driver::Rgit
-            .command(&repo)
+            .command(&target)
             .args(["rev-parse", "--absolute-git-dir"]))?;
-        if rgit.status.success() {
+        let cgit = run(lifecycle_support::proc::git_cmd(&target).args(["rev-parse", "--git-dir"]))?;
+        if rgit.status.success() || cgit.status.success() {
             return Err(format!(
-                "rgit discovered a repository after the crash: {}",
-                describe(&rgit)
-            )
-            .into());
-        }
-        let cgit = run(lifecycle_support::proc::git_cmd(&repo).args(["rev-parse", "--git-dir"]))?;
-        if cgit.status.success() {
-            return Err(format!(
-                "C Git discovered a repository after the crash: {}",
+                "a repository was discovered after the crash: rgit {} / C Git {}",
+                describe(&rgit),
                 describe(&cgit)
             )
             .into());
         }
     }
 
+    // A fresh init succeeds without consuming, deleting or changing the
+    // orphan or any user file.
     ok_quiet(&Driver::Rgit.init(sandbox.path(), &args)?, "retry init")?;
-    let model = Model::new(hash, &repo, "main");
+    let after_retry = snapshot(sandbox.path())?;
+    if orphan_refs
+        .first()
+        .map_or_else(Default::default, |d| subtree(&after_retry, d))
+        != orphan_before
+    {
+        return Err("retry init consumed or changed the orphan".into());
+    }
+    let new_repo = published.strip_prefix(sandbox.path())?.to_path_buf();
+    let mut excluded = orphan_refs.clone();
+    excluded.push(&new_repo);
+    assert_preserved(
+        sandbox.path(),
+        &before,
+        &without(&after_retry, &excluded),
+        Preserve::Exact,
+        "retry init",
+    )?;
     assert_eq!(
-        git_text(&repo, &["rev-parse", "--is-bare-repository"])?,
-        "false"
-    );
-    assert_eq!(git_text(&repo, &["config", "--get", "core.bare"])?, "false");
-    assert_eq!(
-        git_text(&repo, &["rev-parse", "--show-object-format"])?,
+        git_text(&published, &["rev-parse", "--show-object-format"])?,
         hash.name()
     );
-    // Status may additionally list only untracked entries under the private
-    // leftover; everything else must match the model.
-    let status = observe::status(&repo)?;
+    assert_eq!(
+        git_text(&published, &["config", "--get", "core.bare"])?,
+        bare.to_string()
+    );
+    assert_eq!(
+        observe::symbolic_head(&published)?.as_deref(),
+        Some("refs/heads/main")
+    );
+    if bare {
+        assert_eq!(
+            git_text(&published, &["rev-parse", "--is-bare-repository"])?,
+            "true"
+        );
+        assert!(observe::branches(&published)?.is_empty());
+        assert!(observe::locks(&published)?.is_empty());
+        observe::fsck(&published)?;
+        return Ok(());
+    }
+    // Status equals the model plus only untracked entries from the orphan.
+    let status = observe::status(&target)?;
     let expected = model.status(0);
     let mut extra = Vec::new();
+    let mut matched = Vec::new();
     for record in status.split(|b| *b == 0).filter(|r| !r.is_empty()) {
-        let mut entry = record.to_vec();
-        entry.push(0);
-        if expected.windows(entry.len()).any(|w| w == entry.as_slice()) {
-            continue;
-        }
         let text = String::from_utf8_lossy(record).into_owned();
-        let under_private = private.iter().any(|d| {
-            d.file_name()
+        let under_orphan = orphans.iter().any(|o| {
+            o.file_name()
                 .is_some_and(|n| text.starts_with(&format!("?? {}/", n.to_string_lossy())))
         });
-        if !under_private {
-            return Err(format!(
-                "status entry {text:?} is neither modelled nor under the private dir"
-            )
-            .into());
+        if under_orphan {
+            extra.push(text);
+        } else {
+            matched.extend_from_slice(record);
+            matched.push(0);
         }
-        extra.push(text);
+    }
+    if matched != expected {
+        return Err(format!(
+            "status {:?} (orphan entries removed) != model {:?}",
+            String::from_utf8_lossy(&matched),
+            String::from_utf8_lossy(&expected)
+        )
+        .into());
     }
     if !extra.is_empty() {
-        eprintln!("NOTE: init {hash:?} {mode:?}: status lists leftover entries {extra:?}");
+        eprintln!(
+            "NOTE: init {} {mode:?}: status adds orphan entries {extra:?}",
+            hash.name()
+        );
     }
-    for dir in &private {
-        fs::remove_dir_all(dir)?;
+    // Operator recovery: remove only the observed orphan; then the state is
+    // exactly the model (HEAD, format, status, no refs, no locks, fsck).
+    for orphan in &orphans {
+        fs::remove_dir_all(orphan)?;
     }
-    // Without the leftover: a clean, unborn repository exactly as modelled
-    // (HEAD, object format, status, no refs, no locks, fsck).
     assert_state_with(&model, false)?;
     Ok(())
 }
@@ -683,7 +927,16 @@ fn interrupted_init(driver: Driver) -> Result {
     if driver::lacks(driver, &["init"], "interrupted_init") {
         return Ok(());
     }
-    run_matrix(|h, _, m| init_case(h, m), &["init.before-publish"], "init")
+    run_matrix(
+        |h, _, m| init_case(h, m, false),
+        &["init.before-publish"],
+        "init",
+    )?;
+    run_matrix(
+        |h, _, m| init_case(h, m, true),
+        &["init.before-publish"],
+        "init/bare",
+    )
 }
 
 #[cfg(unix)]

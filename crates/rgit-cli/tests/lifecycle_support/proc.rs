@@ -245,9 +245,12 @@ pub enum Preserve {
     AllowNewObjects,
 }
 
-/// Assert `after` equals `before` under `preserve`. Returns the newly added
-/// loose object paths so callers can report them.
+/// Assert `after` equals `before` under `preserve` (both snapshots of
+/// `root`). Every newly added loose object must be a complete, valid,
+/// read-only object whose content hashes to its name (checked by the
+/// oracle's own SHA). Returns the added paths so callers can report them.
 pub fn assert_preserved(
+    root: &Path,
     before: &BTreeMap<PathBuf, Snap>,
     after: &BTreeMap<PathBuf, Snap>,
     preserve: Preserve,
@@ -268,5 +271,57 @@ pub fn assert_preserved(
             return Err(format!("{context}: unexpected new entry {}", path.display()).into());
         }
     }
+    for path in &added {
+        if matches!(after.get(path), Some(Snap::File { .. })) {
+            verify_loose_object(root, path).map_err(|e| format!("{context}: {e}"))?;
+        }
+    }
     Ok(added)
+}
+
+/// `relative` is `<...>/objects/xx/<rest>` beneath `root`.
+fn verify_loose_object(root: &Path, relative: &Path) -> Result {
+    let full = root.join(relative);
+    let fanout = full.parent().ok_or("fan-out")?;
+    let objects = fanout.parent().ok_or("objects dir")?;
+    let git_dir = objects.parent().ok_or("git dir")?;
+    let oid = format!(
+        "{}{}",
+        fanout.file_name().ok_or("fan-out name")?.to_string_lossy(),
+        full.file_name().ok_or("object name")?.to_string_lossy()
+    );
+    let git_args = |args: &[&str]| -> Result<Vec<u8>> {
+        let mut command = git_cmd(root);
+        command.arg("--git-dir").arg(git_dir).args(args);
+        let output = run(&mut command)?;
+        if !output.status.success() {
+            return Err(format!("new object {oid}: git {args:?}: {}", describe(&output)).into());
+        }
+        Ok(output.stdout)
+    };
+    let kind = String::from_utf8(git_args(&["cat-file", "-t", &oid])?)?
+        .trim()
+        .to_owned();
+    let size: usize = String::from_utf8(git_args(&["cat-file", "-s", &oid])?)?
+        .trim()
+        .parse()?;
+    let body = git_args(&["cat-file", &kind, &oid])?;
+    let hash = match String::from_utf8(git_args(&["rev-parse", "--show-object-format"])?)?.trim() {
+        "sha256" => super::model::Hash::Sha256,
+        _ => super::model::Hash::Sha1,
+    };
+    if body.len() != size || hash.object_hex(&kind, &body) != oid {
+        return Err(format!(
+            "new loose object {oid} does not hash to its name ({kind}, {size} bytes)"
+        )
+        .into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if fs::symlink_metadata(&full)?.permissions().mode() & 0o222 != 0 {
+            return Err(format!("new loose object {oid} is writable").into());
+        }
+    }
+    Ok(())
 }

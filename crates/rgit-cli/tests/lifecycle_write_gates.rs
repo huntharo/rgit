@@ -319,7 +319,7 @@ mod special {
                     } else {
                         Preserve::AllowNewObjects
                     };
-                    assert_preserved(&before, &snapshot(s.dir())?, preserve, &context)?;
+                    assert_preserved(s.dir(), &before, &snapshot(s.dir())?, preserve, &context)?;
                     if observe::index(&s.root())? != s.model.checkouts[0].index {
                         return Err(format!("{context}: refused add changed the index").into());
                     }
@@ -361,6 +361,7 @@ mod special {
                 }
                 Some(128) => {
                     assert_preserved(
+                        s.dir(),
                         &before,
                         &snapshot(s.dir())?,
                         Preserve::AllowNewObjects,
