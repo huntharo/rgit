@@ -4,13 +4,8 @@
 //! the expectation is compared with is read while that lock is held, from the
 //! loose file or, if absent, from `packed-refs`. `packed-refs` is never
 //! rewritten here: a new loose file shadows a packed entry, as in C Git.
-//! As in C Git, reflog lines are appended (one write + fsync each) while the
-//! locks are held, after the compare-and-swap check and before the rename,
-//! so concurrent writers log in publication order. An update logged for a
-//! ref other than `HEAD` also holds `HEAD.lock` (taken first) so `HEAD`
-//! cannot be retargeted while deciding whether its log gets the line. A
-//! crash between the append and the rename leaves a reflog line whose new
-//! value never became the ref (see docs/decisions/0003).
+//! Reflog lines are appended after the rename and are not part of the atomic
+//! publication (see docs/decisions/0003).
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -48,44 +43,20 @@ impl Repository {
     ///
     /// `HEAD` may be updated only while detached; a symbolic `HEAD` is refused
     /// (update its branch instead). Symbolic or symlinked loose references are
-    /// refused. When `log` is given, `HEAD.lock` is held as well (a held
-    /// `HEAD.lock` refuses with [`Error::Locked`], as in C Git), and a reflog
-    /// line is appended for the reference (and for this worktree's `HEAD`
-    /// when, under `HEAD.lock`, it names the reference) as
-    /// `core.logAllRefUpdates` dictates, before the rename publishes the
-    /// value. See [`ReflogAppendError`], [`RefLoggedNotPublishedError`] and
-    /// [`RefPublishedUnsyncedError`] for failures around publication.
+    /// refused. When `log` is given, a reflog line is appended for the
+    /// reference (and for this worktree's `HEAD` when it points at the
+    /// reference) as `core.logAllRefUpdates` dictates. An error after the
+    /// rename means the new value may already be visible.
     pub fn update_ref(&self, update: &RefUpdate) -> Result<(), Error> {
-        self.publish_ref(
-            update,
-            PublishOptions {
-                locked: "ref.locked",
-                head_must_name_ref: false,
-            },
-        )
+        self.publish_ref(update, None)
     }
 
-    /// Shared CAS publication, in C Git's order:
-    ///
-    /// 1. Validate the name and the object (present, a commit for HEAD and
-    ///    branches, loose copy synced) and preflight paths; nothing written.
-    /// 2. When a reflog is requested for a ref other than `HEAD`, take
-    ///    `HEAD.lock` first and decide, while holding it, whether this
-    ///    worktree's `HEAD` names the ref (its log then gets a line too).
-    ///    `HEAD.lock` is released without touching `HEAD`.
-    /// 3. Take `<ref>.lock`, read the current value (loose, else packed) and
-    ///    compare it with the expectation; failpoint `options.locked`.
-    /// 4. Append every reflog line (one write + fsync each) while holding the
-    ///    locks; failpoint `ref.logged`.
-    /// 5. Rename the lock into place and sync the directory.
-    ///
-    /// A failure or crash after step 4 but before the rename leaves the ref
-    /// unchanged and its reflog with a line whose new value never became the
-    /// ref, as in C Git; the object exists, so fsck accepts it.
+    /// Shared CAS publication. `locked_failpoint` runs once the lock is held
+    /// and the expectation verified, immediately before the rename.
     pub(super) fn publish_ref(
         &self,
         update: &RefUpdate,
-        options: PublishOptions,
+        locked_failpoint: Option<&'static str>,
     ) -> Result<(), Error> {
         let location = self.ref_location(&update.name)?;
         self.check_object_id(update.new)?;
@@ -101,42 +72,11 @@ impl Repository {
             super::commit::validate_signature(&log.committer)?;
         }
         // Pre-checks so no directory is created for a conflicting name; the
-        // authoritative checks are repeated under the locks.
-        self.preflight_location(&location, update.log.is_some())?;
+        // authoritative checks are repeated under the lock.
+        let logs = self.preflight_location(&location, update.log.is_some())?;
         create_ref_dirs(&location.base, &location.path)?;
-
-        let hash = self.inner.object_hash();
-        let head_path = self.inner.git_dir().join("HEAD");
-        let needs_head_lock =
-            update.name != b"HEAD" && (update.log.is_some() || options.head_must_name_ref);
-        let head_lock = if needs_head_lock {
-            Some(LockFile::acquire(&head_path)?)
-        } else {
-            None
-        };
-        let head_names_ref = match &head_lock {
-            Some(_) => {
-                matches!(read_loose(&head_path, hash)?, Some(Loose::Symbolic(target)) if target == update.name)
-            }
-            None => false,
-        };
-        if options.head_must_name_ref && !head_names_ref {
-            return Err(Error::RefConflict {
-                name: b"HEAD".to_vec(),
-                expected: match update.expected {
-                    RefExpectation::MustEqual(id) => Some(id),
-                    _ => None,
-                },
-                actual: match read_loose(&head_path, hash)? {
-                    Some(Loose::Direct(id)) => Some(id),
-                    _ => None,
-                },
-            });
-        }
-
         let mut lock = LockFile::acquire(&location.path)?;
-        let lock_identity = LockIdentity::capture(&location.path)?;
-        let current = match read_loose(&location.path, hash)? {
+        let current = match read_loose(&location.path, self.inner.object_hash())? {
             Some(Loose::Direct(id)) => Some(id),
             Some(Loose::Symbolic(_)) if update.name == b"HEAD" => {
                 return Err(Error::UnsupportedCapability(
@@ -177,62 +117,45 @@ impl Repository {
             // appends no reflog entry.
             return Ok(());
         }
-        super::failpoint(options.locked)?;
+        if let Some(name) = locked_failpoint {
+            super::failpoint(name)?;
+        }
         let content = format!("{}\n", update.new.to_hex());
         lock.write_all(content.as_bytes())?;
+        let lock_identity = LockIdentity::capture(&location.path)?;
+        // An error after the rename inside `commit` (directory sync) means the
+        // new value is visible but its durability is unknown: the reflogs are
+        // still appended and `RefPublishedUnsyncedError` says so.
+        let unsynced = match lock.commit() {
+            Ok(()) => None,
+            Err(error) if lock_identity.renamed(&location.path, content.as_bytes()) => Some(error),
+            Err(error) => return Err(error),
+        };
 
-        // Reflogs are appended while the locks are held, so concurrent
-        // writers append in publication order and HEAD's log follows the
-        // HEAD target observed under HEAD.lock. A lock removed or replaced by
-        // someone else is refused before anything is logged (the rename
-        // re-checks it).
-        if !lock_identity.still_held(&location.path) {
-            return Err(Error::Locked(LockIdentity::lock_path(&location.path)));
-        }
-        let mut logged = false;
+        // Only reached once the rename succeeded.
+        let mut reflog_failure = None;
         if let Some(log) = &update.log {
-            let old = current.unwrap_or_else(|| ObjectId::null(hash));
+            let old = current.unwrap_or_else(|| ObjectId::null(self.inner.object_hash()));
             let line = reflog_line(old, update.new, log);
-            for (base, path) in self.reflog_targets(&location, head_names_ref)? {
-                append_reflog(&base, &path, &line).map_err(|source| {
-                    Error::Other(Box::new(ReflogAppendError {
-                        reference: update.name.clone(),
-                        source,
-                        partially_logged: logged,
-                    }))
-                })?;
-                logged = true;
+            for (base, path) in logs {
+                if let Err(source) = append_reflog(&base, &path, &line) {
+                    reflog_failure = Some(source);
+                    break;
+                }
             }
         }
-        if let Err(source) = super::failpoint("ref.logged") {
-            return Err(if logged {
-                Error::Other(Box::new(RefLoggedNotPublishedError {
-                    reference: update.name.clone(),
-                    source,
-                }))
-            } else {
-                source
-            });
-        }
-
-        let result = match lock.commit() {
-            Ok(()) => Ok(()),
-            // Renamed: visible, durability unknown; reflogs already appended.
-            Err(source) if lock_identity.renamed(&location.path, content.as_bytes()) => {
-                Err(Error::Other(Box::new(RefPublishedUnsyncedError {
-                    reference: update.name.clone(),
-                    source,
-                })))
-            }
-            // Not renamed: the ref is unchanged, but its reflog says otherwise.
-            Err(source) if logged => Err(Error::Other(Box::new(RefLoggedNotPublishedError {
+        match (unsynced, reflog_failure) {
+            (Some(source), reflog) => Err(Error::Other(Box::new(RefPublishedUnsyncedError {
+                reference: update.name.clone(),
+                source,
+                reflog,
+            }))),
+            (None, Some(source)) => Err(Error::Other(Box::new(ReflogAppendError {
                 reference: update.name.clone(),
                 source,
             }))),
-            Err(source) => Err(source),
-        };
-        drop(head_lock);
-        result
+            (None, None) => Ok(()),
+        }
     }
 
     /// Refusals for publishing `name` that need no object and no lock: name
@@ -263,14 +186,7 @@ impl Repository {
             _ => {}
         }
         if log {
-            // Path validation only; the HEAD decision is repeated under
-            // HEAD.lock at publication.
-            let head_names_ref = location.name != b"HEAD"
-                && matches!(
-                    read_loose(&self.inner.git_dir().join("HEAD"), self.inner.object_hash())?,
-                    Some(Loose::Symbolic(target)) if target == location.name
-                );
-            self.reflog_targets(location, head_names_ref)
+            self.reflog_targets(location)
         } else {
             Ok(Vec::new())
         }
@@ -441,16 +357,17 @@ impl Repository {
         Ok(PackedRefs(refs))
     }
 
-    /// Reflog files to append for an update of `location`: the reference's
-    /// own log and, when `head_names_ref`, this worktree's `HEAD` log.
-    fn reflog_targets(
-        &self,
-        location: &RefLocation,
-        head_names_ref: bool,
-    ) -> Result<Vec<(PathBuf, PathBuf)>, Error> {
+    /// Reflog files to append for an update of `location`, decided before
+    /// locking: the reference's own log and, when this worktree's `HEAD`
+    /// names it, `HEAD`'s log.
+    fn reflog_targets(&self, location: &RefLocation) -> Result<Vec<(PathBuf, PathBuf)>, Error> {
         let mode = self.log_all_ref_updates()?;
         let mut names = vec![location.name.clone()];
-        if location.name != b"HEAD" && head_names_ref {
+        if location.name != b"HEAD"
+            && let Some(Loose::Symbolic(target)) =
+                read_loose(&self.inner.git_dir().join("HEAD"), self.inner.object_hash())?
+            && target == location.name
+        {
             names.push(b"HEAD".to_vec());
         }
         let mut paths = Vec::new();
@@ -504,15 +421,6 @@ impl Repository {
             },
         }
     }
-}
-
-/// How `publish_ref` is driven by its caller.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct PublishOptions {
-    /// Failpoint hit with the locks held and the expectation verified.
-    pub(super) locked: &'static str,
-    /// Commit on a branch: `HEAD` must still name the ref under `HEAD.lock`.
-    pub(super) head_must_name_ref: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -718,14 +626,6 @@ impl LockIdentity {
         })
     }
 
-    /// The lock path still names the lock we created (Unix: same inode).
-    #[cfg(unix)]
-    fn still_held(&self, target: &Path) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::symlink_metadata(Self::lock_path(target))
-            .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == self.identity)
-    }
-
     /// The target is now our lock file (Unix: same inode).
     #[cfg(unix)]
     fn renamed(&self, target: &Path, _content: &[u8]) -> bool {
@@ -739,13 +639,6 @@ impl LockIdentity {
         Ok(Self {})
     }
 
-    /// Without inode numbers: our open handle denies deletion, so presence
-    /// of a regular file is the check.
-    #[cfg(not(unix))]
-    fn still_held(&self, target: &Path) -> bool {
-        std::fs::symlink_metadata(Self::lock_path(target)).is_ok_and(|metadata| metadata.is_file())
-    }
-
     /// Without inode numbers: the lock is gone and the target holds our bytes.
     #[cfg(not(unix))]
     fn renamed(&self, target: &Path, content: &[u8]) -> bool {
@@ -755,18 +648,24 @@ impl LockIdentity {
 }
 
 /// The reference WAS updated (renamed into place), but syncing its directory
-/// failed, so its durability across a crash is unknown. Its reflogs had
-/// already been appended. Returned inside [`Error::Other`].
+/// failed, so its durability across a crash is unknown. Reflogs were still
+/// appended unless `reflog_failed()`. Returned inside [`Error::Other`].
 #[derive(Debug)]
 pub struct RefPublishedUnsyncedError {
     reference: Vec<u8>,
     source: Error,
+    reflog: Option<std::io::Error>,
 }
 
 impl RefPublishedUnsyncedError {
     /// The reference that now holds the new value.
     pub fn reference(&self) -> &[u8] {
         &self.reference
+    }
+
+    /// Whether appending a reflog also failed.
+    pub fn reflog_failed(&self) -> bool {
+        self.reflog.is_some()
     }
 }
 
@@ -777,7 +676,11 @@ impl std::fmt::Display for RefPublishedUnsyncedError {
             "reference {:?} was updated, but syncing it failed ({}); its durability is unknown",
             BStr::new(&self.reference),
             self.source
-        )
+        )?;
+        if let Some(error) = &self.reflog {
+            write!(f, " (appending its reflog also failed: {error})")?;
+        }
+        Ok(())
     }
 }
 
@@ -787,26 +690,19 @@ impl std::error::Error for RefPublishedUnsyncedError {
     }
 }
 
-/// Appending a reflog line failed before publication: the reference was NOT
-/// updated. If `partially_logged()`, an earlier log of the same update (the
-/// reference's own, before `HEAD`'s) already gained a line whose new value
-/// never became the reference. Returned inside [`Error::Other`].
+/// The reference was published, but its reflog could not be appended.
+/// Returned inside [`Error::Other`]; only ever produced after the rename that
+/// published the new value succeeded.
 #[derive(Debug)]
 pub struct ReflogAppendError {
     reference: Vec<u8>,
     source: std::io::Error,
-    partially_logged: bool,
 }
 
 impl ReflogAppendError {
-    /// The reference that was left unchanged.
+    /// The reference that now holds the new value.
     pub fn reference(&self) -> &[u8] {
         &self.reference
-    }
-
-    /// Whether another reflog of this update was already appended.
-    pub fn partially_logged(&self) -> bool {
-        self.partially_logged
     }
 }
 
@@ -814,48 +710,13 @@ impl std::fmt::Display for ReflogAppendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "appending the reflog for {:?} failed ({}); the reference was not updated",
-            BStr::new(&self.reference),
-            self.source
+            "reference {:?} was updated, but appending its reflog failed",
+            BStr::new(&self.reference)
         )
     }
 }
 
 impl std::error::Error for ReflogAppendError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-
-/// The reflog lines were appended, but publishing the reference (the rename
-/// of its lock) then failed: the reference was NOT updated and its reflog
-/// has a line whose new value never became the reference (as after a crash
-/// at the same point in C Git). Returned inside [`Error::Other`].
-#[derive(Debug)]
-pub struct RefLoggedNotPublishedError {
-    reference: Vec<u8>,
-    source: Error,
-}
-
-impl RefLoggedNotPublishedError {
-    /// The reference that was left unchanged.
-    pub fn reference(&self) -> &[u8] {
-        &self.reference
-    }
-}
-
-impl std::fmt::Display for RefLoggedNotPublishedError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "reference {:?} was not updated ({}), but its reflog already records the update",
-            BStr::new(&self.reference),
-            self.source
-        )
-    }
-}
-
-impl std::error::Error for RefLoggedNotPublishedError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.source)
     }

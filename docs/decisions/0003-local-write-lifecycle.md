@@ -57,34 +57,27 @@ visibility/atomic-rename only.
 
 ## Reference and reflog ordering
 
-A reference update is not a transaction across the reference and its reflogs;
-rgit follows C Git's order so that concurrent writers (rgit or C Git) append
-in publication order. Before any lock: validate the name, require and sync the
-new object, and preflight the reference and reflog paths. Then, for any update
-of a non-`HEAD` reference that logs (and always for a commit on a branch),
-take `HEAD.lock` first and decide under it whether this worktree's `HEAD`
-names the reference; take `<ref>.lock`; read and compare the current value
-(loose, else `packed-refs`); write the new value into the lock; confirm the
-lock is still ours; append one synced line to the reference's log and, when
-`HEAD` names it, to `HEAD`'s log; rename the lock over the reference; sync the
-directory; release `HEAD.lock` without changing `HEAD`. A held `HEAD.lock`
-refuses the update (`Locked`), as it does for C Git.
+A reference update is not a transaction across the reference and its reflogs.
+The order is: validate the name and the new object; take `<ref>.lock` (and,
+for a commit on a branch, `HEAD.lock`); read and compare the current value
+under the lock; write and sync the lock; rename it over the reference; sync the
+directory; then append one line to each applicable reflog (the reference's log
+and, when this worktree's `HEAD` names it, `HEAD`'s log), each append synced.
 
-Observable by a fresh process, for a branch that `HEAD` names:
+Consequences, all observable by a fresh process:
 
-| Interruption or failure | Reference | Reflogs | Left after a crash | Reported |
-| --- | --- | --- | --- | --- |
-| Refusal, CAS conflict, held lock, or before `ref.locked`/`commit.ref-locked` | old | unchanged | the locks already taken | typed error; possible new unreferenced objects |
-| Reflog append fails | old | unchanged, or the branch log only (`partially_logged`) | none (handled) | `ReflogAppendError`: the reference was not updated |
-| After the append, before the rename (`ref.logged`, `lock.before-rename`) | old | new line in each log | `HEAD.lock` and `<ref>.lock` | `RefLoggedNotPublishedError`: not updated, but the reflog records the update |
-| After the rename (`lock.after-rename`), directory sync fails | new | new line in each log | `HEAD.lock` | `RefPublishedUnsyncedError`: updated, durability unknown |
-| Success | new | new line in each log | none | Ok |
+| Interruption or failure | Reference | Reflog | Reported |
+| --- | --- | --- | --- |
+| Before the rename (including refusal, CAS conflict, held lock) | old value | unchanged | error; state unchanged except possible unreferenced objects |
+| Crash after the rename, before the appends | new value | entry missing | process died; no false entry is ever written. For a commit on a branch, `HEAD.lock` (held across the branch rename so `HEAD` cannot be re-pointed mid-commit) remains and refuses later writers until removed |
+| Append fails after the rename | new value | entry missing (or present in one log but not the other) | `ReflogAppendError`: the reference *was* updated; CLI exits 128 with that diagnostic |
+| Directory sync fails after the rename | new value visible | appended | `RefPublishedUnsyncedError`: the reference *was* updated, its durability is unknown (and a reflog append failure is named too) |
 
-A reflog line whose new value never became the reference is C Git's
-behaviour after the same interruption; the object exists, so `git fsck
---strict` accepts it. For a detached `HEAD` the reference lock is `HEAD.lock`
-and only `logs/HEAD` changes. A caller (or test oracle) must never treat an
-error from a write operation as proof that the repository is unchanged.
+C Git appends the reflog before renaming the reference, so its failure modes
+differ: it can record an entry for an update that never became visible. rgit
+prefers a possibly missing entry to a false one. A caller (or test oracle)
+must never treat an error from a write operation as proof that the repository
+is unchanged; only the "before the rename" rows guarantee that.
 
 ## Ownership and frozen API
 
@@ -113,9 +106,7 @@ Pause uses `RGIT_FAILPOINT_READY` / `RGIT_FAILPOINT_RELEASE` file paths.
 | `add.objects-written` | blobs synced, index lock not yet taken |
 | `add.index-locked` | `index.lock` held and written, before commit |
 | `commit.objects-written` | tree/commit synced, ref not yet locked |
-| `commit.ref-locked` | commit: `HEAD.lock` and ref lock held, expected value verified, nothing logged |
-| `ref.locked` | `update_ref`: locks held, expected value verified, nothing logged |
-| `ref.logged` | reflog lines appended under the locks, reference not yet renamed |
+| `commit.ref-locked` | ref lock held, expected value verified, before rename |
 
 ## CLI contract (integration owner)
 

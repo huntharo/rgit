@@ -12,8 +12,8 @@ use std::collections::HashSet;
 
 use crate::{Error, ObjectId, ObjectKind, Repository};
 
-use super::refs::{Loose, PublishOptions, format_signature, read_loose};
-use super::{RefExpectation, RefLog, RefUpdate};
+use super::refs::{Loose, format_signature, read_loose};
+use super::{LockFile, RefExpectation, RefLog, RefUpdate};
 
 /// A Git identity line: `name <email> seconds ±HHMM`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,16 +197,29 @@ impl Repository {
                 message,
             }),
         };
-        // On a branch, publish_ref holds HEAD.lock across the publication and
-        // requires HEAD to still name the branch, so HEAD cannot be re-pointed
-        // (for example by a branch switch) in between; HEAD is not touched.
-        self.publish_ref(
-            &update,
-            PublishOptions {
-                locked: "commit.ref-locked",
-                head_must_name_ref: reference != b"HEAD",
-            },
-        )?;
+        if reference == b"HEAD" {
+            self.publish_ref(&update, Some("commit.ref-locked"))?;
+        } else {
+            // Hold HEAD.lock so HEAD cannot be re-pointed (for example by a
+            // branch switch) between this check and the branch publication.
+            // It is released without touching HEAD.
+            let head_lock = LockFile::acquire(&head_path)?;
+            match read_loose(&head_path, hash)? {
+                Some(Loose::Symbolic(target)) if target == reference => {}
+                other => {
+                    return Err(Error::RefConflict {
+                        name: b"HEAD".to_vec(),
+                        expected: parent,
+                        actual: match other {
+                            Some(Loose::Direct(id)) => Some(id),
+                            _ => None,
+                        },
+                    });
+                }
+            }
+            self.publish_ref(&update, Some("commit.ref-locked"))?;
+            drop(head_lock);
+        }
         Ok(CommitOutcome {
             id,
             tree,

@@ -20,19 +20,13 @@ mod init;
 mod lock;
 mod object;
 mod refs;
-// Allowance until init/object/index adopt these helpers in this milestone.
-#[allow(dead_code)]
 mod sys;
 
 pub use commit::{CommitOutcome, CommitRequest, Signature};
 pub use index::{AddOutcome, AddRefusal};
 pub use init::{InitOptions, InitPublishedError, ObjectFormat, init};
-pub use refs::{
-    RefExpectation, RefLog, RefLoggedNotPublishedError, RefPublishedUnsyncedError, RefUpdate,
-    ReflogAppendError,
-};
+pub use refs::{RefExpectation, RefLog, RefPublishedUnsyncedError, RefUpdate, ReflogAppendError};
 
 pub(crate) use failpoint::hit as failpoint;
 pub(crate) use lock::{LockFile, sync_parent};
-#[allow(unused_imports)]
 pub(crate) use sys::{open_leaf_nofollow, rename_noreplace};
