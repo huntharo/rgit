@@ -112,6 +112,55 @@ fn oracle_detects_divergence_and_corruption() -> Result {
     assert!(observe::index(&root).is_err(), "missed torn index");
     fs::write(git_dir.join("index"), &index)?;
 
+    // A "new loose object" that is not a valid object named by its hash.
+    let before = snapshot(s.dir())?;
+    let fake_dir = git_dir.join("objects/ab");
+    fs::create_dir_all(&fake_dir)?;
+    let fake = fake_dir.join("cdef0123456789abcdef0123456789abcdef01");
+    fs::write(&fake, b"not a zlib stream")?;
+    assert!(
+        assert_preserved(
+            s.dir(),
+            &before,
+            &snapshot(s.dir())?,
+            Preserve::AllowNewObjects,
+            "fake"
+        )
+        .is_err(),
+        "missed an invalid new object"
+    );
+    fs::remove_dir_all(&fake_dir)?;
+    // A valid object that is writable (not immutable) is rejected too.
+    let before = snapshot(s.dir())?;
+    fs::write(root.join("valid-new"), b"valid new object\n")?;
+    let oid = git_text(&root, &["hash-object", "-w", "valid-new"])?;
+    fs::remove_file(root.join("valid-new"))?;
+    let object = git_dir.join("objects").join(&oid[..2]).join(&oid[2..]);
+    assert_preserved(
+        s.dir(),
+        &before,
+        &snapshot(s.dir())?,
+        Preserve::AllowNewObjects,
+        "valid",
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&object, fs::Permissions::from_mode(0o644))?;
+        assert!(
+            assert_preserved(
+                s.dir(),
+                &before,
+                &snapshot(s.dir())?,
+                Preserve::AllowNewObjects,
+                "writable"
+            )
+            .is_err(),
+            "missed a writable new object"
+        );
+        fs::set_permissions(&object, fs::Permissions::from_mode(0o444))?;
+    }
+
     // A commit with a different date than the model predicted.
     let mut wrong = s.model.clone();
     let when = wrong.tick();
@@ -169,7 +218,13 @@ fn init_reports_and_refuses_existing(driver: Driver) -> Result {
     let output = driver.init(s.dir(), &["-q", "repo"])?;
     if driver.refuses_reinit() {
         refused(&output, 128, "re-init")?;
-        assert_preserved(&before, &snapshot(s.dir())?, Preserve::Exact, "re-init")?;
+        assert_preserved(
+            s.dir(),
+            &before,
+            &snapshot(s.dir())?,
+            Preserve::Exact,
+            "re-init",
+        )?;
     } else {
         ok(&output, "C Git re-init")?;
     }
@@ -219,6 +274,7 @@ fn bare_init_and_worktree_refusals(driver: Driver) -> Result {
             "commit in bare",
         )?;
         assert_preserved(
+            sandbox.path(),
             &before_with_file,
             &snapshot(sandbox.path())?,
             Preserve::Exact,
@@ -514,6 +570,7 @@ fn nothing_to_commit_and_allow_empty(driver: Driver) -> Result {
     )?;
     if driver.index_bytes_stable_on_refusal() {
         assert_preserved(
+            s.dir(),
             &before,
             &snapshot(s.dir())?,
             Preserve::Exact,

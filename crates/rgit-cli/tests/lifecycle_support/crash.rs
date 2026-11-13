@@ -208,6 +208,7 @@ pub fn classify_head(model_old: &Model, model_new: &Model, c: usize) -> Result<P
 /// Snapshot comparison that ignores the named published files and lock files
 /// (classified separately) and allows new loose objects.
 pub fn assert_unpublished_untouched(
+    root: &Path,
     before: &BTreeMap<PathBuf, Snap>,
     after: &BTreeMap<PathBuf, Snap>,
     published: &[PathBuf],
@@ -222,6 +223,7 @@ pub fn assert_unpublished_untouched(
             .collect()
     };
     assert_preserved(
+        root,
         &filter(before),
         &filter(after),
         Preserve::AllowNewObjects,
