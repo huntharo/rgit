@@ -73,6 +73,9 @@ impl Repository {
             );
         }
         let mut index = self.read_index()?;
+        // Git emits tracked changes before the separately sorted untracked
+        // group. A staged deletion can also be recreated as an untracked path.
+        let mut untracked_paths = BTreeSet::new();
         // Every filesystem mtime represented by gix's unsigned seconds is at or
         // after this timestamp. Even a stat match must take the racy-content
         // comparison path. Explicit user opt-outs remain effective.
@@ -110,11 +113,7 @@ impl Repository {
                 {
                     path.push(b'/');
                 }
-                result.entry(path.clone()).or_insert(StatusEntry {
-                    path,
-                    index: b'?',
-                    worktree: b'?',
-                });
+                untracked_paths.insert(path);
                 continue;
             }
             let code = match summary {
@@ -132,7 +131,14 @@ impl Repository {
             });
             entry.worktree = code;
         }
-        Ok(result.into_values().collect())
+        Ok(result
+            .into_values()
+            .chain(untracked_paths.into_iter().map(|path| StatusEntry {
+                path,
+                index: b'?',
+                worktree: b'?',
+            }))
+            .collect())
     }
 
     pub(crate) fn inspection_execution_policy(&self) -> Result<(), Error> {

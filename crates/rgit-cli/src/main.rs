@@ -44,7 +44,7 @@ enum Command {
         nul: bool,
         #[arg(long)]
         no_renames: bool,
-        #[arg(short = 'u', long, default_value = "normal", num_args = 0..=1, default_missing_value = "all", require_equals = true)]
+        #[arg(short = 'u', long, default_value = "normal", num_args = 0..=1, default_missing_value = "all")]
         untracked_files: String,
     },
     /// List index paths and optionally their object IDs, modes and stages.
