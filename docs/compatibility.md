@@ -95,7 +95,12 @@ rgit. On Unix, files and directory entries are synced; Windows has no directory
 sync, so its guarantees are atomic visibility only. Hooks never run; signing,
 `commit.gpgSign` and `i18n.commitEncoding` other than UTF-8 are refused.
 
-Every refusal below happens before the first object or index write:
+Every refusal below is a capability, format or input check that happens before
+the first object or index write. Lock contention is different: it is detected
+when the lock is taken, after the operation has written the new objects it
+needs, so a refused `add` or `commit` behind a held lock can leave new complete,
+unreferenced loose objects (existing objects, refs, index and worktree are
+unchanged). This follows the objects-before-names rule.
 
 - Repositories: bare repositories for `add`/`commit`; reftable and other
   unsupported extensions (at discovery); index version 4, `index.version` other
@@ -131,12 +136,18 @@ Differences from C Git:
   Resolve-undo, untracked-cache and fsmonitor extensions are dropped when the
   index is rewritten; `index.skipHash` is ignored and a checksum is always
   written. No `safecrlf` warnings are printed.
-- `commit` writes identities verbatim (no C Git whitespace trimming), never
-  runs hooks or editors, cannot amend, and refuses during merge, rebase or
-  sequencer operations. Without `GIT_*_DATE` the timestamp is the current time
-  with a `+0000` offset (no local time zone). Identity comes from
-  `GIT_{AUTHOR,COMMITTER}_{NAME,EMAIL}` or repository-local `user.*` only.
-  Nothing to commit exits 128, not 1. `commit` reads the index without taking
+- `commit -m` applies C Git's default `whitespace` message cleanup and trims
+  identities like C Git (leading/trailing whitespace and `,:;<>"'\`; inner
+  `<`, `>` and newlines removed), so identical inputs produce identical commit
+  IDs; tests compare them byte for byte. It never runs hooks or editors,
+  cannot amend, and refuses during merge, rebase or sequencer operations.
+  Identity comes from `GIT_{AUTHOR,COMMITTER}_{NAME,EMAIL}` or
+  repository-local `user.*` only. Without `GIT_*_DATE` both timestamps use one
+  reading of the current time with a `+0000` offset (no local time zone).
+  Dates accept only `[@]<seconds> <±hhmm>` and ISO 8601
+  `YYYY-MM-DD[T ]HH:MM:SS` with `Z`, `±HH:MM` or `±HHMM`; fractional seconds,
+  a space before the zone, RFC 2822, zone-less dates and approximate dates
+  are refused. Nothing to commit and an empty message exit 128, not 1. `commit` reads the index without taking
   `index.lock`, so it commits the index snapshot it read; a concurrent `add`
   published after that read is not included.
 - Objects are always written loose (zlib level 1); there is no packing or
@@ -146,6 +157,27 @@ Differences from C Git:
   diagnostic stating that the reference was updated.
 - Ignore and attribute rules come from the worktree, `info/` and
   repository-local config only, consistent with isolated discovery.
+- `add` refuses absolute paths even inside the worktree, and `path/` must name a
+  directory. A conflicted path is refused even without in-progress operation
+  state (for example after a conflicting `git stash pop`), where C Git would
+  resolve it. Any skip-worktree, assume-unchanged or gitlink entry under the
+  pathspec refuses the whole call.
+- An empty directory left where a reference must be created (for example
+  `refs/heads/a/` after `refs/heads/a/b` was deleted) is a conflict; C Git
+  removes it and proceeds.
+- For a plain reference update outside `commit`, which reflogs to append
+  (including `HEAD`'s) is decided before the lock; `HEAD` re-pointed
+  concurrently can receive or miss that line. `commit` holds `HEAD.lock` and
+  is not affected.
+- Durability covers objects rgit writes. Objects another program wrote and
+  rgit only references (for example a parent commit written by C Git without
+  `core.fsync`) are checked for presence, not synced.
+
+Known race windows, outside the claim that preflight is a filesystem sandbox:
+a path swapped for a FIFO or symlink between `add`'s `lstat` and `open` can
+block or be followed (content is re-hashed and verified, so wrong bytes are
+never staged); and on Unix the rename that publishes `init` replaces an empty
+`.git` directory that a concurrent `git init` created in that instant.
 
 Recovery after interruption: a fresh process sees each of the index, `HEAD`
 and the branch ref either completely old or completely new. Abrupt termination
