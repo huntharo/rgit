@@ -6,6 +6,9 @@ pub use gix::ObjectId;
 pub use gix::bstr::BStr;
 pub use gix::object::Kind as ObjectKind;
 
+mod diff;
+pub use diff::DiffEntry;
+
 mod graph;
 pub use graph::GraphLimits;
 mod inspection;
