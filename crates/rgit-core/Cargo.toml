@@ -14,6 +14,11 @@ failpoints = []
 gix.workspace = true
 similar.workspace = true
 
+# Safe atomic no-replace rename and no-follow/non-blocking opens (already in
+# the dependency tree through gix; never used with `unsafe` in this crate).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs"] }
+
 [dev-dependencies]
 tempfile.workspace = true
 
