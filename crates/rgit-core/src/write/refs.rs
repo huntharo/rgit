@@ -839,8 +839,6 @@ pub struct RefLoggedNotPublishedError {
 
 impl RefLoggedNotPublishedError {
     /// The reference that was left unchanged.
-    // Reachable once write/mod.rs re-exports this type (integration owner).
-    #[allow(dead_code)]
     pub fn reference(&self) -> &[u8] {
         &self.reference
     }
