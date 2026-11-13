@@ -381,6 +381,59 @@ mod special {
         }
         Ok(())
     }
+
+    /// A FIFO `.gitattributes`/`.gitignore` in the root or any ancestor of a
+    /// staged path (or inside a staged directory) makes `add` refuse
+    /// promptly with exit 128 and every byte unchanged, for a modified
+    /// tracked file, a new file and a directory pathspec. rgit only: C Git
+    /// opens such a FIFO and blocks.
+    pub fn ancestor_metadata_fifo(driver: Driver) -> Result {
+        for name in [".gitattributes", ".gitignore"] {
+            for location in ["", "dir", "dir/sub"] {
+                for spec in ["dir/sub/file", "dir/sub/new", "dir", "."] {
+                    let mut s = Scenario::init(driver, Hash::Sha1, "main")?;
+                    s.model.write(0, b"dir/sub/file", b"tracked\n")?;
+                    s.add(0, &[b"dir/sub/file"])?;
+                    s.commit(0, &["base"])?;
+                    s.model.write(0, b"dir/sub/file", b"modified\n")?;
+                    s.model.write(0, b"dir/sub/new", b"new\n")?;
+                    let fifo = s.root().join(location).join(name);
+                    mkfifo(&fifo)?;
+                    let context = format!(
+                        "add {spec} with FIFO {}",
+                        Path::new(location).join(name).display()
+                    );
+                    let before = snapshot(s.dir())?;
+                    let output = add_bounded(driver, &s.root(), &[spec])?;
+                    refused(&output, 128, &context)?;
+                    assert_preserved(
+                        s.dir(),
+                        &before,
+                        &snapshot(s.dir())?,
+                        Preserve::Exact,
+                        &context,
+                    )?;
+                    fs::remove_file(&fifo)?;
+                    s.check().map_err(|e| format!("{context}: {e}"))?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn ancestor_metadata_fifo_refuses_add_promptly(driver: Driver) -> Result {
+    if lifecycle_support::driver::lacks(driver, &["add"], "ancestor_metadata_fifo") {
+        return Ok(());
+    }
+    special::ancestor_metadata_fifo(driver)
+}
+
+#[cfg(unix)]
+mod unix_rgit {
+    use super::*;
+    rgit_only!(ancestor_metadata_fifo_refuses_add_promptly);
 }
 
 #[cfg(unix)]

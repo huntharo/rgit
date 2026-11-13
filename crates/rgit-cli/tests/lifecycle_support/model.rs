@@ -138,6 +138,72 @@ pub fn message(parts: &[&str]) -> String {
     text
 }
 
+/// The message `commit -m <part>...` records, derived from C Git's rules
+/// rather than any implementation: parts are joined as paragraphs (each
+/// completed to a line, separated by a newline), then cleaned up in
+/// "whitespace" mode: trailing whitespace (space, tab, CR, LF) is removed
+/// from every line, leading and trailing blank lines are dropped and runs of
+/// blank lines collapse to one. Comment lines are kept.
+pub fn cleaned_message(parts: &[&str]) -> String {
+    let mut raw = String::new();
+    for part in parts {
+        if !raw.is_empty() {
+            raw.push('\n');
+        }
+        raw.push_str(part);
+        if !raw.is_empty() && !raw.ends_with('\n') {
+            raw.push('\n');
+        }
+    }
+    let mut out = String::new();
+    let mut blanks = 0;
+    for line in raw.split('\n') {
+        let line = line.trim_end_matches([' ', '\t', '\r']);
+        if line.is_empty() {
+            blanks += 1;
+            continue;
+        }
+        if blanks > 0 && !out.is_empty() {
+            out.push('\n');
+        }
+        blanks = 0;
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// C Git's identity "crud" trimming: drop leading/trailing bytes that are
+/// <= 0x20 or one of `,:;<>"\'` ('.' stopped being crud in Git 2.17), then
+/// remove every '<', '>' and LF.
+pub fn without_crud(value: &str) -> String {
+    let crud = |c: char| c as u32 <= 32 || ",:;<>\"\\'".contains(c);
+    value
+        .trim_start_matches(crud)
+        .trim_end_matches(crud)
+        .chars()
+        .filter(|c| !matches!(c, '<' | '>' | '\n'))
+        .collect()
+}
+
+pub fn commit_body_as(
+    tree: &str,
+    parents: &[String],
+    name: &str,
+    email: &str,
+    when: i64,
+    message: &str,
+) -> Vec<u8> {
+    let mut body = format!("tree {tree}\n");
+    for parent in parents {
+        body.push_str(&format!("parent {parent}\n"));
+    }
+    body.push_str(&format!("author {name} <{email}> {when} +0000\n"));
+    body.push_str(&format!("committer {name} <{email}> {when} +0000\n\n"));
+    body.push_str(message);
+    body.into_bytes()
+}
+
 pub fn commit_body(tree: &str, parents: &[String], when: i64, message: &str) -> Vec<u8> {
     let mut body = format!("tree {tree}\n");
     for parent in parents {
