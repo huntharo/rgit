@@ -188,8 +188,9 @@ in the worktree are pre-read the same way and handed to Gitoxide from memory;
 after an `lstat` check. An already-present loose object is accepted only after
 its content is inflated and its hash verified. Parent directories are still
 resolved by path: an ancestor directory swapped for a symlink concurrently is
-not detected. On Windows an object that already exists cannot be re-synced
-(`FlushFileBuffers` needs write access to a read-only file), the leaf
+not detected. On Windows an object that already exists is not re-synced by this
+implementation (it is read-only, and syncing would need a writable handle), so
+its durability there relies on whoever wrote it; the leaf
 fingerprint is size and modification time
 only, and the exclusive-creation fallback for `init` is used because no
 atomic no-replace rename is available. Preflight is therefore not a filesystem sandbox against an actively
