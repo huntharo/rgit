@@ -42,6 +42,9 @@ pub fn git(root: &Path, args: &[&str]) -> Result<Output> {
 
 /// `git fsck --strict --no-dangling` must succeed.
 pub fn fsck(root: &Path) -> Result {
-    git(root, &["fsck", "--strict", "--no-dangling", "--no-progress"])?;
+    git(
+        root,
+        &["fsck", "--strict", "--no-dangling", "--no-progress"],
+    )?;
     Ok(())
 }
