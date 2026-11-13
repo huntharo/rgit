@@ -8,6 +8,10 @@ pub use gix::object::Kind as ObjectKind;
 
 mod graph;
 pub use graph::GraphLimits;
+mod inspection;
+pub use inspection::IndexEntry;
+mod status;
+pub use status::{StatusEntry, UntrackedMode};
 
 /// Operation errors retain the underlying Gitoxide error as their source.
 #[derive(Debug)]
@@ -29,6 +33,8 @@ pub enum Error {
     },
     GraphCycle,
     UnsupportedHistory(&'static str),
+    UnsupportedCapability(&'static str),
+    InvalidPath(Vec<u8>),
 }
 
 impl std::fmt::Display for Error {
@@ -45,12 +51,14 @@ impl std::fmt::Display for Error {
             Self::UnsupportedExtension(name) => {
                 write!(f, "unsupported repository extension: {name}")
             }
-            Self::Io(error) => write!(f, "could not read graph data: {error}"),
+            Self::Io(error) => write!(f, "I/O failure: {error}"),
             Self::InvalidShallow => write!(f, "invalid shallow boundary object ID"),
             Self::GraphLimit { resource, limit } => {
                 write!(f, "commit graph exceeds {resource} limit ({limit})")
             }
             Self::GraphCycle => write!(f, "commit graph contains a cycle"),
+            Self::UnsupportedCapability(feature) => write!(f, "unsupported capability: {feature}"),
+            Self::InvalidPath(path) => write!(f, "unsafe repository path: {:?}", BStr::new(path)),
             Self::UnsupportedHistory(feature) => {
                 write!(f, "unsupported history feature: {feature}")
             }
