@@ -44,12 +44,13 @@ const ADD_POINTS: [&str; 5] = [
     "add.index-locked",
 ];
 
-const COMMIT_POINTS: [&str; 5] = [
+const COMMIT_POINTS: [&str; 6] = [
     "lock.acquired",
     "lock.before-rename",
     "lock.after-rename",
     "commit.objects-written",
     "commit.ref-locked",
+    "ref.logged",
 ];
 
 fn based(hash: Hash, shape: Shape) -> Result<Scenario> {
@@ -252,88 +253,59 @@ fn commit_case(hash: Hash, shape: Shape, point: &str, mode: Mode) -> Result {
         Mode::Error => expect_injected(&output, point)?,
     }
 
+    // Never infer "unchanged" from the failure: classify every published
+    // file from a fresh process, then hold it to ADR 0003's table ("Reference
+    // and reflog ordering") for this point.
     if classify_index(&old, &new, 0)? != Published::Old {
         return Err("commit changed index entries".into());
     }
-    // Never infer "unchanged" from the failure: classify from a fresh
-    // process, then hold it to the documented expectation for the point.
     let head_state = classify_head(&old, &new, 0)?;
-    // The ref lock is commit's first (and only) lock: before its rename
-    // nothing is published; lock.after-rename fires after the rename, before
-    // the directory sync and reflog append, so the new value is visible.
-    let expected = if point == "lock.after-rename" {
+    let published = point == "lock.after-rename";
+    let logged = matches!(
+        point,
+        "ref.logged" | "lock.before-rename" | "lock.after-rename"
+    );
+    let expected_state = if published {
         Published::New
     } else {
         Published::Old
     };
-    if head_state != expected {
-        return Err(
-            format!("HEAD is {head_state:?} after {point}, expected {expected:?} ({oid})").into(),
-        );
+    if head_state != expected_state {
+        return Err(format!(
+            "ref is {head_state:?} after {point} {mode:?}, expected {expected_state:?} ({oid})"
+        )
+        .into());
     }
-    // Reflogs. Every abort, and every handled error before the rename,
-    // precedes the append: no log gains an entry. A handled error AFTER the
-    // rename (lock.after-rename:error, a directory-sync failure) appends the
-    // reflogs before reporting that durability is unknown: exactly one new
-    // line, chaining old -> new with the model's committer and C Git's
-    // message, in the branch log and HEAD's log (HEAD's only when detached).
-    let observed = snapshot(s.dir())?;
-    let git_rel = s.root().join(".git").strip_prefix(s.dir())?.to_path_buf();
-    let appended = point == "lock.after-rename" && mode == Mode::Error;
-    if appended {
+    if mode == Mode::Error {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.contains("was updated") || !stderr.contains("durability is unknown") {
+        let wanted: &[&str] = match point {
+            "ref.logged" | "lock.before-rename" => &["was not updated", "reflog already records"],
+            "lock.after-rename" => &["was updated", "durability is unknown"],
+            _ => &[],
+        };
+        if wanted.iter().any(|w| !stderr.contains(w)) {
             return Err(format!(
-                "published-unsynced diagnostic missing: {}",
+                "{point}:error diagnostic must contain {wanted:?}: {}",
                 describe(&output)
             )
             .into());
         }
     }
-    let old_oid = old
-        .head_commit(0)
-        .unwrap_or_else(|| "0".repeat(hash.digest(b"").len() * 2));
-    let action = if shape == Shape::Unborn {
-        "commit (initial)"
-    } else {
-        "commit"
-    };
-    let line = format!(
-        "{old_oid} {oid} {} <{}> {when} +0000\t{action}: interrupted\n",
-        lifecycle_support::proc::NAME,
-        lifecycle_support::proc::EMAIL
-    );
-    for log in ["logs/HEAD", "logs/refs/heads/main"] {
-        let rel = git_rel.join(log);
-        let logged = appended && (shape != Shape::Detached || log == "logs/HEAD");
-        let expected = if logged {
-            let mut bytes = match before.get(&rel) {
-                Some(lifecycle_support::proc::Snap::File { bytes, .. }) => bytes.clone(),
-                None => Vec::new(),
-                Some(other) => return Err(format!("{log} was {other:?}").into()),
-            };
-            bytes.extend_from_slice(line.as_bytes());
-            Some(bytes)
-        } else {
-            match before.get(&rel) {
-                Some(lifecycle_support::proc::Snap::File { bytes, .. }) => Some(bytes.clone()),
-                _ => None,
-            }
-        };
-        let actual = match observed.get(&rel) {
-            Some(lifecycle_support::proc::Snap::File { bytes, .. }) => Some(bytes.clone()),
-            None => None,
-            Some(other) => return Err(format!("{log} became {other:?}").into()),
-        };
-        if actual != expected {
-            return Err(format!(
-                "{log} after {point} {mode:?}: expected {:?}, found {:?}",
-                expected.as_deref().map(String::from_utf8_lossy),
-                actual.as_deref().map(String::from_utf8_lossy)
-            )
-            .into());
-        }
-    }
+    // Reflogs: exactly one C Git line (old -> new, model committer, C Git
+    // message) in the branch log and HEAD's log once the append happened
+    // (only HEAD's when detached), otherwise byte-identical.
+    let line = reflog_line(&old, hash, shape, &oid, when, "interrupted");
+    let appended: Vec<&str> = if logged { vec![line.as_str()] } else { vec![] };
+    let observed = snapshot(s.dir())?;
+    check_logs(
+        &s,
+        shape,
+        &before,
+        &observed,
+        &appended,
+        &format!("{point} {mode:?}"),
+    )?;
+    let git_rel = s.root().join(".git").strip_prefix(s.dir())?.to_path_buf();
     if shape != Shape::Detached
         && observed.get(&git_rel.join("HEAD")) != before.get(&git_rel.join("HEAD"))
     {
@@ -343,58 +315,58 @@ fn commit_case(hash: Hash, shape: Shape, point: &str, mode: Mode) -> Result {
     assert_unpublished_untouched(
         s.dir(),
         &before,
-        &snapshot(s.dir())?,
-        &published_paths(&s, head_state == Published::New)?,
+        &observed,
+        &published_paths(&s, logged || published)?,
         "commit",
     )?;
-    if head_state == Published::Old {
-        // Old state includes byte-identical HEAD, branch and reflogs.
-        let all = published_paths(&s, true)?;
+    if !published {
         let after = snapshot(s.dir())?;
-        for path in all.iter().filter(|p| !p.ends_with("index")) {
+        for path in published_paths(&s, false)?
+            .iter()
+            .filter(|p| !p.ends_with("index"))
+        {
             if before.get(path) != after.get(path) {
-                return Err(format!("{} changed although HEAD is old", path.display()).into());
+                return Err(format!("{} changed although the ref is old", path.display()).into());
             }
         }
     }
     every_ref_object_exists(&s)?;
 
+    // Locks: an abort leaves exactly the locks held at that point (HEAD.lock
+    // is commit's first lock; a branch's own lock follows); a handled error
+    // releases everything.
     let git_dir = s.root().join(".git");
-    let ref_lock = match shape {
-        Shape::Detached => git_dir.join("HEAD.lock"),
-        _ => git_dir.join("refs/heads/main.lock"),
+    let head_lock = git_dir.join("HEAD.lock");
+    let branch_lock = git_dir.join("refs/heads/main.lock");
+    let expected_locks: Vec<PathBuf> = match (mode, point, shape) {
+        (Mode::Error, _, _) | (_, "commit.objects-written", _) => vec![],
+        (_, "lock.acquired", _) => vec![head_lock.clone()],
+        (_, "lock.after-rename", Shape::Detached) => vec![],
+        (_, "lock.after-rename", _) => vec![head_lock.clone()],
+        (_, _, Shape::Detached) => vec![head_lock.clone()],
+        _ => vec![head_lock.clone(), branch_lock.clone()],
     };
-    let allowed = [
-        ref_lock.clone(),
-        git_dir.join("HEAD.lock"),
-        git_dir.join("index.lock"),
-    ];
     let locks: Vec<PathBuf> = observe::locks(&git_dir)?
         .into_iter()
         .filter(|l| *l != foreign.path)
         .collect();
-    if let Some(stray) = locks.iter().find(|l| !allowed.contains(l)) {
-        return Err(format!("unexpected lock {}", stray.display()).into());
-    }
-    let must_hold = mode == Mode::Abort
-        && matches!(
-            point,
-            "lock.acquired" | "lock.before-rename" | "commit.ref-locked"
-        );
-    if must_hold && locks.is_empty() {
-        return Err(format!("abort at {point} left no stale lock").into());
-    }
-    if point == "commit.ref-locked" && mode == Mode::Abort && !locks.contains(&ref_lock) {
+    if locks != expected_locks {
         return Err(format!(
-            "commit.ref-locked left {locks:?}, not {}",
-            ref_lock.display()
+            "{point} {mode:?} {shape:?}: locks {locks:?}, expected {expected_locks:?}"
         )
         .into());
     }
-    if (mode == Mode::Error || point == "commit.objects-written") && !locks.is_empty() {
-        return Err(format!("{point} {mode:?} left locks {locks:?}").into());
+    if !locks.is_empty() {
+        eprintln!(
+            "NOTE: {hash:?} {shape:?} {point} {mode:?}: ref {head_state:?}, orphan locks {locks:?}"
+        );
     }
-    if head_state == Published::Old {
+
+    if !published {
+        // A HEAD-contending C Git writer is refused while HEAD.lock is held.
+        if locks.contains(&head_lock) {
+            c_git_commit_refused(&s, when)?;
+        }
         let root = s.root();
         stale_locks_refuse_then_clear(&s, &locks, Preserve::AllowNewObjects, &mut || {
             Driver::Rgit.commit(&root, &["interrupted"], when)
@@ -406,38 +378,124 @@ fn commit_case(hash: Hash, shape: Shape, point: &str, mode: Mode) -> Result {
         if let Head::Detached(_) = &new.checkouts[0].head {
             assert_eq!(observe::symbolic_head(&s.root())?, None);
         }
+        // The retry logs from the ref's real (old) value. After a pre-rename
+        // append the log therefore holds the unpublished line and then the
+        // retry's line, both starting at the old value (C Git behaviour).
+        let lines: Vec<&str> = if logged {
+            vec![&line, &line]
+        } else {
+            vec![&line]
+        };
+        check_logs(
+            &s,
+            shape,
+            &before,
+            &snapshot(s.dir())?,
+            &lines,
+            &format!("{point} {mode:?} retry"),
+        )?;
         s.model = new;
         foreign.verify_and_withdraw()?;
-        return assert_state_with(&s.model, false);
+        return assert_state_with(&s.model, logged);
     }
 
-    // Published (lock.after-rename): the published ref's own lock is gone.
-    // Decision (G1 WP3, ADR 0003 invariant 2): a commit on a branch holds
-    // HEAD.lock across the branch rename so HEAD cannot be re-pointed
-    // mid-commit (C Git's files backend also locks HEAD for its log-only
-    // update), so an ABORT here may leave exactly HEAD.lock. Any other
-    // leftover lock, any lock after :error, and any lock on a detached-HEAD
-    // commit is a failure.
-    let permitted: Vec<PathBuf> = match (shape, mode) {
-        (Shape::Branch | Shape::Unborn, Mode::Abort) => vec![git_dir.join("HEAD.lock")],
-        _ => vec![],
+    // Published (lock.after-rename) with its reflog line. A branch commit
+    // aborted here leaves only HEAD.lock (held across the branch rename);
+    // a later rgit commit and a HEAD-contending C Git commit are refused
+    // until the operator removes exactly that orphan.
+    s.model = new;
+    follow_up_commit_logs_from(&mut s, shape, &oid, &locks, Some(&foreign))
+}
+
+/// C Git's reflog line for a commit made by the model's committer.
+fn reflog_line(
+    old: &Model,
+    hash: Hash,
+    shape: Shape,
+    new_oid: &str,
+    when: i64,
+    subject: &str,
+) -> String {
+    let old_oid = old
+        .head_commit(0)
+        .unwrap_or_else(|| "0".repeat(hash.digest(b"").len() * 2));
+    let action = if shape == Shape::Unborn {
+        "commit (initial)"
+    } else {
+        "commit"
     };
-    if !locks.is_empty() && locks != permitted {
+    format!(
+        "{old_oid} {new_oid} {} <{}> {when} +0000\t{action}: {subject}\n",
+        lifecycle_support::proc::NAME,
+        lifecycle_support::proc::EMAIL
+    )
+}
+
+/// The branch log and HEAD's log in `after` must equal their bytes in
+/// `before` followed by exactly `lines` (only HEAD's log changes when
+/// detached; the other log must be byte-identical).
+fn check_logs(
+    s: &Scenario,
+    shape: Shape,
+    before: &std::collections::BTreeMap<PathBuf, lifecycle_support::proc::Snap>,
+    after: &std::collections::BTreeMap<PathBuf, lifecycle_support::proc::Snap>,
+    lines: &[&str],
+    context: &str,
+) -> Result {
+    check_log_lines(s, before, after, "logs/HEAD", lines, context)?;
+    let branch_lines: &[&str] = if shape == Shape::Detached { &[] } else { lines };
+    check_log_lines(
+        s,
+        before,
+        after,
+        "logs/refs/heads/main",
+        branch_lines,
+        context,
+    )
+}
+
+fn check_log_lines(
+    s: &Scenario,
+    before: &std::collections::BTreeMap<PathBuf, lifecycle_support::proc::Snap>,
+    after: &std::collections::BTreeMap<PathBuf, lifecycle_support::proc::Snap>,
+    log: &str,
+    lines: &[&str],
+    context: &str,
+) -> Result {
+    use lifecycle_support::proc::Snap;
+    let rel = s
+        .root()
+        .join(".git")
+        .join(log)
+        .strip_prefix(s.dir())?
+        .to_path_buf();
+    let bytes = |snap: &std::collections::BTreeMap<PathBuf, Snap>| -> Result<Option<Vec<u8>>> {
+        match snap.get(&rel) {
+            Some(Snap::File { bytes, .. }) => Ok(Some(bytes.clone())),
+            None => Ok(None),
+            Some(other) => Err(format!("{log} is {other:?}").into()),
+        }
+    };
+    let old = bytes(before)?;
+    let expected = if lines.is_empty() {
+        old
+    } else {
+        let mut data = old.unwrap_or_default();
+        for line in lines {
+            data.extend_from_slice(line.as_bytes());
+        }
+        Some(data)
+    };
+    let actual = bytes(after)?;
+    if actual != expected {
         return Err(format!(
-            "{point} {mode:?} {shape:?}: ref published but locks {locks:?} remain; only {permitted:?} may"
+            "{context}: {log} expected {:?}, found {:?}",
+            expected.as_deref().map(String::from_utf8_lossy),
+            actual.as_deref().map(String::from_utf8_lossy)
         )
         .into());
     }
-    if !locks.is_empty() {
-        eprintln!(
-            "NOTE: {hash:?} {shape:?} {point} {mode:?}: ref published; documented stale HEAD.lock remains"
-        );
-    }
-    s.model = new;
-    // Published without its reflog entry; a further commit must be refused
-    // by the stale HEAD.lock (exit 128, named, byte-identical), then succeed
-    // once it is removed and log from the published value.
-    follow_up_commit_logs_from(&mut s, shape, &oid, &locks, Some(&foreign))
+    Ok(())
 }
 
 /// A lock planted by the fixture on behalf of some other (live) writer. No
@@ -551,8 +609,9 @@ fn reflog_path(s: &Scenario, shape: Shape) -> PathBuf {
     }
 }
 
-/// Commit a further change with rgit and require its reflog line to chain
-/// from `published` (the value whose own entry is missing).
+/// Commit a further change with rgit (after any orphan locks are shown to
+/// refuse it and are removed) and require its reflog line to chain from
+/// `published`.
 fn follow_up_commit_logs_from(
     s: &mut Scenario,
     shape: Shape,
@@ -583,7 +642,8 @@ fn follow_up_commit_logs_from(
     if let Some(foreign) = foreign {
         foreign.verify_and_withdraw()?;
     }
-    assert_state_with(&s.model, true)?;
+    // The published commit's line is present, so the chain is intact.
+    assert_state_with(&s.model, false)?;
     let text = fs::read_to_string(reflog_path(s, shape))?;
     let last = text.lines().last().unwrap_or_default();
     if !last.starts_with(&format!("{published} {next} ")) {
@@ -615,24 +675,33 @@ impl Drop for ReadOnly {
     }
 }
 
-/// Partial success: the ref is published but the reflog append fails
-/// (existing reflog made read-only). rgit exits 128 saying the reference
-/// "was updated"; a fresh process must see the new ref, an exact model tree,
-/// no new reflog entry, fsck clean and no lock; after restoring permissions
-/// the next commit succeeds.
+/// Reflog append failure (an existing log made read-only): the append comes
+/// before the rename, so the reference is NOT updated; exit 128 with "the
+/// reference was not updated", no lock left, fsck clean. Fixtures:
+/// - branch, read-only branch log: no log gains a line;
+/// - branch, read-only HEAD log: the branch log already gained the line
+///   (partially logged), HEAD's log did not;
+/// - detached, read-only HEAD log: no log gains a line.
+///
+/// After restoring permissions the retry commit succeeds and logs from the
+/// real old value.
 #[cfg(unix)]
-fn reflog_append_failure_after_publication(driver: Driver) -> Result {
+fn reflog_append_failure_leaves_ref_unchanged(driver: Driver) -> Result {
     if driver::lacks(
         driver,
         &["commit"],
-        "reflog_append_failure_after_publication",
+        "reflog_append_failure_leaves_ref_unchanged",
     ) {
         return Ok(());
     }
     for hash in Hash::ALL {
-        for shape in [Shape::Branch, Shape::Detached] {
+        for (shape, read_only, partial) in [
+            (Shape::Branch, "logs/refs/heads/main", false),
+            (Shape::Branch, "logs/HEAD", true),
+            (Shape::Detached, "logs/HEAD", false),
+        ] {
             let mut s = based(hash, shape)?;
-            let log = reflog_path(&s, shape);
+            let log = s.root().join(".git").join(read_only);
             if !log.is_file() {
                 return Err(format!(
                     "{hash:?} {shape:?}: no reflog at {} after base commit",
@@ -640,55 +709,75 @@ fn reflog_append_failure_after_publication(driver: Driver) -> Result {
                 )
                 .into());
             }
-            s.model.write(0, b"a", b"published without reflog\n")?;
+            s.model.write(0, b"a", b"not published\n")?;
             s.add(0, &[b"a"])?;
             let old = s.model.clone();
             let mut new = s.model.clone();
             let when = new.tick();
             let oid = new.commit(0, &["partial"], when);
-            let log_before = fs::read(&log)?;
-            let head_log = s.root().join(".git/logs/HEAD");
-            let head_log_before = fs::read(&head_log).ok();
+            let line = reflog_line(&old, hash, shape, &oid, when, "partial");
+            let before = snapshot(s.dir())?;
             let guard = ReadOnly::new(log.clone())?;
             let output = Driver::Rgit.commit(&s.root(), &["partial"], when)?;
-            let context = format!("{hash:?} {shape:?} reflog append failure");
+            let context = format!("{hash:?} {shape:?} read-only {read_only}");
             refused(&output, 128, &context)?;
-            if !String::from_utf8_lossy(&output.stderr).contains("was updated") {
+            if !String::from_utf8_lossy(&output.stderr).contains("the reference was not updated") {
                 return Err(format!(
-                    "{context}: stderr must say the ref was updated: {}",
+                    "{context}: stderr must say the reference was not updated: {}",
                     describe(&output)
                 )
                 .into());
             }
             // Fresh-process classification, not inference from the exit code.
-            if classify_head(&old, &new, 0)? != Published::New {
-                return Err(format!("{context}: ref not published").into());
+            if classify_head(&old, &new, 0)? != Published::Old {
+                return Err(format!("{context}: ref changed").into());
             }
             if classify_index(&old, &new, 0)? != Published::Old {
                 return Err(format!("{context}: index entries changed").into());
             }
-            if fs::read(&log)? != log_before {
-                return Err(format!("{context}: reflog gained an entry").into());
-            }
-            if shape == Shape::Branch {
-                let head_log_after = fs::read(&head_log).ok();
+            let after = snapshot(s.dir())?;
+            if partial {
+                check_log_lines(
+                    &s,
+                    &before,
+                    &after,
+                    "logs/refs/heads/main",
+                    &[&line],
+                    &context,
+                )?;
+                check_log_lines(&s, &before, &after, "logs/HEAD", &[], &context)?;
                 eprintln!(
-                    "NOTE: {context}: HEAD reflog {}",
-                    if head_log_after == head_log_before {
-                        "unchanged"
-                    } else {
-                        "appended"
-                    }
+                    "NOTE: {context}: partially logged (branch log has the unpublished line)"
                 );
+            } else {
+                check_logs(&s, shape, &before, &after, &[], &context)?;
             }
             let locks = observe::locks(&s.root().join(".git"))?;
             if !locks.is_empty() {
                 return Err(format!("{context}: leftover locks {locks:?}").into());
             }
+            every_ref_object_exists(&s)?;
             drop(guard);
+            ok_quiet(
+                &Driver::Rgit.commit(&s.root(), &["partial"], when)?,
+                "retry after restoring permissions",
+            )?;
+            let retried = snapshot(s.dir())?;
+            if partial {
+                check_log_lines(
+                    &s,
+                    &before,
+                    &retried,
+                    "logs/refs/heads/main",
+                    &[&line, &line],
+                    &context,
+                )?;
+                check_log_lines(&s, &before, &retried, "logs/HEAD", &[&line], &context)?;
+            } else {
+                check_logs(&s, shape, &before, &retried, &[&line], &context)?;
+            }
             s.model = new;
-            assert_state_with(&s.model, true)?; // commit body/tree, fsck, status
-            follow_up_commit_logs_from(&mut s, shape, &oid, &[], None)?;
+            assert_state_with(&s.model, partial)?;
         }
     }
     Ok(())
@@ -1002,7 +1091,7 @@ fn interrupted_init(driver: Driver) -> Result {
 #[cfg(unix)]
 mod partial {
     use super::*;
-    rgit_only!(reflog_append_failure_after_publication);
+    rgit_only!(reflog_append_failure_leaves_ref_unchanged);
 }
 
 rgit_only!(

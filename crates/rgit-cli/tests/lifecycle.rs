@@ -784,6 +784,102 @@ fn target_ref_refusals_write_nothing(driver: Driver) -> Result {
     Ok(())
 }
 
+/// A symlink or special file already sitting at the loose-object path a
+/// commit needs (its tree, or the commit itself) is refused within a bound:
+/// exit 128, the ref unchanged, the planted entry (and a symlink's target)
+/// untouched. A refusal at the tree writes nothing at all; a refusal at the
+/// commit may only leave the new, valid tree object.
+#[cfg(unix)]
+fn loose_object_path_guard(driver: Driver) -> Result {
+    use std::os::unix::fs::MetadataExt;
+    if driver::lacks(driver, &["commit"], "loose_object_path_guard") {
+        return Ok(());
+    }
+    for hash in Hash::ALL {
+        for victim in ["tree", "commit"] {
+            for plant in ["symlink", "fifo"] {
+                let mut s = Scenario::init(driver, hash, "main")?;
+                s.model.write(0, b"f", b"base\n")?;
+                s.add(0, &[b"f"])?;
+                s.commit(0, &["base"])?;
+                s.model
+                    .write(0, b"f", format!("guarded {victim} {plant}\n").as_bytes())?;
+                s.add(0, &[b"f"])?;
+                let when = s.model.tick();
+                let (commit_oid, _) = s.model.predict_commit(0, &["guarded"], when);
+                let oid = if victim == "tree" {
+                    tree_id(hash, &s.model.checkouts[0].index)
+                } else {
+                    commit_oid
+                };
+                let fanout = s.root().join(".git/objects").join(&oid[..2]);
+                fs::create_dir_all(&fanout)?;
+                let path = fanout.join(&oid[2..]);
+                let outside = s.dir().join("outside-target");
+                fs::write(&outside, b"not an object\n")?;
+                if plant == "symlink" {
+                    std::os::unix::fs::symlink(&outside, &path)?;
+                } else {
+                    assert!(
+                        std::process::Command::new("mkfifo")
+                            .arg(&path)
+                            .status()?
+                            .success()
+                    );
+                }
+                let planted_inode = fs::symlink_metadata(&path)?.ino();
+                let outside_inode = fs::metadata(&outside)?.ino();
+                let before = snapshot(s.dir())?;
+                let context = format!("{} {victim} path holds a {plant}", hash.name());
+                let output = lifecycle_support::proc::run_within(
+                    &mut driver.commit_cmd(&s.root(), &["guarded"], when, &[]),
+                    std::time::Duration::from_secs(10),
+                )?;
+                refused(&output, 128, &context)?;
+                let preserve = if victim == "tree" {
+                    Preserve::Exact
+                } else {
+                    Preserve::AllowNewObjects
+                };
+                assert_preserved(s.dir(), &before, &snapshot(s.dir())?, preserve, &context)?;
+                assert_eq!(
+                    fs::symlink_metadata(&path)?.ino(),
+                    planted_inode,
+                    "{context}: plant replaced"
+                );
+                assert_eq!(
+                    fs::metadata(&outside)?.ino(),
+                    outside_inode,
+                    "{context}: target replaced"
+                );
+                assert_eq!(
+                    fs::read(&outside)?,
+                    b"not an object\n",
+                    "{context}: target written"
+                );
+                // Ref and index unchanged, as a fresh C Git sees them.
+                fs::remove_file(&path)?;
+                fs::remove_file(&outside)?;
+                s.check().map_err(|e| format!("{context}: {e}"))?;
+                // With the plant gone the same commit succeeds.
+                ok(
+                    &driver.commit(&s.root(), &["guarded"], when)?,
+                    &format!("{context}: retry"),
+                )?;
+                s.model.commit(0, &["guarded"], when);
+                s.check()?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn loose_object_path_guard(_: Driver) -> Result {
+    eprintln!("SKIP: loose_object_path_guard requires Unix symlinks and FIFOs");
+    Ok(())
+}
+
 /// Same-size rewrite in the same second with mtime restored right after add
 /// (racy-clean): status must report it and the next add must stage it.
 fn racy_same_second_edit(driver: Driver) -> Result {
@@ -848,4 +944,4 @@ mod unix {
     both_drivers!(exec_bit, symlinks, non_utf8_paths);
 }
 
-rgit_only!(target_ref_refusals_write_nothing);
+rgit_only!(target_ref_refusals_write_nothing, loose_object_path_guard);
