@@ -16,7 +16,12 @@ fn diff_names_nul_and_exit_codes_match_c_git() -> Result {
             same(root.path(), &args)?;
         }
         fs::write(root.path().join("file.txt"), b"changed\n")?;
-        for name in ["space name", "quote\"name", "new.txt"] {
+        let quoted = if cfg!(windows) {
+            "plain name"
+        } else {
+            "quote\"name"
+        };
+        for name in ["space name", quoted, "new.txt"] {
             fs::write(root.path().join(name), b"staged\n")?;
             git(root.path(), &["add", name])?;
             fs::write(root.path().join(name), b"unstaged\n")?;

@@ -32,11 +32,14 @@ C Git. A closed output pipe ends without a panic.
 
 ## Index, status and diffs
 
-Index reads verify the checksum and structural ordering. Missing indexes are
+Index reads verify present checksums and structural ordering; Git's all-zero
+checksum omission is accepted. Symlink and special index files are refused.
+Missing indexes are
 empty. Split and sparse indexes are explicitly unsupported. Trees and index
 paths retain byte ordering and conflict stages; malformed or unsafe paths fail.
 These operations never refresh or write an index, store a blob, or acquire an
-index lock. Tests snapshot repository and worktree bytes around inspection.
+index lock. Tests snapshot repository and worktree bytes around inspection;
+those snapshots do not detect same-byte rewrites or metadata-only touches.
 
 Status deliberately compares tracked file content even when stat metadata and
 fsmonitor flags claim a file is unchanged. Explicit assume-unchanged and
@@ -44,7 +47,8 @@ skip-worktree flags remain user opt-outs. Native APFS tests use closed file
 descriptors and writable shared mappings: one inspection occurs with the
 mapping live, another in a fresh process after final unmap. This establishes
 the initial read-only detection behavior; it does not establish a future
-write-enabled command's transaction or durability contract. Content scanning
+write-enabled command's transaction or durability contract, crash recovery or
+multi-mapper interleavings. Content scanning
 costs more I/O than trusting the stat cache; no performance parity is claimed.
 
 Builtin text/EOL/ident conversions participate in comparisons. External
