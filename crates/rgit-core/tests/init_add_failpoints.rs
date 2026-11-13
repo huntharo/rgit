@@ -33,13 +33,17 @@ fn snapshot(dir: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
 
 /// Re-run this binary's `child_action` test with the failpoint set in the
 /// child's environment (the parent never mutates its own environment).
-fn run_child(point: &str, scenario: &str, path: &Path) -> Result<String> {
-    let output = std::process::Command::new(std::env::current_exe()?)
+fn spawn_child(spec: &str, scenario: &str, path: &Path) -> Result<std::process::Output> {
+    Ok(std::process::Command::new(std::env::current_exe()?)
         .args(["--exact", "child_action", "--nocapture", "--test-threads=1"])
-        .env("RGIT_FAILPOINT", format!("{point}:error"))
+        .env("RGIT_FAILPOINT", spec)
         .env("RGIT_TEST_SCENARIO", scenario)
         .env("RGIT_TEST_PATH", path)
-        .output()?;
+        .output()?)
+}
+
+fn run_child(point: &str, scenario: &str, path: &Path) -> Result<String> {
+    let output = spawn_child(&format!("{point}:error"), scenario, path)?;
     let stdout = String::from_utf8(output.stdout)?;
     assert!(output.status.success(), "child failed: {stdout}");
     Ok(stdout
@@ -84,6 +88,59 @@ fn child_action() -> Result {
 
 fn injected(outcome: String, name: &str) {
     assert_eq!(outcome, format!("injected {name}"));
+}
+
+/// No Git (C Git or rgit) may treat `path` as a repository.
+fn assert_not_a_repository(path: &Path) -> Result {
+    assert!(Repository::discover(path).is_err());
+    let c_git = common::git_command(path)
+        .args(["--git-dir", "."])
+        .args(["rev-parse", "--git-dir"])
+        .output()?;
+    assert!(!c_git.status.success(), "C Git accepted {}", path.display());
+    Ok(())
+}
+
+/// An existing empty bare target is populated in place with HEAD last: an
+/// injected error restores the empty directory, and a crash (abort) before
+/// HEAD leaves a directory no Git recognizes as a repository.
+#[test]
+fn bare_in_place_init_is_not_a_repository_before_head() -> Result {
+    for (format, suffix) in [(ObjectFormat::Sha1, ""), (ObjectFormat::Sha256, "-sha256")] {
+        let temp = tempfile::tempdir()?;
+        let target = temp.path().join("existing.git");
+        fs::create_dir(&target)?;
+        injected(
+            run_child("init.before-head", &format!("init-bare{suffix}"), &target)?,
+            "init.before-head",
+        );
+        assert_eq!(
+            fs::read_dir(&target)?.count(),
+            0,
+            "entries were not removed"
+        );
+
+        let output = spawn_child("init.before-head", &format!("init-bare{suffix}"), &target)?;
+        assert!(!output.status.success(), "the child should have aborted");
+        assert!(target.join("objects").is_dir() && target.join("config").is_file());
+        assert!(!target.join("HEAD").exists());
+        assert_not_a_repository(&target)?;
+        // The leftover is not empty, so a retry refuses rather than merging.
+        let retry = init(
+            &target,
+            &InitOptions {
+                object_format: format,
+                bare: true,
+                ..InitOptions::default()
+            },
+        );
+        assert!(
+            matches!(retry, Err(Error::AlreadyExists(_))),
+            "{:?}",
+            retry.err()
+        );
+    }
+    Ok(())
 }
 
 #[test]

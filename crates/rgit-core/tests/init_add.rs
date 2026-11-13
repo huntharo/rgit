@@ -1054,7 +1054,7 @@ fn add_with_held_index_lock_is_locked_and_leaves_index_and_lock() -> Result {
 
 #[cfg(unix)]
 #[test]
-fn init_follows_a_symlinked_worktree_but_refuses_a_symlinked_bare_target() -> Result {
+fn init_follows_symlinked_targets_but_refuses_a_dangling_bare_link() -> Result {
     let temp = tempdir()?;
     let real = temp.path().join("real");
     fs::create_dir(&real)?;
@@ -1063,18 +1063,182 @@ fn init_follows_a_symlinked_worktree_but_refuses_a_symlinked_bare_target() -> Re
     init(&link, &InitOptions::default())?;
     assert!(real.join(".git/HEAD").is_file());
     fsck(&real)?;
+    // A link to an empty directory is populated through, like C Git.
     let bare_real = temp.path().join("bare-real");
     fs::create_dir(&bare_real)?;
     let bare_link = temp.path().join("bare-link");
     std::os::unix::fs::symlink(&bare_real, &bare_link)?;
-    let result = init(&bare_link, &options(ObjectFormat::Sha1, true));
+    init(&bare_link, &options(ObjectFormat::Sha1, true))?;
+    assert!(fs::symlink_metadata(&bare_link)?.file_type().is_symlink());
+    assert_eq!(
+        text(&bare_real, &["rev-parse", "--is-bare-repository"])?,
+        "true"
+    );
+    fsck(&bare_real)?;
+    let dangling = temp.path().join("dangling");
+    std::os::unix::fs::symlink(temp.path().join("missing"), &dangling)?;
+    let result = init(&dangling, &options(ObjectFormat::Sha1, true));
     assert!(
         matches!(result, Err(Error::UnsupportedCapability(_))),
         "{:?}",
         result.err()
     );
-    assert!(fs::symlink_metadata(&bare_link)?.file_type().is_symlink());
-    assert_eq!(fs::read_dir(&bare_real)?.count(), 0);
+    assert!(!temp.path().join("missing").exists());
     assert_no_init_temporaries(temp.path())?;
+    Ok(())
+}
+
+/// An existing empty bare target keeps its inode, mode bits (including
+/// setgid), and so any process whose working directory is inside it.
+#[cfg(unix)]
+#[test]
+fn init_bare_populates_an_existing_empty_directory_in_place() -> Result {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    for format in FORMATS {
+        let temp = tempdir()?;
+        let target = temp.path().join("shared.git");
+        fs::create_dir(&target)?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o2775))?;
+        let before = fs::metadata(&target)?;
+        init(&target, &options(format, true))?;
+        let after = fs::metadata(&target)?;
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(after.mode() & 0o7777, 0o2775);
+        assert_eq!(
+            text(&target, &["rev-parse", "--is-bare-repository"])?,
+            "true"
+        );
+        assert_eq!(
+            text(&target, &["rev-parse", "--show-object-format"])?,
+            format_name(format)
+        );
+        fsck(&target)?;
+        let names: Vec<_> = fs::read_dir(&target)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<std::io::Result<_>>()?;
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.to_string_lossy().contains("rgit-init")),
+            "{names:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Re-run `bare_init_child` with its working directory inside the target, as
+/// a shell would after `mkdir x.git && cd x.git && git init --bare`.
+#[cfg(unix)]
+#[test]
+fn init_bare_keeps_a_working_directory_inside_the_target_valid() -> Result {
+    let temp = tempdir()?;
+    let target = temp.path().join("here.git");
+    fs::create_dir(&target)?;
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "bare_init_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("RGIT_TEST_BARE_INIT_CHILD", "1")
+        .current_dir(&target)
+        .output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("CHILD cwd-sees-head"), "{stdout}");
+    fsck(&target)?;
+    Ok(())
+}
+
+#[test]
+fn bare_init_child() -> Result {
+    if std::env::var_os("RGIT_TEST_BARE_INIT_CHILD").is_none() {
+        return Ok(());
+    }
+    init(Path::new("."), &options(ObjectFormat::Sha1, true))?;
+    // Relative to the unchanged working directory: still the repository.
+    if Path::new("HEAD").is_file() && Path::new("objects").is_dir() {
+        println!("CHILD cwd-sees-head");
+    }
+    Ok(())
+}
+
+/// Run `add` on another thread; a FIFO among the ignore/attribute files
+/// must be refused promptly, never opened (which would block forever).
+#[cfg(unix)]
+fn add_without_blocking(root: &Path, paths: &[&str], fifo: &Path) -> Result<Error> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let thread_root = root.to_owned();
+    let thread_paths: Vec<String> = paths.iter().map(|path| (*path).to_owned()).collect();
+    std::thread::spawn(move || {
+        let result = Repository::discover(&thread_root).and_then(|repo| {
+            let paths: Vec<&BStr> = thread_paths.iter().map(BStr::new).collect();
+            repo.add(&paths)
+        });
+        let _ = sender.send(result.err().map(|error| error.to_string()));
+    });
+    match receiver.recv_timeout(std::time::Duration::from_secs(20)) {
+        Ok(Some(message)) => Ok(Error::Other(message.into())),
+        Ok(None) => Err("add succeeded despite a FIFO metadata file".into()),
+        Err(_) => {
+            // Unblock the stuck reader so the process can exit, then fail.
+            let _ = fs::OpenOptions::new().write(true).open(fifo);
+            Err(format!("add blocked on FIFO {}", fifo.display()).into())
+        }
+    }
+}
+
+#[cfg(unix)]
+fn mkfifo(path: &Path) -> Result {
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()?
+            .success()
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn add_refuses_fifo_metadata_in_ancestors_of_tracked_paths_without_blocking() -> Result {
+    // (a) An ancestor .gitattributes of an explicitly named tracked file.
+    let temp = tempdir()?;
+    let root = temp.path().join("repo");
+    init(&root, &InitOptions::default())?;
+    fs::create_dir_all(root.join("a/b"))?;
+    fs::write(root.join("a/b/c"), b"v1\n")?;
+    git(&root, &["add", "a/b/c"])?;
+    fs::write(root.join("a/b/c"), b"v2\n")?;
+    let fifo = root.join("a/b/.gitattributes");
+    mkfifo(&fifo)?;
+    let index = fs::read(root.join(".git/index"))?;
+    let error = add_without_blocking(&root, &["a/b/c"], &fifo)?;
+    assert!(
+        error.to_string().contains("attribute/ignore file"),
+        "{error}"
+    );
+    assert_eq!(fs::read(root.join(".git/index"))?, index);
+
+    // (b) A FIFO .gitignore inside an ignored directory with a tracked file.
+    let temp = tempdir()?;
+    let root = temp.path().join("repo");
+    init(&root, &InitOptions::default())?;
+    fs::write(root.join(".gitignore"), b"ignored/\n")?;
+    fs::create_dir(root.join("ignored"))?;
+    fs::write(root.join("ignored/tracked"), b"v1\n")?;
+    git(&root, &["add", ".gitignore"])?;
+    git(&root, &["add", "-f", "ignored/tracked"])?;
+    fs::write(root.join("ignored/tracked"), b"v2\n")?;
+    let fifo = root.join("ignored/.gitignore");
+    mkfifo(&fifo)?;
+    let index = fs::read(root.join(".git/index"))?;
+    let error = add_without_blocking(&root, &["."], &fifo)?;
+    assert!(
+        error.to_string().contains("attribute/ignore file"),
+        "{error}"
+    );
+    assert_eq!(fs::read(root.join(".git/index"))?, index);
     Ok(())
 }
