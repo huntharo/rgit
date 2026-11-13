@@ -105,7 +105,8 @@ unchanged). This follows the objects-before-names rule.
 - Repositories: bare repositories for `add`/`commit`; reftable and other
   unsupported extensions (at discovery); index version 4, `index.version` other
   than 2/3, `feature.manyFiles`, split index, sparse checkout or sparse index;
-  `core.symlinks=false`; in-progress merge, cherry-pick, revert, rebase or
+  with `core.symlinks=false` (the C Git default on Windows), a path that is or
+  is tracked as a symbolic link; in-progress merge, cherry-pick, revert, rebase or
   sequencer state.
 - Paths: globs and `:` magic, absolute paths and paths leaving the worktree,
   pathspecs matching nothing, explicitly named ignored paths and any pathspec
@@ -187,7 +188,9 @@ in the worktree are pre-read the same way and handed to Gitoxide from memory;
 after an `lstat` check. An already-present loose object is accepted only after
 its content is inflated and its hash verified. Parent directories are still
 resolved by path: an ancestor directory swapped for a symlink concurrently is
-not detected. On Windows the leaf fingerprint is size and modification time
+not detected. On Windows an object that already exists cannot be re-synced
+(`FlushFileBuffers` needs write access to a read-only file), the leaf
+fingerprint is size and modification time
 only, and the exclusive-creation fallback for `init` is used because no
 atomic no-replace rename is available. Preflight is therefore not a filesystem sandbox against an actively
 hostile concurrent writer.

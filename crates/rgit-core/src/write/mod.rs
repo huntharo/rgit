@@ -32,4 +32,4 @@ pub use refs::{
 
 pub(crate) use failpoint::hit as failpoint;
 pub(crate) use lock::{LockFile, sync_parent};
-pub(crate) use sys::{open_leaf_nofollow, rename_noreplace};
+pub(crate) use sys::{open_leaf_nofollow, rename_noreplace, sync_existing_file};

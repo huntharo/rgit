@@ -42,4 +42,4 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install ${{ matrix.rust }} --profile minimal
       - run: git --version
-      - run: cargo +${{ matrix.rust }} test --workspace --locked -- --nocapture
+      - run: cargo +${{ matrix.rust }} test --workspace --locked --no-fail-fast -- --nocapture

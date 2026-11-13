@@ -20,9 +20,17 @@ pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> Result<(), Error> {
         match renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE) {
             Ok(()) => Ok(()),
             Err(Errno::EXIST) => Err(Error::AlreadyExists(to.to_owned())),
-            Err(Errno::INVAL | Errno::NOSYS | Errno::NOTSUP | Errno::OPNOTSUPP) => Err(
-                Error::UnsupportedCapability("atomic no-replace rename on this filesystem"),
-            ),
+            // ENOTSUP and EOPNOTSUPP are the same value on Linux.
+            Err(error)
+                if error == Errno::INVAL
+                    || error == Errno::NOSYS
+                    || error == Errno::NOTSUP
+                    || error == Errno::OPNOTSUPP =>
+            {
+                Err(Error::UnsupportedCapability(
+                    "atomic no-replace rename on this filesystem",
+                ))
+            }
             Err(error) => Err(std::io::Error::from(error).into()),
         }
     }
@@ -58,7 +66,17 @@ pub(crate) fn open_leaf_nofollow(path: &Path) -> std::io::Result<File> {
     options.open(path)
 }
 
-#[cfg(test)]
+/// Flush an existing file that another writer (or an earlier run) created,
+/// then its directory. Unix syncs through a read-only descriptor. Windows
+/// cannot: `FlushFileBuffers` requires write access, and loose objects are
+/// read-only, so there this is a no-op and durability relies on the writer.
+pub(crate) fn sync_existing_file(path: &Path) -> Result<(), Error> {
+    #[cfg(unix)]
+    File::open(path)?.sync_all()?;
+    super::sync_parent(path)
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

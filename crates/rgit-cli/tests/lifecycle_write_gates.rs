@@ -1,6 +1,8 @@
 //! Write-path correctness gates: native APFS MAP_SHARED changes (live and
 //! after final unmap) must be staged and committed by fresh processes, and
 //! special files must never hang or be staged.
+// Several helpers exercise Unix-only behaviour (symlinks, FIFOs, modes).
+#![cfg_attr(not(unix), allow(unused_imports, unused_variables, dead_code))]
 
 #[allow(dead_code)]
 mod lifecycle_support;

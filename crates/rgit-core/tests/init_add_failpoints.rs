@@ -4,6 +4,8 @@
 //! Run with `cargo test -p rgit-core --features failpoints`; abort-mode
 //! crash recovery is exercised through the CLI by the lifecycle suite.
 #![cfg(all(feature = "failpoints", debug_assertions))]
+// Several helpers exercise Unix-only behaviour (symlinks, FIFOs, modes).
+#![cfg_attr(not(unix), allow(unused_imports, unused_variables, dead_code))]
 
 mod common;
 

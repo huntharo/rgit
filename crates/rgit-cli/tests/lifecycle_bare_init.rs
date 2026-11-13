@@ -3,6 +3,8 @@
 //! HEAD is published last, so an interruption never leaves something Git
 //! recognizes as a repository. An absent target still goes through the
 //! private-directory publication (`init.before-publish`).
+// Several helpers exercise Unix-only behaviour (symlinks, FIFOs, modes).
+#![cfg_attr(not(unix), allow(unused_imports, unused_variables, dead_code))]
 
 #[allow(dead_code)]
 mod lifecycle_support;

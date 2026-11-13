@@ -1,6 +1,8 @@
 //! Local lifecycle scenarios (ADR 0003) checked against an independent model.
 //! Every scenario runs with the C Git driver (proving the oracle is not
 //! tailored to rgit) and with the rgit driver.
+// Several helpers exercise Unix-only behaviour (symlinks, FIFOs, modes).
+#![cfg_attr(not(unix), allow(unused_imports, unused_variables, dead_code))]
 
 #[allow(dead_code)]
 mod lifecycle_support;
@@ -209,9 +211,21 @@ fn init_reports_and_refuses_existing(driver: Driver) -> Result {
         let git_dir = s.dir().join("second/.git");
         let canonical = git_dir.canonicalize()?;
         let text = String::from_utf8(output.stdout.clone())?;
-        let accepted = [git_dir, canonical]
-            .map(|p| format!("Initialized empty Git repository in {}/\n", p.display()));
-        assert!(accepted.contains(&text), "init output {text:?}");
+        // Windows prints forward slashes (as C Git does) and no `\\?\` prefix.
+        let normalize = |text: &str| {
+            if cfg!(windows) {
+                text.replace('\\', "/").replace("//?/", "")
+            } else {
+                text.to_owned()
+            }
+        };
+        let accepted = [git_dir, canonical].map(|p| {
+            normalize(&format!(
+                "Initialized empty Git repository in {}/\n",
+                p.display()
+            ))
+        });
+        assert!(accepted.contains(&normalize(&text)), "init output {text:?}");
     }
     // Initializing an existing repository.
     let before = snapshot(s.dir())?;
@@ -346,15 +360,21 @@ fn nested_dirs_and_tree_ordering(driver: Driver) -> Result {
     for hash in Hash::ALL {
         let mut s = Scenario::init(driver, hash, "main")?;
         // "a-b" < "a/" < "a0" < "a=": directory sorts as "a/".
-        for name in [
+        let mut names = vec![
             &b"a-b"[..],
             b"a/x",
             b"a/y/z/deep",
             b"a0",
             b"a=",
             b"b/c/d/e/f",
-            b"sp ace/t\tab",
-        ] {
+            b"sp ace/plain",
+        ];
+        if cfg!(windows) {
+            eprintln!("SKIP: tab in a file name: Windows forbids it");
+        } else {
+            names.push(b"sp ace/t\tab");
+        }
+        for name in names {
             s.model.write(0, name, &[name, b"\n"].concat())?;
         }
         s.add(0, &[b"."])?;

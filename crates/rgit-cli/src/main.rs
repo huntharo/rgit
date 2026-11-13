@@ -195,8 +195,12 @@ fn run(cli: Cli, out: &mut impl Write) -> Result<u8> {
         let repo = rgit_core::write::init(&target, &options)?;
         if !quiet {
             out.write_all(b"Initialized empty Git repository in ")?;
-            let git_dir = dunce::canonicalize(repo.git_dir())?;
-            out.write_all(os_bytes(git_dir.as_os_str())?)?;
+            // Same absolute form as `rev-parse --absolute-git-dir` (forward
+            // slashes on Windows, as C Git prints), followed by `/`.
+            let mut git_dir = Vec::new();
+            write_path(&mut git_dir, repo.git_dir())?;
+            git_dir.pop();
+            out.write_all(&git_dir)?;
             out.write_all(b"/\n")?;
         }
         out.flush()?;

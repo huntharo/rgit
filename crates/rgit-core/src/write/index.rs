@@ -138,6 +138,9 @@ fn refuse(refusal: AddRefusal) -> Error {
 
 #[derive(Clone, Copy)]
 struct AddConfig {
+    /// `core.symlinks=false` (the C Git default on Windows) only matters for
+    /// paths that are, or are tracked as, symbolic links; those are refused.
+    symlinks: bool,
     filemode: bool,
     ignorecase: bool,
     precompose: bool,
@@ -229,9 +232,6 @@ impl Repository {
                 "index.version other than 2 or 3",
             ));
         }
-        if !flag("core.symlinks", true)? {
-            return Err(Error::UnsupportedCapability("core.symlinks=false"));
-        }
         let is_input = |key: &str| {
             config
                 .string(key)
@@ -245,6 +245,7 @@ impl Repository {
         let autocrlf = is_input("core.autocrlf") || flag("core.autocrlf", false)?;
         let safecrlf_die = !is_warn("core.safecrlf") && flag("core.safecrlf", false)?;
         Ok(AddConfig {
+            symlinks: flag("core.symlinks", true)?,
             filemode: flag("core.fileMode", true)?,
             ignorecase: flag("core.ignoreCase", false)?,
             precompose: flag("core.precomposeUnicode", false)?,
@@ -386,14 +387,21 @@ impl Repository {
                 continue;
             };
             let symlink = kind == DiskKind::Symlink;
+            let existing = tracked
+                .get(path)
+                .and_then(|slot| slot.stage0)
+                .map(|position| state.entries()[position].mode);
+            if !config.symlinks && (symlink || existing == Some(Mode::SYMLINK)) {
+                // C Git would stage the link-target text of a plain file as a
+                // symlink here; that conversion is not implemented.
+                return Err(Error::UnsupportedCapability(
+                    "core.symlinks=false for a path that is or was a symbolic link",
+                ));
+            }
             let (data, stat) = read_worktree(root, path, symlink)?;
             let mode = if symlink {
                 Mode::SYMLINK
             } else {
-                let existing = tracked
-                    .get(path)
-                    .and_then(|slot| slot.stage0)
-                    .map(|position| state.entries()[position].mode);
                 file_mode(root, path, config, existing)?
             };
             if !symlink {
@@ -521,8 +529,7 @@ impl Repository {
             Ok(metadata) if metadata.is_file() => {
                 // Trust an existing loose file only once it holds this object.
                 super::object::verify_loose_object(&loose, id)?;
-                fs::File::open(&loose)?.sync_all()?;
-                super::sync_parent(&loose)?;
+                super::sync_existing_file(&loose)?;
                 return Ok(true);
             }
             Ok(_) => {

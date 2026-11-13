@@ -287,10 +287,7 @@ impl Repository {
             .join(&hex[..2])
             .join(&hex[2..]);
         match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_file() => {
-                File::open(&path)?.sync_all()?;
-                sync_parent(&path)
-            }
+            Ok(metadata) if metadata.is_file() => super::sync_existing_file(&path),
             Ok(_) => Err(Error::UnsupportedCapability(
                 "symlink or special loose object file",
             )),

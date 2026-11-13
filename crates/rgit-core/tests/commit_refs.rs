@@ -2,6 +2,8 @@
 //! with C Git as an independent implementation. C Git builds every fixture
 //! (init, add, update-index) so these tests do not depend on rgit's own
 //! init/add. Every scenario ends with `git fsck --strict`.
+// Several helpers exercise Unix-only behaviour (symlinks, FIFOs, modes).
+#![cfg_attr(not(unix), allow(unused_imports, unused_variables, dead_code))]
 
 mod common;
 

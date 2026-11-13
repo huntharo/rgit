@@ -78,8 +78,7 @@ fn loose_path(objects: &Path, id: &ObjectId) -> (PathBuf, PathBuf) {
 }
 
 fn sync_existing(path: &Path) -> Result<(), Error> {
-    File::open(path)?.sync_all()?;
-    super::sync_parent(path)
+    super::sync_existing_file(path)
 }
 
 /// Create the fan-out directory if needed, syncing `objects/` when it was.
