@@ -54,10 +54,6 @@ impl LockFile {
         Ok(lock)
     }
 
-    pub(crate) fn lock_path(&self) -> &Path {
-        &self.lock_path
-    }
-
     pub(crate) fn write_all(&mut self, bytes: &[u8]) -> Result<(), Error> {
         let file = self.file.as_mut().ok_or(Error::Injected("lock reused"))?;
         file.write_all(bytes)?;

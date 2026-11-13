@@ -14,22 +14,17 @@
 //!   never rewritten in place. A held lock refuses the operation.
 
 mod commit;
-// Scaffolding allowance: removed at integration once WP1/WP2 use these.
-#[allow(dead_code)]
 mod failpoint;
 mod index;
 mod init;
-#[allow(dead_code)]
 mod lock;
 mod object;
 mod refs;
 
 pub use commit::{CommitOutcome, CommitRequest, Signature};
-pub use index::AddOutcome;
+pub use index::{AddOutcome, AddRefusal};
 pub use init::{InitOptions, ObjectFormat, init};
 pub use refs::{RefExpectation, RefLog, RefUpdate, ReflogAppendError};
 
-#[allow(unused_imports)]
 pub(crate) use failpoint::hit as failpoint;
-#[allow(unused_imports)]
 pub(crate) use lock::{LockFile, sync_parent};
