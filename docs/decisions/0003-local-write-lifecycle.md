@@ -83,7 +83,8 @@ Observable by a fresh process, for a branch that `HEAD` names:
 A reflog line whose new value never became the reference is C Git's
 behaviour after the same interruption; the object exists, so `git fsck
 --strict` accepts it. For a detached `HEAD` the reference lock is `HEAD.lock`
-and only `logs/HEAD` changes. A caller (or test oracle) must never treat an
+and only `logs/HEAD` changes; a crash after the rename leaves no lock, because
+`HEAD.lock` itself was renamed over `HEAD`. A caller (or test oracle) must never treat an
 error from a write operation as proof that the repository is unchanged.
 
 ## Ownership and frozen API
