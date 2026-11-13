@@ -11,6 +11,11 @@ use tempfile::{TempDir, tempdir};
 mod support;
 use support::{Result, git, git_command};
 
+#[cfg(windows)]
+const ADDED_NAME: &str = "added space";
+#[cfg(not(windows))]
+const ADDED_NAME: &str = "added space\t\"\\";
+
 fn init(hash: &str) -> Result<TempDir> {
     let root = tempdir()?;
     git(
@@ -100,10 +105,7 @@ fn modifications(root: &Path) -> Result {
         b"one\nchanged\nthree\nfour\nfive\nsix\nseven\neight\nnine\nlast without newline",
     )?;
     fs::remove_file(root.join("deleted"))?;
-    fs::write(
-        root.join("added space\t\"\\"),
-        b"new\nnon-UTF-8: \xff\xfe\n",
-    )?;
+    fs::write(root.join(ADDED_NAME), b"new\nnon-UTF-8: \xff\xfe\n")?;
     fs::write(root.join("empty-added"), b"")?;
     fs::write(root.join("becomes-empty"), b"")?;
     #[cfg(unix)]
@@ -129,7 +131,7 @@ fn staged_and_worktree_patches_apply_to_the_expected_tree() -> Result {
             if cached {
                 git(root, &["add", "-A"])?;
             } else {
-                git(root, &["add", "-N", "added space\t\"\\", "empty-added"])?;
+                git(root, &["add", "-N", ADDED_NAME, "empty-added"])?;
             }
             let repo = Repository::discover(root)?;
             let before = snapshot(&root.join(".git"))?;
@@ -494,5 +496,123 @@ fn cached_submodule_metadata_is_available_but_patches_are_refused() -> Result {
     assert_eq!(repo.diff_entries(true)?, names(root, true)?);
     assert!(repo.diff_patch(true).is_err());
     assert!(repo.diff_entries(false).is_err());
+    Ok(())
+}
+
+#[cfg(unix)]
+fn bounded_status(root: &Path) -> Result<Output> {
+    use std::time::{Duration, Instant};
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rgit"))
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain", "-uno"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let start = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(child.wait_with_output()?);
+        }
+        if start.elapsed() > Duration::from_secs(5) {
+            child.kill()?;
+            child.wait()?;
+            return Err("status blocked while inspecting nested metadata".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn status_refuses_nested_marker_metadata_without_blocking_or_following_links() -> Result {
+    use std::os::unix::fs::symlink;
+    let root = init("sha1")?;
+    let root = root.path();
+    fs::create_dir(root.join("dir"))?;
+    fs::write(root.join("dir/file"), b"old\n")?;
+    git(root, &["add", "."])?;
+    git(root, &["commit", "-m", "tracked nested directory"])?;
+    fs::write(root.join("dir/file"), b"changed and longer\n")?;
+    // The recursive preflight may treat any .git marker as a repository
+    // boundary. Tracked files still cause its parent metadata to be loaded.
+    fs::write(root.join("dir/.git"), b"not even a valid gitdir marker\n")?;
+    let outside = tempdir()?;
+    fs::write(outside.path().join("metadata"), b"* text eol=lf\n")?;
+    for name in [".gitattributes", ".gitignore"] {
+        let path = root.join("dir").join(name);
+        for fifo in [true, false] {
+            if fifo {
+                assert!(
+                    std::process::Command::new("mkfifo")
+                        .arg(&path)
+                        .status()?
+                        .success()
+                );
+            } else {
+                symlink(outside.path().join("metadata"), &path)?;
+            }
+            let output = bounded_status(root)?;
+            assert_eq!(
+                output.status.code(),
+                Some(128),
+                "{name}, fifo={fifo}: {output:?}"
+            );
+            assert!(output.stdout.is_empty(), "refusal emitted partial status");
+            assert!(!output.stderr.is_empty(), "refusal needs a diagnostic");
+            fs::remove_file(path.as_path())?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn removed_intent_to_add_has_an_applicable_deletion_patch() -> Result {
+    for hash in ["sha1", "sha256"] {
+        let root = init(hash)?;
+        let root = root.path();
+        baseline(root)?;
+        fs::write(root.join("ita"), b"never staged content\n")?;
+        git(root, &["add", "-N", "ita"])?;
+        fs::remove_file(root.join("ita"))?;
+        let repo = Repository::discover(root)?;
+        let before = snapshot(&root.join(".git"))?;
+        let entries = repo.diff_entries(false)?;
+        assert_eq!(
+            entries,
+            vec![DiffEntry {
+                path: b"ita".to_vec(),
+                code: b'D'
+            }]
+        );
+        assert_eq!(entries, names(root, false)?);
+        let patch = repo.diff_patch(false)?;
+        assert!(!patch.is_empty(), "removed ITA requires a deletion patch");
+        assert!(
+            patch
+                .windows(b"deleted file mode 100644\n".len())
+                .any(|part| part == b"deleted file mode 100644\n")
+        );
+        assert_eq!(before, snapshot(&root.join(".git"))?);
+        // A regular empty index entry independently models the before-image of
+        // an ITA deletion. Applying the patch must restore the HEAD tree.
+        let expected = git(root, &["rev-parse", "HEAD^{tree}"])?.stdout;
+        let empty_blob = input(root, &["hash-object", "-w", "--stdin"], b"")?.stdout;
+        let empty_blob = std::str::from_utf8(&empty_blob)?.trim();
+        git(
+            root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "100644",
+                empty_blob,
+                "ita",
+            ],
+        )?;
+        input(root, &["apply", "--cached", "-"], &patch)?;
+        assert_eq!(expected, git(root, &["write-tree"])?.stdout);
+    }
     Ok(())
 }
