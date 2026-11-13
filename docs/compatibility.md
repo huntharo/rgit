@@ -152,10 +152,10 @@ Differences from C Git:
   `index.lock`, so it commits the index snapshot it read; a concurrent `add`
   published after that read is not included.
 - Objects are always written loose (zlib level 1); there is no packing or
-  auto-maintenance. Reflog lines are appended after the reference is
-  published, whereas C Git appends before; see decision 0003 for the full
-  failure table. A reflog append failure after publication exits 128 with a
-  diagnostic stating that the reference was updated.
+  auto-maintenance. Reflog lines are appended under the reference lock before
+  the rename, in C Git's order, so a crash between the two leaves a line for
+  an update that never became visible; see decision 0003 for the failure
+  table. Every error says whether the reference was updated.
 - Ignore and attribute rules come from the worktree, `info/` and
   repository-local config only, consistent with isolated discovery.
 - `add` refuses absolute paths even inside the worktree, and `path/` must name a
@@ -166,21 +166,25 @@ Differences from C Git:
 - An empty directory left where a reference must be created (for example
   `refs/heads/a/` after `refs/heads/a/b` was deleted) is a conflict; C Git
   removes it and proceeds.
-- For a plain reference update outside `commit`, which reflogs to append
-  (including `HEAD`'s) is decided before the lock; `HEAD` re-pointed
-  concurrently can receive or miss that line. `commit` holds `HEAD.lock` and
-  is not affected.
+- A logged update of a branch takes `HEAD.lock` (as C Git does) to decide
+  whether `HEAD`'s log receives the line, so a held `HEAD.lock` refuses it.
 - Durability covers objects rgit writes, plus a commit's parent and trees and
   the object `update_ref` publishes, which rgit syncs before publishing. Blobs
   another program wrote (for example C Git without `core.fsync`) are checked
   for presence, not synced; packed objects are assumed durable. A symlink or
   special file at a loose object path is refused.
 
-Known race windows, outside the claim that preflight is a filesystem sandbox:
-a path swapped for a FIFO or symlink between `add`'s `lstat` and `open` can
-block or be followed (content is re-hashed and verified, so wrong bytes are
-never staged); and on Unix the rename that publishes `init` replaces an empty
-`.git` directory that a concurrent `git init` created in that instant.
+Publication never replaces an existing entry: objects, `HEAD` and a new Git
+directory are published by `hard_link` or an atomic no-replace rename
+(`renameat` with `RENAME_EXCL`/`RENAME_NOREPLACE` on macOS and Linux). Where
+neither is available the operation is refused or, for `init` on Windows, uses
+exclusive directory creation; there is no check-then-rename fallback.
+Worktree files are opened without following a final symlink and without
+blocking on a FIFO (`O_NOFOLLOW|O_NONBLOCK`), and the opened descriptor is
+validated before its bytes are used. Parent directories are still resolved by
+path: an ancestor directory swapped for a symlink concurrently is not
+detected. Preflight is therefore not a filesystem sandbox against an actively
+hostile concurrent writer.
 
 Recovery after interruption: a fresh process sees each of the index, `HEAD`
 and the branch ref either completely old or completely new. Abrupt termination
