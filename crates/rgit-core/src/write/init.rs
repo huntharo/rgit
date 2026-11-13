@@ -38,14 +38,19 @@ impl Default for InitOptions {
 
 /// Create a new repository at `directory` (created if absent). Refuses with
 /// [`Error::AlreadyExists`] when a repository already exists there; does not
-/// reinitialize. The Git directory is assembled privately and published with
-/// one rename so an interruption never leaves a partially initialized one.
+/// reinitialize. An interruption never leaves a directory that C Git
+/// recognizes as a partially initialized repository:
 ///
-/// A bare repository is published by renaming over `directory`, which must be
-/// absent or an empty directory. On Unix the rename atomically replaces an
-/// empty directory (its permissions and ownership become those of the new
-/// directory); a directory that gains entries concurrently makes the rename
-/// fail and nothing is published.
+/// - A non-bare `.git`, or a bare repository at an absent path, is assembled
+///   in a private sibling directory and published with one rename.
+/// - An existing empty bare target (or a symlink to one) is populated in
+///   place so its inode, mode, ownership, ACLs and extended attributes are
+///   kept: `objects/`, `refs/` and `config` are written and synced first and
+///   `HEAD`, without which no Git recognizes a repository, is published last
+///   through a no-replace link.
+///
+/// A failure after publication is reported as [`InitPublishedError`]: the
+/// repository exists even though an error is returned.
 pub fn init(directory: &Path, options: &InitOptions) -> Result<Repository, Error> {
     let head_ref = branch_reference(&options.initial_branch)?;
     if directory.as_os_str().is_empty() {
@@ -87,7 +92,7 @@ fn init_worktree(
     refuse_existing(&git_dir)?;
     let temporary = directory.join(format!(".git.rgit-init-{}", super::object::unique_suffix()));
     publish_git_dir(&temporary, &git_dir, options, head_ref, false)?;
-    Repository::discover(directory)
+    finish(directory, &git_dir)
 }
 
 fn init_bare(
@@ -95,24 +100,25 @@ fn init_bare(
     options: &InitOptions,
     head_ref: &[u8],
 ) -> Result<Repository, Error> {
-    let replace_empty = match fs::symlink_metadata(directory) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            // Publishing renames over the target, which would replace the
-            // link itself rather than populate the directory it names.
-            return Err(Error::UnsupportedCapability(
-                "bare repository target is a symbolic link",
-            ));
-        }
+    // Like C Git, a symlink to a directory is followed.
+    match fs::metadata(directory) {
         Ok(metadata) if metadata.is_dir() => {
             if fs::read_dir(directory)?.next().is_some() {
                 return Err(Error::AlreadyExists(directory.to_owned()));
             }
-            true
+            populate_in_place(directory, options, head_ref)?;
+            return finish(directory, directory);
         }
         Ok(_) => return Err(Error::AlreadyExists(directory.to_owned())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if fs::symlink_metadata(directory).is_ok() {
+                return Err(Error::UnsupportedCapability(
+                    "bare repository target is a dangling symbolic link",
+                ));
+            }
+        }
         Err(error) => return Err(error.into()),
-    };
+    }
     let name = directory
         .file_name()
         .ok_or_else(|| Error::InvalidPath(directory.as_os_str().as_encoded_bytes().to_vec()))?;
@@ -120,20 +126,143 @@ fn init_bare(
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_owned(),
         _ => PathBuf::from("."),
     };
-    if !replace_empty {
-        create_directories(&parent)?;
-    }
+    create_directories(&parent)?;
     let mut temporary_name = std::ffi::OsString::from(".");
     temporary_name.push(name);
     temporary_name.push(format!(".rgit-init-{}", super::object::unique_suffix()));
     let temporary = parent.join(temporary_name);
-    if replace_empty && !cfg!(unix) {
-        // Windows cannot rename over a directory; the empty target is removed
-        // first, leaving a short window in which it is absent.
-        fs::remove_dir(directory)?;
-    }
     publish_git_dir(&temporary, directory, options, head_ref, true)?;
-    Repository::discover(directory)
+    finish(directory, directory)
+}
+
+/// Open the published repository; failure here is reported as published.
+fn finish(directory: &Path, git_dir: &Path) -> Result<Repository, Error> {
+    Repository::discover(directory).map_err(|source| published(git_dir, "opening it", source))
+}
+
+/// Populate an existing empty directory as a bare repository without
+/// replacing it. Everything except `HEAD` is written and synced first; until
+/// `HEAD` exists the directory is not a repository for C Git or rgit. On a
+/// failure before `HEAD` is published, the entries this call created are
+/// removed (best effort) and the original error is returned.
+fn populate_in_place(root: &Path, options: &InitOptions, head_ref: &[u8]) -> Result<(), Error> {
+    let mut created: Vec<PathBuf> = Vec::new();
+    let mut head_temporary = None;
+    let prepared = (|| -> Result<PathBuf, Error> {
+        for directory in DIRECTORIES {
+            let path = root.join(directory);
+            fs::create_dir(&path)?;
+            created.push(path);
+        }
+        let config = config_bytes(root, options, true)?;
+        let config_path = root.join("config");
+        write_synced(&config_path, &config)?;
+        created.push(config_path);
+        for directory in DIRECTORIES.iter().rev() {
+            sync_directory(&root.join(directory))?;
+        }
+        sync_directory(root)?;
+        super::failpoint("init.before-head")?;
+        let temporary = root.join(format!("HEAD.rgit-init-{}", super::object::unique_suffix()));
+        write_synced(&temporary, &head_bytes(head_ref))?;
+        head_temporary = Some(temporary.clone());
+        Ok(temporary)
+    })();
+    let published_head = prepared.and_then(|temporary| {
+        let linked = publish_no_replace(&temporary, &root.join("HEAD"))?;
+        Ok(linked.then_some(temporary))
+    });
+    let leftover = match published_head {
+        Ok(leftover) => leftover,
+        Err(error) => {
+            // Undo only what this call created; the target stays a plain,
+            // empty directory. Cleanup failures cannot hide the cause.
+            if let Some(temporary) = head_temporary {
+                let _ = fs::remove_file(temporary);
+            }
+            for path in created.iter().rev() {
+                let _ = if path.is_dir() {
+                    fs::remove_dir(path)
+                } else {
+                    fs::remove_file(path)
+                };
+            }
+            return Err(error);
+        }
+    };
+    // HEAD is published: from here on the repository exists.
+    if let Some(temporary) = leftover {
+        fs::remove_file(&temporary)
+            .map_err(|source| published(root, "removing the temporary HEAD", source.into()))?;
+    }
+    sync_directory(root).map_err(|source| published(root, "syncing the repository", source))
+}
+
+/// Publish the complete, synced `temporary` as `path` without ever replacing
+/// an existing entry. Uses a hard link (which fails if `path` exists) and
+/// returns `true`, leaving `temporary` for the caller to remove. Where hard
+/// links are unsupported it renames instead, only while `path` is still
+/// absent, and returns `false` because `temporary` no longer exists.
+fn publish_no_replace(temporary: &Path, path: &Path) -> Result<bool, Error> {
+    match fs::hard_link(temporary, path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(Error::AlreadyExists(path.to_owned()))
+        }
+        Err(link_error) => match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::rename(temporary, path)?;
+                Ok(false)
+            }
+            Ok(_) => Err(Error::AlreadyExists(path.to_owned())),
+            Err(_) => Err(link_error.into()),
+        },
+    }
+}
+
+/// The repository was created (and is visible at [`Self::git_dir`]), but a
+/// step after publication failed, such as syncing its parent directory or
+/// opening it. Carried in [`Error::Other`]; never produced before publication.
+#[derive(Debug)]
+pub struct InitPublishedError {
+    git_dir: PathBuf,
+    step: &'static str,
+    source: Error,
+}
+
+impl InitPublishedError {
+    /// The Git directory that now exists.
+    // Reachable once write/mod.rs re-exports this type (integration owner).
+    #[allow(dead_code)]
+    pub fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+}
+
+impl std::fmt::Display for InitPublishedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the repository was created at {}, but {} failed afterwards: {}",
+            self.git_dir.display(),
+            self.step,
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for InitPublishedError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn published(git_dir: &Path, step: &'static str, source: Error) -> Error {
+    Error::Other(Box::new(InitPublishedError {
+        git_dir: git_dir.to_owned(),
+        step,
+        source,
+    }))
 }
 
 /// A non-bare target is a repository if `.git` exists in any form.
@@ -182,7 +311,8 @@ fn publish_git_dir(
         Ok(())
     })();
     match result {
-        Ok(()) => super::sync_parent(target),
+        Ok(()) => super::sync_parent(target)
+            .map_err(|source| published(target, "syncing its parent directory", source)),
         Err(error) => {
             let _ = fs::remove_dir_all(temporary);
             Err(error)
@@ -210,25 +340,30 @@ fn rename_directory(from: &Path, to: &Path) -> Result<(), Error> {
     }
 }
 
-fn assemble(root: &Path, options: &InitOptions, head_ref: &[u8], bare: bool) -> Result<(), Error> {
-    let directories = [
-        "objects",
-        "objects/info",
-        "objects/pack",
-        "refs",
-        "refs/heads",
-        "refs/tags",
-    ];
-    for directory in directories {
-        fs::create_dir(root.join(directory))?;
-    }
+const DIRECTORIES: [&str; 6] = [
+    "objects",
+    "objects/info",
+    "objects/pack",
+    "refs",
+    "refs/heads",
+    "refs/tags",
+];
+
+fn head_bytes(head_ref: &[u8]) -> Vec<u8> {
     let mut head = b"ref: ".to_vec();
     head.extend_from_slice(head_ref);
     head.push(b'\n');
-    write_synced(&root.join("HEAD"), &head)?;
+    head
+}
+
+fn assemble(root: &Path, options: &InitOptions, head_ref: &[u8], bare: bool) -> Result<(), Error> {
+    for directory in DIRECTORIES {
+        fs::create_dir(root.join(directory))?;
+    }
+    write_synced(&root.join("HEAD"), &head_bytes(head_ref))?;
     let config = config_bytes(root, options, bare)?;
     write_synced(&root.join("config"), &config)?;
-    for directory in directories.iter().rev() {
+    for directory in DIRECTORIES.iter().rev() {
         sync_directory(&root.join(directory))?;
     }
     sync_directory(root)
@@ -254,7 +389,7 @@ fn config_bytes(root: &Path, options: &InitOptions, bare: bool) -> Result<Vec<u8
     if !bare {
         config.push_str("\tlogallrefupdates = true\n");
     }
-    if !probe_symlinks(root) {
+    if !probe_symlinks(root)? {
         config.push_str("\tsymlinks = false\n");
     }
     if probe_ignorecase(root)? {
@@ -290,7 +425,9 @@ fn probe_filemode(_root: &Path) -> Result<bool, Error> {
     Ok(false)
 }
 
-fn probe_symlinks(root: &Path) -> bool {
+/// Git's probe: can a symlink be created? A probe link that cannot be
+/// removed is an error rather than a stray entry in the Git directory.
+fn probe_symlinks(root: &Path) -> Result<bool, Error> {
     let link = root.join("tXXXXXX");
     #[cfg(unix)]
     let created = std::os::unix::fs::symlink("testing", &link).is_ok();
@@ -299,9 +436,9 @@ fn probe_symlinks(root: &Path) -> bool {
     #[cfg(not(any(unix, windows)))]
     let created = false;
     if created {
-        let _ = fs::remove_file(&link);
+        fs::remove_file(&link)?;
     }
-    created
+    Ok(created)
 }
 
 /// Git's probe: after creating `config`, can it be found as `CoNfIg`?

@@ -18,7 +18,7 @@
 //! are "smudged" (size 0), forcing C Git to compare content, which is a
 //! conservative form of Git's `ce_smudge_racily_clean_entry`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -354,7 +354,9 @@ impl Repository {
         // Expand pathspecs into tracked paths to refresh and new paths.
         let mut selected: BTreeSet<Vec<u8>> = BTreeSet::new();
         let mut fresh: BTreeSet<Vec<u8>> = BTreeSet::new();
+        let mut guard = MetadataGuard::new(root);
         let mut expander = Expander {
+            guard: &mut guard,
             root,
             state: &state,
             tracked: &tracked,
@@ -388,6 +390,7 @@ impl Repository {
                 file_mode(root, path, config, existing)?
             };
             if !symlink {
+                guard.check(path, false)?;
                 attributes.reset();
                 stack
                     .at_entry(BStr::new(path), None)?
@@ -731,6 +734,7 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 struct Expander<'a, 'repo> {
+    guard: &'a mut MetadataGuard,
     root: &'a Path,
     state: &'a gix::index::State,
     tracked: &'a BTreeMap<Vec<u8>, Tracked>,
@@ -863,10 +867,7 @@ impl Expander<'_, '_> {
     }
 
     fn excluded(&mut self, path: &[u8], is_dir: bool) -> Result<bool, Error> {
-        let directory = native(self.root, path)?;
-        if let Some(parent) = directory.parent() {
-            check_metadata_files(&[parent.join(".gitignore"), parent.join(".gitattributes")])?;
-        }
+        self.guard.check(path, is_dir)?;
         let mode = is_dir.then_some(Mode::DIR);
         Ok(self.stack.at_entry(BStr::new(path), mode)?.is_excluded())
     }
@@ -879,7 +880,7 @@ impl Expander<'_, '_> {
         let mut pending = vec![spec.to_vec()];
         while let Some(directory) = pending.pop() {
             let absolute = native(self.root, &directory)?;
-            check_metadata_files(&[absolute.join(".gitignore"), absolute.join(".gitattributes")])?;
+            self.guard.check(&directory, true)?;
             for child in fs::read_dir(&absolute)? {
                 let child = child?;
                 let name = name_bytes(&child.file_name())?;
@@ -1008,27 +1009,27 @@ fn read_worktree(root: &Path, path: &[u8], symlink: bool) -> Result<(Vec<u8>, St
         }
         let target = fs::read_link(&absolute)?;
         let after = fs::symlink_metadata(&absolute)?;
-        if fingerprint(&before) != fingerprint(&after) {
+        if fingerprint(&before)? != fingerprint(&after)? {
             return Err(changed());
         }
         let data = path_bytes(&target)?;
-        return Ok((data, stat_of(&before)));
+        return Ok((data, stat_of(&before)?));
     }
     if !before.file_type().is_file() {
         return Err(changed());
     }
     let mut file = fs::File::open(&absolute)?;
     let opened = file.metadata()?;
-    if !opened.is_file() || fingerprint(&before) != fingerprint(&opened) {
+    if !opened.is_file() || fingerprint(&before)? != fingerprint(&opened)? {
         return Err(changed());
     }
     let mut data = Vec::with_capacity(usize::try_from(opened.len()).unwrap_or(0));
     file.read_to_end(&mut data)?;
     let after = file.metadata()?;
-    if fingerprint(&opened) != fingerprint(&after) || data.len() as u64 != after.len() {
+    if fingerprint(&opened)? != fingerprint(&after)? || data.len() as u64 != after.len() {
         return Err(changed());
     }
-    Ok((data, stat_of(&opened)))
+    Ok((data, stat_of(&opened)?))
 }
 
 fn file_mode(
@@ -1065,9 +1066,9 @@ fn executable(_metadata: &fs::Metadata) -> bool {
 }
 
 #[cfg(unix)]
-fn fingerprint(metadata: &fs::Metadata) -> [i64; 7] {
+fn fingerprint(metadata: &fs::Metadata) -> Result<[i64; 7], Error> {
     use std::os::unix::fs::MetadataExt;
-    [
+    Ok([
         metadata.dev() as i64,
         metadata.ino() as i64,
         metadata.len() as i64,
@@ -1075,17 +1076,15 @@ fn fingerprint(metadata: &fs::Metadata) -> [i64; 7] {
         metadata.mtime_nsec(),
         metadata.ctime(),
         metadata.ctime_nsec(),
-    ]
+    ])
 }
 
+/// Without an inode identity, size and modification time must both be
+/// available; an unreadable timestamp is an error, never a size-only check.
 #[cfg(not(unix))]
-fn fingerprint(metadata: &fs::Metadata) -> [i64; 7] {
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .unwrap_or_default();
-    [
+fn fingerprint(metadata: &fs::Metadata) -> Result<[i64; 7], Error> {
+    let modified = since_epoch(metadata.modified()?)?;
+    Ok([
         0,
         0,
         metadata.len() as i64,
@@ -1093,16 +1092,22 @@ fn fingerprint(metadata: &fs::Metadata) -> [i64; 7] {
         i64::from(modified.subsec_nanos()),
         0,
         0,
-    ]
+    ])
+}
+
+#[cfg(not(unix))]
+fn since_epoch(time: std::time::SystemTime) -> Result<std::time::Duration, Error> {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| Error::Other(Box::new(error)))
 }
 
 /// Index stat data as C Git records it (`st_ctime`, not birth time).
 #[cfg(unix)]
-fn stat_of(metadata: &fs::Metadata) -> Stat {
+fn stat_of(metadata: &fs::Metadata) -> Result<Stat, Error> {
     use gix::index::entry::stat::Time;
     use std::os::unix::fs::MetadataExt;
     // Truncation to 32 bits matches Git's on-disk index fields.
-    Stat {
+    Ok(Stat {
         mtime: Time {
             secs: metadata.mtime() as u32,
             nsecs: metadata.mtime_nsec() as u32,
@@ -1116,28 +1121,25 @@ fn stat_of(metadata: &fs::Metadata) -> Stat {
         uid: metadata.uid(),
         gid: metadata.gid(),
         size: metadata.len() as u32,
-    }
+    })
 }
 
 #[cfg(not(unix))]
-fn stat_of(metadata: &fs::Metadata) -> Stat {
+fn stat_of(metadata: &fs::Metadata) -> Result<Stat, Error> {
     use gix::index::entry::stat::Time;
-    let time = |time: std::io::Result<std::time::SystemTime>| {
-        let duration = time
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .unwrap_or_default();
-        Time {
+    let time = |time: std::io::Result<std::time::SystemTime>| -> Result<Time, Error> {
+        let duration = since_epoch(time?)?;
+        Ok(Time {
             secs: duration.as_secs() as u32,
             nsecs: duration.subsec_nanos(),
-        }
+        })
     };
-    Stat {
-        mtime: time(metadata.modified()),
-        ctime: time(metadata.created()),
+    Ok(Stat {
+        mtime: time(metadata.modified())?,
+        ctime: time(metadata.created())?,
         size: metadata.len() as u32,
         ..Stat::default()
-    }
+    })
 }
 
 /// Literal worktree-relative pathspec to a normalized index path; `.` (the
@@ -1219,6 +1221,46 @@ fn has_git_marker(directory: &Path) -> Result<bool, Error> {
             Ok(false)
         }
         Err(error) => Err(error.into()),
+    }
+}
+
+/// Before any ignore or attribute lookup for a path, verify the
+/// `.gitignore`/`.gitattributes` of every directory the lookup will read: the
+/// worktree root, each ancestor and, for a directory, the directory itself.
+/// Gitoxide opens these files while walking the path, so a FIFO among them
+/// would block and a symlink would be followed. Checked directories are cached.
+struct MetadataGuard {
+    root: PathBuf,
+    checked: HashSet<Vec<u8>>,
+}
+
+impl MetadataGuard {
+    fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_owned(),
+            checked: HashSet::new(),
+        }
+    }
+
+    fn check(&mut self, path: &[u8], is_dir: bool) -> Result<(), Error> {
+        let mut directories = vec![&path[..0]];
+        for (offset, byte) in path.iter().enumerate() {
+            if *byte == b'/' {
+                directories.push(&path[..offset]);
+            }
+        }
+        if is_dir && !path.is_empty() {
+            directories.push(path);
+        }
+        for directory in directories {
+            if self.checked.contains(directory) {
+                continue;
+            }
+            let absolute = native(&self.root, directory)?;
+            check_metadata_files(&[absolute.join(".gitignore"), absolute.join(".gitattributes")])?;
+            self.checked.insert(directory.to_vec());
+        }
+        Ok(())
     }
 }
 
