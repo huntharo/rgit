@@ -6,6 +6,9 @@ pub use gix::ObjectId;
 pub use gix::bstr::BStr;
 pub use gix::object::Kind as ObjectKind;
 
+mod graph;
+pub use graph::GraphLimits;
+
 /// Operation errors retain the underlying Gitoxide error as their source.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -18,6 +21,14 @@ pub enum Error {
     PeelLimit,
     UnsupportedFormat(i64),
     UnsupportedExtension(String),
+    Io(std::io::Error),
+    InvalidShallow,
+    GraphLimit {
+        resource: &'static str,
+        limit: usize,
+    },
+    GraphCycle,
+    UnsupportedHistory(&'static str),
 }
 
 impl std::fmt::Display for Error {
@@ -34,6 +45,15 @@ impl std::fmt::Display for Error {
             Self::UnsupportedExtension(name) => {
                 write!(f, "unsupported repository extension: {name}")
             }
+            Self::Io(error) => write!(f, "could not read graph data: {error}"),
+            Self::InvalidShallow => write!(f, "invalid shallow boundary object ID"),
+            Self::GraphLimit { resource, limit } => {
+                write!(f, "commit graph exceeds {resource} limit ({limit})")
+            }
+            Self::GraphCycle => write!(f, "commit graph contains a cycle"),
+            Self::UnsupportedHistory(feature) => {
+                write!(f, "unsupported history feature: {feature}")
+            }
         }
     }
 }
@@ -42,8 +62,15 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Git(error) => Some(error),
+            Self::Io(error) => Some(error),
             _ => None,
         }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
     }
 }
 

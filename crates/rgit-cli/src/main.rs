@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
-use rgit_core::{BStr, ObjectKind, Repository};
+use rgit_core::{BStr, GraphLimits, ObjectKind, Repository};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -34,6 +34,21 @@ enum Command {
     },
     /// List references and their object IDs, without peeling tags.
     ShowRef,
+    /// Find best common ancestors, or test whether one commit is an ancestor.
+    MergeBase {
+        #[arg(short = 'a', long, conflicts_with = "is_ancestor")]
+        all: bool,
+        #[arg(long)]
+        is_ancestor: bool,
+        left: OsString,
+        right: OsString,
+    },
+    /// Count the unique commits reachable from one revision.
+    RevList {
+        #[arg(long, required = true)]
+        count: bool,
+        revision: OsString,
+    },
 }
 
 #[derive(Args)]
@@ -115,6 +130,35 @@ fn run(cli: Cli, out: &mut impl Write) -> Result<u8> {
                 out.write_all(&reference.name)?;
                 writeln!(out)?;
             }
+        }
+        Command::MergeBase {
+            all,
+            is_ancestor,
+            left,
+            right,
+        } => {
+            let (left, right) = (os_bytes(&left)?, os_bytes(&right)?);
+            if is_ancestor {
+                return Ok(u8::from(!repo.is_ancestor(
+                    left,
+                    right,
+                    GraphLimits::default(),
+                )?));
+            }
+            let bases = repo.merge_bases(left, right, GraphLimits::default())?;
+            if bases.is_empty() {
+                return Ok(1);
+            }
+            for id in bases.into_iter().take(if all { usize::MAX } else { 1 }) {
+                writeln!(out, "{id}")?;
+            }
+        }
+        Command::RevList { revision, .. } => {
+            writeln!(
+                out,
+                "{}",
+                repo.ancestor_count(os_bytes(&revision)?, GraphLimits::default())?
+            )?;
         }
     }
     out.flush()?;
