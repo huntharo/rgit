@@ -16,6 +16,8 @@ clap.workspace = true
 dunce.workspace = true
 
 [dev-dependencies]
+# Integration tests drive the binary with test-only failpoints enabled.
+rgit-core = { path = "../rgit-core", features = ["failpoints"] }
 tempfile.workspace = true
 
 [lints]

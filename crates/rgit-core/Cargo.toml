@@ -6,9 +6,16 @@ rust-version.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Test-only fault injection (see src/write/failpoint.rs). Never enable in releases.
+failpoints = []
+
 [dependencies]
 gix.workspace = true
 similar.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
