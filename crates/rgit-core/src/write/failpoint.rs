@@ -50,3 +50,31 @@ pub(crate) fn hit(name: &'static str) -> Result<(), Error> {
         _ => std::process::abort(),
     }
 }
+
+/// Runs only as `cargo test --release -p rgit-core --features failpoints`:
+/// proves an optimized build ignores the environment even with the feature on.
+#[cfg(all(test, feature = "failpoints", not(debug_assertions)))]
+mod release_tests {
+    #![allow(clippy::expect_used)]
+
+    #[test]
+    fn release_build_ignores_failpoint_environment() {
+        // Re-run this test in a child with the variable set: an active
+        // failpoint would abort the child, so success proves it is inert.
+        let exe = std::env::current_exe().expect("test executable");
+        if std::env::var_os("RGIT_FAILPOINT_CHILD").is_some() {
+            assert!(super::hit("lock.acquired").is_ok());
+            return;
+        }
+        let status = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "write::failpoint::release_tests::release_build_ignores_failpoint_environment",
+            ])
+            .env("RGIT_FAILPOINT_CHILD", "1")
+            .env("RGIT_FAILPOINT", "lock.acquired")
+            .status()
+            .expect("spawn child");
+        assert!(status.success(), "failpoint fired in a release build");
+    }
+}
