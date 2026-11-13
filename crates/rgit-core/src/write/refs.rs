@@ -66,16 +66,14 @@ impl Repository {
         } else {
             self.require_present(update.new)?;
         }
+        // The object may have been written by someone who did not sync it.
+        self.sync_loose_object(update.new)?;
         if let Some(log) = &update.log {
             super::commit::validate_signature(&log.committer)?;
         }
         // Pre-checks so no directory is created for a conflicting name; the
         // authoritative checks are repeated under the lock.
-        self.check_directory_conflicts(&location)?;
-        let logs = match &update.log {
-            Some(_) => self.reflog_targets(&location)?,
-            None => Vec::new(),
-        };
+        let logs = self.preflight_location(&location, update.log.is_some())?;
         create_ref_dirs(&location.base, &location.path)?;
         let mut lock = LockFile::acquire(&location.path)?;
         let current = match read_loose(&location.path, self.inner.object_hash())? {
@@ -122,26 +120,99 @@ impl Repository {
         if let Some(name) = locked_failpoint {
             super::failpoint(name)?;
         }
-        lock.write_all(format!("{}\n", update.new.to_hex()).as_bytes())?;
+        let content = format!("{}\n", update.new.to_hex());
+        lock.write_all(content.as_bytes())?;
+        let lock_identity = LockIdentity::capture(&location.path)?;
         // An error after the rename inside `commit` (directory sync) means the
-        // value may be visible; it is returned as is, never as a conflict.
-        lock.commit()?;
+        // new value is visible but its durability is unknown: the reflogs are
+        // still appended and `RefPublishedUnsyncedError` says so.
+        let unsynced = match lock.commit() {
+            Ok(()) => None,
+            Err(error) if lock_identity.renamed(&location.path, content.as_bytes()) => Some(error),
+            Err(error) => return Err(error),
+        };
 
-        // Only reached once the rename succeeded: reflog failures from here
-        // on are reported as `ReflogAppendError`, stating the ref was updated.
+        // Only reached once the rename succeeded.
+        let mut reflog_failure = None;
         if let Some(log) = &update.log {
             let old = current.unwrap_or_else(|| ObjectId::null(self.inner.object_hash()));
             let line = reflog_line(old, update.new, log);
             for (base, path) in logs {
-                append_reflog(&base, &path, &line).map_err(|source| {
-                    Error::Other(Box::new(ReflogAppendError {
-                        reference: update.name.clone(),
-                        source,
-                    }))
-                })?;
+                if let Err(source) = append_reflog(&base, &path, &line) {
+                    reflog_failure = Some(source);
+                    break;
+                }
             }
         }
-        Ok(())
+        match (unsynced, reflog_failure) {
+            (Some(source), reflog) => Err(Error::Other(Box::new(RefPublishedUnsyncedError {
+                reference: update.name.clone(),
+                source,
+                reflog,
+            }))),
+            (None, Some(source)) => Err(Error::Other(Box::new(ReflogAppendError {
+                reference: update.name.clone(),
+                source,
+            }))),
+            (None, None) => Ok(()),
+        }
+    }
+
+    /// Refusals for publishing `name` that need no object and no lock: name
+    /// validity, D/F conflicts, symlinked/special/symbolic loose refs and
+    /// unusable reflog paths. Commit runs this before writing any object.
+    pub(super) fn preflight_ref(&self, name: &[u8], log: bool) -> Result<(), Error> {
+        let location = self.ref_location(name)?;
+        self.preflight_location(&location, log).map(|_| ())
+    }
+
+    fn preflight_location(
+        &self,
+        location: &RefLocation,
+        log: bool,
+    ) -> Result<Vec<(PathBuf, PathBuf)>, Error> {
+        self.check_directory_conflicts(location)?;
+        match read_loose(&location.path, self.inner.object_hash())? {
+            Some(Loose::Symbolic(_)) if location.name == b"HEAD" => {
+                return Err(Error::UnsupportedCapability(
+                    "updating a symbolic HEAD; update the branch it names",
+                ));
+            }
+            Some(Loose::Symbolic(_)) => {
+                return Err(Error::UnsupportedCapability(
+                    "updating a symbolic reference",
+                ));
+            }
+            _ => {}
+        }
+        if log {
+            self.reflog_targets(location)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Sync the loose copy of `id`, if any, and its directory. Packed objects
+    /// are durable already; a symlink or special file is refused.
+    pub(super) fn sync_loose_object(&self, id: ObjectId) -> Result<(), Error> {
+        let hex = id.to_hex().to_string();
+        let path = self
+            .inner
+            .common_dir()
+            .join("objects")
+            .join(&hex[..2])
+            .join(&hex[2..]);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {
+                File::open(&path)?.sync_all()?;
+                sync_parent(&path)
+            }
+            Ok(_) => Err(Error::UnsupportedCapability(
+                "symlink or special loose object file",
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub(super) fn ref_location(&self, name: &[u8]) -> Result<RefLocation, Error> {
@@ -530,6 +601,96 @@ fn append_reflog(base: &Path, path: &Path, line: &[u8]) -> std::io::Result<()> {
         sync_parent(path).map_err(std::io::Error::other)?;
     }
     Ok(())
+}
+
+/// Identity of a held `<ref>.lock`, used after a failed `LockFile::commit`
+/// to tell whether the rename (publication) already happened.
+struct LockIdentity {
+    #[cfg(unix)]
+    identity: (u64, u64),
+}
+
+impl LockIdentity {
+    fn lock_path(target: &Path) -> PathBuf {
+        let mut name = target.file_name().unwrap_or_default().to_os_string();
+        name.push(".lock");
+        target.with_file_name(name)
+    }
+
+    #[cfg(unix)]
+    fn capture(target: &Path) -> Result<Self, Error> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(Self::lock_path(target))?;
+        Ok(Self {
+            identity: (metadata.dev(), metadata.ino()),
+        })
+    }
+
+    /// The target is now our lock file (Unix: same inode).
+    #[cfg(unix)]
+    fn renamed(&self, target: &Path, _content: &[u8]) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(target)
+            .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == self.identity)
+    }
+
+    #[cfg(not(unix))]
+    fn capture(_target: &Path) -> Result<Self, Error> {
+        Ok(Self {})
+    }
+
+    /// Without inode numbers: the lock is gone and the target holds our bytes.
+    #[cfg(not(unix))]
+    fn renamed(&self, target: &Path, content: &[u8]) -> bool {
+        !Self::lock_path(target).exists()
+            && std::fs::read(target).is_ok_and(|bytes| bytes == content)
+    }
+}
+
+/// The reference WAS updated (renamed into place), but syncing its directory
+/// failed, so its durability across a crash is unknown. Reflogs were still
+/// appended unless `reflog_failed()`. Returned inside [`Error::Other`].
+#[derive(Debug)]
+pub struct RefPublishedUnsyncedError {
+    reference: Vec<u8>,
+    source: Error,
+    reflog: Option<std::io::Error>,
+}
+
+impl RefPublishedUnsyncedError {
+    /// The reference that now holds the new value.
+    // Reachable once write/mod.rs re-exports this type (integration owner).
+    #[allow(dead_code)]
+    pub fn reference(&self) -> &[u8] {
+        &self.reference
+    }
+
+    /// Whether appending a reflog also failed.
+    #[allow(dead_code)]
+    pub fn reflog_failed(&self) -> bool {
+        self.reflog.is_some()
+    }
+}
+
+impl std::fmt::Display for RefPublishedUnsyncedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "reference {:?} was updated, but syncing it failed ({}); its durability is unknown",
+            BStr::new(&self.reference),
+            self.source
+        )?;
+        if let Some(error) = &self.reflog {
+            write!(f, " (appending its reflog also failed: {error})")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RefPublishedUnsyncedError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 /// The reference was published, but its reflog could not be appended.

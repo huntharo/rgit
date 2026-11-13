@@ -996,6 +996,136 @@ fn reflog_failure_after_publication_reports_the_update() -> Result {
     Ok(())
 }
 
+/// Loose object files in `.git/objects/xx/` (excluding info/ and pack/).
+fn loose_objects(dir: &Path) -> Result<Vec<String>> {
+    let mut found = Vec::new();
+    for fanout in std::fs::read_dir(dir.join(".git/objects"))? {
+        let fanout = fanout?;
+        let name = fanout.file_name().to_string_lossy().into_owned();
+        if name.len() != 2 {
+            continue;
+        }
+        for object in std::fs::read_dir(fanout.path())? {
+            found.push(format!("{name}{}", object?.file_name().to_string_lossy()));
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// Every commit refusal is decided before the first object write: trees are
+/// computed in memory and the target reference is preflighted.
+#[cfg(unix)]
+#[test]
+fn commit_refusals_write_no_objects() -> Result {
+    for format in FORMATS {
+        // Unborn branch, empty index: the empty tree is not even stored.
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path();
+        init(dir, format)?;
+        assert!(matches!(
+            Repository::discover(dir)?.commit(&request(b"empty\n")),
+            Err(Error::NothingToCommit)
+        ));
+        assert_eq!(loose_objects(dir)?, Vec::<String>::new());
+
+        type Setup = fn(&Path) -> Result;
+        let cases: [(&str, Setup); 4] = [
+            ("D/F conflict on the unborn target branch", |dir| {
+                git(dir, &["symbolic-ref", "HEAD", "refs/heads/main/topic"])?;
+                Ok(())
+            }),
+            ("symlinked branch ref", |dir| {
+                let refs = dir.join(".git/refs/heads");
+                std::fs::rename(refs.join("main"), dir.join(".git/main-moved"))?;
+                std::os::unix::fs::symlink("../../main-moved", refs.join("main"))?;
+                Ok(())
+            }),
+            ("symbolic branch ref", |dir| {
+                git(dir, &["branch", "other"])?;
+                std::fs::write(dir.join(".git/refs/heads/main"), b"ref: refs/heads/other\n")?;
+                Ok(())
+            }),
+            ("reflog path is a directory", |dir| {
+                let log = dir.join(".git/logs/refs/heads/main");
+                std::fs::remove_file(&log)?;
+                std::fs::create_dir_all(log.join("x"))?;
+                Ok(())
+            }),
+        ];
+        for (what, setup) in cases {
+            let temp = tempfile::tempdir()?;
+            let dir = temp.path();
+            repo_with_commit(dir, format)?;
+            write_file(dir, "nested/new", "never stored\n")?;
+            git(dir, &["add", "nested/new"])?;
+            setup(dir)?;
+            let before = loose_objects(dir)?;
+            let result = Repository::discover(dir)?.commit(&request(b"refused\n"));
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::AlreadyExists(_) | Error::UnsupportedCapability(_))
+                ),
+                "{format} {what}: {result:?}"
+            );
+            assert_eq!(loose_objects(dir)?, before, "{format} {what}");
+        }
+    }
+    Ok(())
+}
+
+/// A symlink at a loose object path is never trusted as the stored object,
+/// whether rgit would write it (a tree) or only name it (update_ref).
+#[cfg(unix)]
+#[test]
+fn symlinked_loose_objects_are_refused() -> Result {
+    for format in FORMATS {
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path();
+        let head = repo_with_commit(dir, format)?;
+        write_file(dir, "a", "two\n")?;
+        git(dir, &["add", "a"])?;
+        // C Git stores the tree rgit will compute; replace it with a symlink
+        // to a valid copy, which the object store would happily follow.
+        let tree = text(&git(dir, &["write-tree"])?);
+        let path = dir.join(".git/objects").join(&tree[..2]).join(&tree[2..]);
+        let copy = dir.join(".git/tree-copy");
+        std::fs::rename(&path, &copy)?;
+        std::os::unix::fs::symlink(&copy, &path)?;
+        let repo = Repository::discover(dir)?;
+        assert!(matches!(
+            repo.commit(&request(b"through symlink\n")),
+            Err(Error::UnsupportedCapability(_))
+        ));
+        assert_eq!(rev(dir, "HEAD")?, head);
+        std::fs::remove_file(&path)?;
+        std::fs::rename(&copy, &path)?;
+
+        let commit = text(&git(dir, &["commit-tree", &tree, "-p", &head, "-m", "x"])?);
+        let path = dir
+            .join(".git/objects")
+            .join(&commit[..2])
+            .join(&commit[2..]);
+        std::fs::rename(&path, &copy)?;
+        std::os::unix::fs::symlink(&copy, &path)?;
+        assert!(matches!(
+            repo.update_ref(&RefUpdate {
+                name: b"refs/heads/linked".to_vec(),
+                new: oid(&commit)?,
+                expected: RefExpectation::MustNotExist,
+                log: None,
+            }),
+            Err(Error::UnsupportedCapability(_))
+        ));
+        assert!(!dir.join(".git/refs/heads/linked").exists());
+        std::fs::remove_file(&path)?;
+        std::fs::rename(&copy, &path)?;
+        fsck(dir)?;
+    }
+    Ok(())
+}
+
 /// Crash and race boundaries. The test binary re-executes itself as a child
 /// running `failpoint_child`, with `RGIT_FAILPOINT` set only for the child.
 #[cfg(all(feature = "failpoints", debug_assertions))]
@@ -1017,7 +1147,7 @@ mod failpoints {
         let outcome = Repository::discover(&repo)?.commit(&request(b"child commit\n"));
         let line = match outcome {
             Ok(outcome) => format!("ok {}", outcome.id),
-            Err(error) => format!("err {error:?}"),
+            Err(error) => format!("err {error:?} | {error}"),
         };
         std::fs::write(result, line)?;
         Ok(())
@@ -1107,6 +1237,41 @@ mod failpoints {
                     fsck(&dir)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// A failure after the rename (directory sync) reports that the branch
+    /// WAS updated, still appends both reflogs, and leaves no lock behind.
+    #[test]
+    fn failure_after_rename_reports_the_update() -> Result {
+        for format in FORMATS {
+            let temp = tempfile::tempdir()?;
+            let (dir, head) = staged_repo(temp.path(), format)?;
+            let status = child(&dir, "lock.after-rename:error", None)?.status()?;
+            assert!(status.success(), "{status:?}");
+            let result = child_result(&dir)?;
+            assert!(
+                result.starts_with("err Other(RefPublishedUnsyncedError"),
+                "{result}"
+            );
+            assert!(
+                result.contains("Injected(\"lock.after-rename\")"),
+                "{result}"
+            );
+            assert!(result.contains("was updated"), "{result}");
+            let now = rev(&dir, "refs/heads/main")?;
+            assert_ne!(now, head);
+            assert_eq!(rev(&dir, &format!("{now}^"))?, head);
+            let entry = format!("{now} commit: child commit");
+            assert_eq!(
+                reflog_subjects(&dir, "refs/heads/main")?.first(),
+                Some(&entry)
+            );
+            assert_eq!(reflog_subjects(&dir, "HEAD")?.first(), Some(&entry));
+            assert!(!dir.join(".git/refs/heads/main.lock").exists());
+            assert!(!dir.join(".git/HEAD.lock").exists());
+            fsck(&dir)?;
         }
         Ok(())
     }
