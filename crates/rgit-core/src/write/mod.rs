@@ -27,7 +27,7 @@ mod refs;
 pub use commit::{CommitOutcome, CommitRequest, Signature};
 pub use index::AddOutcome;
 pub use init::{InitOptions, ObjectFormat, init};
-pub use refs::{RefExpectation, RefLog, RefUpdate};
+pub use refs::{RefExpectation, RefLog, RefUpdate, ReflogAppendError};
 
 #[allow(unused_imports)]
 pub(crate) use failpoint::hit as failpoint;

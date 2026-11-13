@@ -543,8 +543,6 @@ pub struct ReflogAppendError {
 
 impl ReflogAppendError {
     /// The reference that now holds the new value.
-    // Reachable once write/mod.rs re-exports this type (integration owner).
-    #[allow(dead_code)]
     pub fn reference(&self) -> &[u8] {
         &self.reference
     }
