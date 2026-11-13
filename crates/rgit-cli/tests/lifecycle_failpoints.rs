@@ -142,8 +142,16 @@ fn published_paths(s: &Scenario, include_logs: bool) -> Result<Vec<PathBuf>> {
         git_dir.join("packed-refs"),
     ];
     if include_logs {
-        paths.push(git_dir.join("logs/HEAD"));
-        paths.push(git_dir.join("logs/refs/heads/main"));
+        // A first append creates the log directories as well.
+        for path in [
+            "logs",
+            "logs/refs",
+            "logs/refs/heads",
+            "logs/HEAD",
+            "logs/refs/heads/main",
+        ] {
+            paths.push(git_dir.join(path));
+        }
     }
     paths
         .into_iter()
@@ -263,15 +271,67 @@ fn commit_case(hash: Hash, shape: Shape, point: &str, mode: Mode) -> Result {
             format!("HEAD is {head_state:?} after {point}, expected {expected:?} ({oid})").into(),
         );
     }
-    // No reflog (branch or HEAD) has a new entry: every crash point precedes
-    // the reflog append. HEAD's own bytes are unchanged unless HEAD itself is
-    // the published ref (detached).
+    // Reflogs. Every abort, and every handled error before the rename,
+    // precedes the append: no log gains an entry. A handled error AFTER the
+    // rename (lock.after-rename:error, a directory-sync failure) appends the
+    // reflogs before reporting that durability is unknown: exactly one new
+    // line, chaining old -> new with the model's committer and C Git's
+    // message, in the branch log and HEAD's log (HEAD's only when detached).
     let observed = snapshot(s.dir())?;
     let git_rel = s.root().join(".git").strip_prefix(s.dir())?.to_path_buf();
+    let appended = point == "lock.after-rename" && mode == Mode::Error;
+    if appended {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("was updated") || !stderr.contains("durability is unknown") {
+            return Err(format!(
+                "published-unsynced diagnostic missing: {}",
+                describe(&output)
+            )
+            .into());
+        }
+    }
+    let old_oid = old
+        .head_commit(0)
+        .unwrap_or_else(|| "0".repeat(hash.digest(b"").len() * 2));
+    let action = if shape == Shape::Unborn {
+        "commit (initial)"
+    } else {
+        "commit"
+    };
+    let line = format!(
+        "{old_oid} {oid} {} <{}> {when} +0000\t{action}: interrupted\n",
+        lifecycle_support::proc::NAME,
+        lifecycle_support::proc::EMAIL
+    );
     for log in ["logs/HEAD", "logs/refs/heads/main"] {
         let rel = git_rel.join(log);
-        if observed.get(&rel) != before.get(&rel) {
-            return Err(format!("{log} changed although the crash precedes reflog append").into());
+        let logged = appended && (shape != Shape::Detached || log == "logs/HEAD");
+        let expected = if logged {
+            let mut bytes = match before.get(&rel) {
+                Some(lifecycle_support::proc::Snap::File { bytes, .. }) => bytes.clone(),
+                None => Vec::new(),
+                Some(other) => return Err(format!("{log} was {other:?}").into()),
+            };
+            bytes.extend_from_slice(line.as_bytes());
+            Some(bytes)
+        } else {
+            match before.get(&rel) {
+                Some(lifecycle_support::proc::Snap::File { bytes, .. }) => Some(bytes.clone()),
+                _ => None,
+            }
+        };
+        let actual = match observed.get(&rel) {
+            Some(lifecycle_support::proc::Snap::File { bytes, .. }) => Some(bytes.clone()),
+            None => None,
+            Some(other) => return Err(format!("{log} became {other:?}").into()),
+        };
+        if actual != expected {
+            return Err(format!(
+                "{log} after {point} {mode:?}: expected {:?}, found {:?}",
+                expected.as_deref().map(String::from_utf8_lossy),
+                actual.as_deref().map(String::from_utf8_lossy)
+            )
+            .into());
         }
     }
     if shape != Shape::Detached

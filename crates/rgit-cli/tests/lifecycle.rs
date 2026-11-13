@@ -553,41 +553,234 @@ fn linked_worktree_isolation(driver: Driver) -> Result {
     Ok(())
 }
 
-fn nothing_to_commit_and_allow_empty(driver: Driver) -> Result {
-    if driver::lacks(driver, &["commit"], "nothing_to_commit_and_allow_empty") {
-        return Ok(());
-    }
-    let mut s = Scenario::init(driver, Hash::Sha1, "main")?;
-    s.model.write(0, b"f", b"x\n")?;
-    s.add(0, &[b"f"])?;
-    s.commit(0, &["one"])?;
+/// Refuse `commit` with nothing to commit; for rgit with ZERO new objects
+/// and every byte unchanged (NothingToCommit precedes any object write).
+fn assert_nothing_to_commit(s: &Scenario, context: &str) -> Result {
     let before = snapshot(s.dir())?;
-    let output = driver.commit(&s.root(), &["nothing"], s.model.clock + 60)?;
-    refused(
-        &output,
-        driver.nothing_to_commit_code(),
-        "nothing to commit",
-    )?;
-    if driver.index_bytes_stable_on_refusal() {
+    let output = s
+        .driver
+        .commit(&s.root(), &["nothing"], s.model.clock + 1)?;
+    refused(&output, s.driver.nothing_to_commit_code(), context)?;
+    if s.driver.index_bytes_stable_on_refusal() {
         assert_preserved(
             s.dir(),
             &before,
             &snapshot(s.dir())?,
             Preserve::Exact,
-            "nothing to commit",
+            context,
         )?;
     }
-    s.check()?;
-    let when = s.model.tick();
-    let output = lifecycle_support::proc::run(&mut driver.commit_cmd(
-        &s.root(),
-        &["empty"],
-        when,
-        &["--allow-empty"],
-    ))?;
-    ok(&output, "commit --allow-empty")?;
-    s.model.commit(0, &["empty"], when);
-    s.check()?;
+    s.check()
+}
+
+fn nothing_to_commit_and_allow_empty(driver: Driver) -> Result {
+    if driver::lacks(driver, &["commit"], "nothing_to_commit_and_allow_empty") {
+        return Ok(());
+    }
+    for hash in Hash::ALL {
+        // Unborn, no index file at all; then --allow-empty records the empty
+        // tree as a root commit.
+        let mut s = Scenario::init(driver, hash, "main")?;
+        assert_nothing_to_commit(&s, "unborn without an index")?;
+        let when = s.model.tick();
+        ok(
+            &lifecycle_support::proc::run(&mut driver.commit_cmd(
+                &s.root(),
+                &["empty root"],
+                when,
+                &["--allow-empty"],
+            ))?,
+            "unborn commit --allow-empty",
+        )?;
+        s.model.commit(0, &["empty root"], when);
+        s.check()?;
+
+        // Unborn with an index that exists but has no entries.
+        let mut s = Scenario::init(driver, hash, "main")?;
+        s.model.write(0, b"gone", b"staged then removed\n")?;
+        s.add(0, &[b"gone"])?;
+        s.model.remove(0, b"gone")?;
+        s.add(0, &[b"gone"])?;
+        if !s.root().join(".git/index").is_file() || !s.model.checkouts[0].index.is_empty() {
+            return Err("fixture: expected an existing, empty index".into());
+        }
+        assert_nothing_to_commit(&s, "unborn with an empty index")?;
+
+        // Born branch: tree unchanged, including with unstaged edits.
+        let mut s = Scenario::init(driver, hash, "main")?;
+        s.model.write(0, b"f", b"x\n")?;
+        s.add(0, &[b"f"])?;
+        s.commit(0, &["one"])?;
+        assert_nothing_to_commit(&s, "born branch, tree unchanged")?;
+        s.model.write(0, b"f", b"unstaged edit\n")?;
+        assert_nothing_to_commit(&s, "born branch, only unstaged edits")?;
+        let when = s.model.tick();
+        ok(
+            &lifecycle_support::proc::run(&mut driver.commit_cmd(
+                &s.root(),
+                &["empty"],
+                when,
+                &["--allow-empty"],
+            ))?,
+            "commit --allow-empty",
+        )?;
+        s.model.commit(0, &["empty"], when);
+        s.check()?;
+    }
+    Ok(())
+}
+
+/// Odd messages and identities: the recorded commit must equal C Git's
+/// byte for byte, as predicted by the model's own cleanup/trimming rules.
+fn odd_messages_and_identities_match_c_git(driver: Driver) -> Result {
+    if driver::lacks(driver, &["commit"], "odd_messages_and_identities") {
+        return Ok(());
+    }
+    // Model self-checks of the two rules.
+    assert_eq!(
+        lifecycle_support::model::cleaned_message(&["\n\n  subject  \t", "a\r\n\n\n\nb   \n\n"]),
+        "  subject\n\na\n\nb\n"
+    );
+    assert_eq!(
+        lifecycle_support::model::without_crud("  .,Jane <Q.> Doe;:  "),
+        ".,Jane Q. Doe"
+    );
+    assert_eq!(
+        lifecycle_support::model::without_crud("  <jane@example.invalid>.  "),
+        "jane@example.invalid."
+    );
+    let cases: [(&[&str], &str, &str); 3] = [
+        (
+            &[
+                "\n\n  Subject with trailing space   \t",
+                "body\r\n\n\n\nwith   \nblank runs\n\n\n",
+            ],
+            "  .,Jane <Q.> Doe;:  ",
+            "  <jane@example.invalid>.  ",
+        ),
+        (
+            &["# not a comment for -m", "   ", "tail\t"],
+            "\"Quoted\" Name",
+            "'odd@example.invalid'",
+        ),
+        (&["single"], "Plain Name", "plain@example.invalid"),
+    ];
+    for hash in Hash::ALL {
+        let mut s = Scenario::init(driver, hash, "main")?;
+        for (round, (parts, name, email)) in cases.iter().enumerate() {
+            s.model
+                .write(0, b"f", format!("round {round}\n").as_bytes())?;
+            s.add(0, &[b"f"])?;
+            let when = s.model.tick();
+            let mut command = driver.commit_cmd(&s.root(), parts, when, &[]);
+            command
+                .env("GIT_AUTHOR_NAME", name)
+                .env("GIT_COMMITTER_NAME", name)
+                .env("GIT_AUTHOR_EMAIL", email)
+                .env("GIT_COMMITTER_EMAIL", email);
+            ok(&lifecycle_support::proc::run(&mut command)?, "odd commit")?;
+            let index = s.model.checkouts[0].index.clone();
+            let parents: Vec<String> = s.model.head_commit(0).into_iter().collect();
+            let body = lifecycle_support::model::commit_body_as(
+                &tree_id(hash, &index),
+                &parents,
+                &lifecycle_support::model::without_crud(name),
+                &lifecycle_support::model::without_crud(email),
+                when,
+                &lifecycle_support::model::cleaned_message(parts),
+            );
+            let oid = hash.object_hex("commit", &body);
+            s.model.record_commit(
+                &oid,
+                lifecycle_support::model::CommitInfo { body, tree: index },
+            );
+            s.model.advance(0, &oid);
+            s.check()
+                .map_err(|e| format!("{} {} round {round}: {e}", driver.name(), hash.name()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Refusals about the commit's target ref happen before any object write:
+/// a symlinked or symbolic branch ref, a directory where the branch ref
+/// belongs (D/F) and a non-regular reflog path each exit 128 with every
+/// byte unchanged and zero new objects.
+fn target_ref_refusals_write_nothing(driver: Driver) -> Result {
+    if driver::lacks(driver, &["commit"], "target_ref_refusals_write_nothing") {
+        return Ok(());
+    }
+    for hash in Hash::ALL {
+        for case in [
+            "symlinked ref",
+            "symbolic ref",
+            "D/F ref",
+            "reflog dir",
+            "reflog fifo",
+        ] {
+            let unborn = case == "D/F ref";
+            let mut s = Scenario::init(driver, hash, "main")?;
+            if !unborn {
+                s.model.write(0, b"f", b"base\n")?;
+                s.add(0, &[b"f"])?;
+                s.commit(0, &["base"])?;
+            }
+            s.model.write(0, b"f", b"staged\n")?;
+            s.add(0, &[b"f"])?;
+            let git_dir = s.root().join(".git");
+            let branch = git_dir.join("refs/heads/main");
+            let log = git_dir.join("logs/refs/heads/main");
+            match case {
+                "symlinked ref" => {
+                    let value = fs::read(&branch)?;
+                    fs::write(git_dir.join("refs/heads/target"), &value)?;
+                    fs::remove_file(&branch)?;
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink("target", &branch)?;
+                    #[cfg(not(unix))]
+                    continue;
+                }
+                "symbolic ref" => {
+                    let value = fs::read(&branch)?;
+                    fs::write(git_dir.join("refs/heads/other"), &value)?;
+                    fs::write(&branch, b"ref: refs/heads/other\n")?;
+                }
+                "D/F ref" => {
+                    fs::create_dir_all(branch.join("nested"))?;
+                    fs::write(branch.join("nested/leaf"), b"not a ref\n")?;
+                }
+                "reflog dir" => {
+                    fs::remove_file(&log)?;
+                    fs::create_dir(&log)?;
+                }
+                _ => {
+                    fs::remove_file(&log)?;
+                    #[cfg(unix)]
+                    {
+                        let status = std::process::Command::new("mkfifo").arg(&log).status()?;
+                        assert!(status.success());
+                    }
+                    #[cfg(not(unix))]
+                    continue;
+                }
+            }
+            let context = format!("{} {case}", hash.name());
+            let before = snapshot(s.dir())?;
+            let when = s.model.tick();
+            let output = lifecycle_support::proc::run_within(
+                &mut driver.commit_cmd(&s.root(), &["refused"], when, &[]),
+                std::time::Duration::from_secs(10),
+            )?;
+            refused(&output, 128, &context)?;
+            assert_preserved(
+                s.dir(),
+                &before,
+                &snapshot(s.dir())?,
+                Preserve::Exact,
+                &context,
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -645,6 +838,7 @@ both_drivers!(
     detached_head_commits,
     linked_worktree_isolation,
     nothing_to_commit_and_allow_empty,
+    odd_messages_and_identities_match_c_git,
     racy_same_second_edit,
 );
 
@@ -653,3 +847,5 @@ mod unix {
     use super::*;
     both_drivers!(exec_bit, symlinks, non_utf8_paths);
 }
+
+rgit_only!(target_ref_refusals_write_nothing);
