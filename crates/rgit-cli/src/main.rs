@@ -9,7 +9,11 @@ use rgit_core::{BStr, ObjectKind, Repository};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Parser)]
-#[command(version, about = "An experimental rewrite of Git using Rust.")]
+#[command(
+    name = "rgit",
+    version,
+    about = "An experimental rewrite of Git using Rust."
+)]
 struct Cli {
     /// Run as if started in this directory (one -C is supported).
     #[arg(short = 'C', default_value = ".", global = true)]

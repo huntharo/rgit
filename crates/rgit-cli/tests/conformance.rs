@@ -84,6 +84,21 @@ fn same(root: &Path, args: &[&str]) -> Result {
 }
 
 #[test]
+fn help_and_version_work_outside_a_repository() -> Result {
+    let root = tempdir()?;
+    for option in ["--help", "--version"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_rgit"))
+            .current_dir(root.path())
+            .arg(option)
+            .output()?;
+        assert!(output.status.success());
+        assert!(!output.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("rgit-cli"));
+    }
+    Ok(())
+}
+
+#[test]
 fn loose_and_packed_objects_match_c_git_for_both_hashes() -> Result {
     for hash in ["sha1", "sha256"] {
         let root = fixture(hash)?;
