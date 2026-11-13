@@ -20,9 +20,13 @@ reset variants and linked-worktree add/remove are later G1 issues.
 
 ## Invariants
 
-1. **Objects before names.** Every object an index entry or reference names is
-   written and synced (file and containing directory on Unix) before the index
-   or reference is published. No published reference points at an unavailable
+1. **Objects before names.** Every object rgit writes is synced (file and
+   containing directory on Unix) before an index entry or reference names it.
+   Before publishing, `commit` also syncs its parent commit and every tree of
+   the new commit (including ones that already existed), and `update_ref`
+   syncs the loose object it publishes. Blobs named by the index are durable
+   only if their writer synced them (rgit `add` does); packed objects are
+   assumed durable. No published reference points at an unavailable
    object; `update_ref` verifies existence (and commit type for
    `refs/heads/*`) before locking.
 2. **Lock then rename.** Index, `HEAD`, loose refs and `packed-refs` change only
@@ -67,7 +71,7 @@ Consequences, all observable by a fresh process:
 | Before the rename (including refusal, CAS conflict, held lock) | old value | unchanged | error; state unchanged except possible unreferenced objects |
 | Crash after the rename, before the appends | new value | entry missing | process died; no false entry is ever written. For a commit on a branch, `HEAD.lock` (held across the branch rename so `HEAD` cannot be re-pointed mid-commit) remains and refuses later writers until removed |
 | Append fails after the rename | new value | entry missing (or present in one log but not the other) | `ReflogAppendError`: the reference *was* updated; CLI exits 128 with that diagnostic |
-| Directory sync fails after the rename | new value visible | not appended | I/O error; durability of the new value is unknown |
+| Directory sync fails after the rename | new value visible | appended | `RefPublishedUnsyncedError`: the reference *was* updated, its durability is unknown (and a reflog append failure is named too) |
 
 C Git appends the reflog before renaming the reference, so its failure modes
 differ: it can record an entry for an update that never became visible. rgit

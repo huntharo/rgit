@@ -659,14 +659,11 @@ pub struct RefPublishedUnsyncedError {
 
 impl RefPublishedUnsyncedError {
     /// The reference that now holds the new value.
-    // Reachable once write/mod.rs re-exports this type (integration owner).
-    #[allow(dead_code)]
     pub fn reference(&self) -> &[u8] {
         &self.reference
     }
 
     /// Whether appending a reflog also failed.
-    #[allow(dead_code)]
     pub fn reflog_failed(&self) -> bool {
         self.reflog.is_some()
     }

@@ -170,9 +170,11 @@ Differences from C Git:
   (including `HEAD`'s) is decided before the lock; `HEAD` re-pointed
   concurrently can receive or miss that line. `commit` holds `HEAD.lock` and
   is not affected.
-- Durability covers objects rgit writes. Objects another program wrote and
-  rgit only references (for example a parent commit written by C Git without
-  `core.fsync`) are checked for presence, not synced.
+- Durability covers objects rgit writes, plus a commit's parent and trees and
+  the object `update_ref` publishes, which rgit syncs before publishing. Blobs
+  another program wrote (for example C Git without `core.fsync`) are checked
+  for presence, not synced; packed objects are assumed durable. A symlink or
+  special file at a loose object path is refused.
 
 Known race windows, outside the claim that preflight is a filesystem sandbox:
 a path swapped for a FIFO or symlink between `add`'s `lstat` and `open` can
