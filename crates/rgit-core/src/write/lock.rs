@@ -31,11 +31,19 @@ impl LockFile {
             .to_os_string();
         lock_name.push(".lock");
         let lock_path = target.with_file_name(lock_name);
-        let file = match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        // Windows: deny delete/rename sharing while held so no other process
+        // can remove or replace the lock under us (std shares DELETE by
+        // default).
+        #[cfg(windows)]
         {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ: u32 = 0x1;
+            const FILE_SHARE_WRITE: u32 = 0x2;
+            options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+        }
+        let file = match options.open(&lock_path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(Error::Locked(lock_path));
@@ -67,18 +75,26 @@ impl LockFile {
     /// content is already visible but its durability is unknown; callers must
     /// not report that as "unchanged".
     pub(crate) fn commit(mut self) -> Result<(), Error> {
-        let mut file = self.file.take().ok_or(Error::Injected("lock reused"))?;
+        let file = self.file.as_mut().ok_or(Error::Injected("lock reused"))?;
         file.flush()?;
         file.sync_all()?;
-        drop(file);
         super::failpoint("lock.before-rename")?;
+        // Check identity while our descriptor is still open, so the inode
+        // cannot have been freed and reused by a replacement lock.
         if !self.still_ours() {
             // Someone removed or replaced our lock; never publish their file.
             self.released = true;
+            drop(self.file.take());
             return Err(Error::Locked(self.lock_path.clone()));
         }
+        // Windows cannot rename a file this process holds open without delete
+        // sharing; close immediately before the rename. Unix keeps the
+        // descriptor open across the rename.
+        #[cfg(windows)]
+        drop(self.file.take());
         std::fs::rename(&self.lock_path, &self.target)?;
         self.released = true;
+        drop(self.file.take());
         super::failpoint("lock.after-rename")?;
         sync_parent(&self.target)
     }
@@ -131,9 +147,11 @@ impl Identity {
         })
     }
 
-    // Windows: the open handle (no FILE_SHARE_DELETE) prevents another process
-    // from deleting or replacing the lock while held; std exposes no stable
-    // file index, so presence of a regular file is the check.
+    // Windows: `acquire` opens the lock without FILE_SHARE_DELETE, so no other
+    // process can delete or replace it while the handle is open; std exposes
+    // no stable file index, so presence of a regular file is the check. The
+    // handle is closed immediately before the rename (Windows requires it),
+    // leaving a short window that this check cannot cover.
     #[cfg(not(unix))]
     fn of_file(_file: &File) -> Result<Self, Error> {
         Ok(Self {})

@@ -220,7 +220,33 @@ fn run(cli: Cli, out: &mut impl Write) -> Result<u8> {
                 .iter()
                 .map(|path| repo_relative(&prefix, os_bytes(path)?))
                 .collect::<Result<Vec<_>>>()?;
-            let paths: Vec<&BStr> = paths.iter().map(BStr::new).collect();
+            let root = repo
+                .work_dir()
+                .ok_or("this operation must be run in a work tree")?;
+            let mut literal = Vec::with_capacity(paths.len());
+            for path in &paths {
+                match path.strip_suffix(b"/") {
+                    Some(directory) => {
+                        // `path/` must be a directory, as in C Git.
+                        let on_disk = root.join(
+                            std::str::from_utf8(directory)
+                                .ok()
+                                .map(PathBuf::from)
+                                .map_or_else(|| native_path(directory), Ok)?,
+                        );
+                        if !std::fs::symlink_metadata(&on_disk).is_ok_and(|m| m.is_dir()) {
+                            return Err(format!(
+                                "pathspec '{}' did not match any files",
+                                BStr::new(path)
+                            )
+                            .into());
+                        }
+                        literal.push(BStr::new(directory));
+                    }
+                    None => literal.push(BStr::new(path)),
+                }
+            }
+            let paths = literal;
             repo.add(&paths)?;
         }
         Command::Commit {
@@ -229,22 +255,27 @@ fn run(cli: Cli, out: &mut impl Write) -> Result<u8> {
             quiet,
         } => {
             // Resolve every input before the library writes anything.
-            let author = identity(&repo, "AUTHOR")?;
-            let committer = identity(&repo, "COMMITTER")?;
-            let mut message = Vec::new();
-            for (index, part) in messages.iter().enumerate() {
-                if index > 0 {
-                    message.extend_from_slice(b"\n");
+            // One clock reading so a defaulted author and committer agree.
+            let now: i64 = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs()
+                .try_into()?;
+            let author = identity(&repo, "AUTHOR", now)?;
+            let committer = identity(&repo, "COMMITTER", now)?;
+            // Like C Git's `-m`: paragraphs joined by a blank line, then the
+            // default `whitespace` cleanup (stripspace without comments).
+            let mut raw = Vec::new();
+            for part in &messages {
+                if !raw.is_empty() {
+                    raw.push(b'\n');
                 }
-                let part = os_bytes(part)?.to_vec();
-                let end = part
-                    .iter()
-                    .rposition(|byte| !byte.is_ascii_whitespace())
-                    .map_or(0, |end| end + 1);
-                message.extend_from_slice(&part[..end]);
-                message.push(b'\n');
+                raw.extend_from_slice(os_bytes(part)?);
+                if raw.last() != Some(&b'\n') {
+                    raw.push(b'\n');
+                }
             }
-            if message.iter().all(u8::is_ascii_whitespace) {
+            let message = stripspace(&raw);
+            if message.is_empty() {
                 return Err("aborting commit due to empty commit message".into());
             }
             let outcome = repo.commit(&CommitRequest {
@@ -460,6 +491,16 @@ fn repo_relative(prefix: &[u8], path: &BStr) -> Result<Vec<u8>> {
     if path.starts_with(b"/") || path.starts_with(b":") {
         return Err(format!("unsupported pathspec: {path:?}").into());
     }
+    if path.ends_with(b"/") && path.iter().any(|&byte| byte != b'/' && byte != b'.') {
+        // A trailing slash names a directory; the caller verifies it is one.
+        let end = path
+            .iter()
+            .rposition(|&byte| byte != b'/')
+            .map_or(0, |end| end + 1);
+        let mut joined = repo_relative(prefix, BStr::new(&path[..end]))?;
+        joined.push(b'/');
+        return Ok(joined);
+    }
     let mut parts: Vec<&[u8]> = prefix
         .split(|&byte| byte == b'/')
         .filter(|part| !part.is_empty())
@@ -485,7 +526,7 @@ fn repo_relative(prefix: &[u8], path: &BStr) -> Result<Vec<u8>> {
 
 /// Identity from `GIT_<ROLE>_{NAME,EMAIL,DATE}`, else repository-local
 /// `user.name`/`user.email`; the timestamp defaults to now in UTC.
-fn identity(repo: &Repository, role: &str) -> Result<Signature> {
+fn identity(repo: &Repository, role: &str, now: i64) -> Result<Signature> {
     let lookup = |field: &str, key: &str| -> Result<Option<Vec<u8>>> {
         match std::env::var_os(format!("GIT_{role}_{field}")) {
             Some(value) => Ok(Some(os_bytes(&value)?.to_vec())),
@@ -494,25 +535,22 @@ fn identity(repo: &Repository, role: &str) -> Result<Signature> {
     };
     let name = lookup("NAME", "user.name")?;
     let email = lookup("EMAIL", "user.email")?;
-    let (Some(name), Some(email)) = (name, email) else {
+    let (Some(name), Some(email)) = (
+        name.map(|v| without_crud(&v)),
+        email.map(|v| without_crud(&v)),
+    ) else {
         return Err(format!(
             "{} identity unknown: set user.name and user.email in the repository config",
             role.to_ascii_lowercase()
         )
         .into());
     };
-    if name.iter().all(u8::is_ascii_whitespace) {
+    if name.is_empty() {
         return Err("empty ident name not allowed".into());
     }
     let (seconds, offset_minutes) = match std::env::var(format!("GIT_{role}_DATE")) {
         Ok(date) => parse_date(&date).ok_or_else(|| format!("invalid date format: {date}"))?,
-        Err(std::env::VarError::NotPresent) => (
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs()
-                .try_into()?,
-            0,
-        ),
+        Err(std::env::VarError::NotPresent) => (now, 0),
         Err(error) => return Err(error.into()),
     };
     Ok(Signature {
@@ -521,6 +559,49 @@ fn identity(repo: &Repository, role: &str) -> Result<Signature> {
         seconds,
         offset_minutes,
     })
+}
+
+/// C Git's `strbuf_addstr_without_crud`: drop leading and trailing bytes
+/// that are control/space or `,:;<>"'\\` (current C Git keeps `.`), and
+/// remove `<`, `>` and newlines
+/// inside, so an identity cannot break the header line.
+fn without_crud(value: &[u8]) -> Vec<u8> {
+    let crud = |byte: &u8| *byte <= 32 || b",:;<>\"\\'".contains(byte);
+    let start = value.iter().position(|b| !crud(b)).unwrap_or(value.len());
+    let end = value
+        .iter()
+        .rposition(|b| !crud(b))
+        .map_or(start, |end| end + 1);
+    value[start..end]
+        .iter()
+        .copied()
+        .filter(|byte| !matches!(byte, b'<' | b'>' | b'\n'))
+        .collect()
+}
+
+/// C Git's `strbuf_stripspace` without comment removal: strip trailing
+/// whitespace from each line, drop leading and trailing blank lines, collapse
+/// runs of blank lines, and end every line with a newline.
+fn stripspace(text: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut pending_blank = false;
+    for line in text.split(|&byte| byte == b'\n') {
+        let end = line
+            .iter()
+            .rposition(|byte| !byte.is_ascii_whitespace())
+            .map_or(0, |end| end + 1);
+        if end == 0 {
+            pending_blank = !out.is_empty();
+            continue;
+        }
+        if pending_blank {
+            out.push(b'\n');
+            pending_blank = false;
+        }
+        out.extend_from_slice(&line[..end]);
+        out.push(b'\n');
+    }
+    out
 }
 
 /// Accept Git's internal `[@]<seconds> <±hhmm>` and ISO 8601
@@ -546,7 +627,10 @@ fn parse_date(date: &str) -> Option<(i64, i32)> {
         );
         (minutes < 60).then_some(sign * (hours * 60 + minutes))
     };
-    if let Some((seconds, zone)) = date.trim_start_matches('@').split_once(' ')
+    let internal = date.strip_prefix('@').unwrap_or(date);
+    if let Some((seconds, zone)) = internal.split_once(' ')
+        && !seconds.is_empty()
+        && seconds.bytes().all(|byte| byte.is_ascii_digit())
         && let Ok(seconds) = seconds.parse::<i64>()
     {
         return Some((seconds, offset(zone)?));
@@ -555,7 +639,13 @@ fn parse_date(date: &str) -> Option<(i64, i32)> {
     if bytes.len() < 20 || !matches!(bytes[10], b'T' | b' ') {
         return None;
     }
-    let number = |range: std::ops::Range<usize>| date.get(range)?.parse::<i64>().ok();
+    let number = |range: std::ops::Range<usize>| {
+        let field = date.get(range)?;
+        if !field.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        field.parse::<i64>().ok()
+    };
     let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
     let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
     let separators = [bytes[4], bytes[7], bytes[13], bytes[16]];
@@ -634,6 +724,19 @@ fn write_entry_path(out: &mut impl Write, path: &[u8], nul: bool, quote_space: b
 }
 
 #[cfg(unix)]
+fn native_path(bytes: &[u8]) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+}
+
+#[cfg(not(unix))]
+fn native_path(bytes: &[u8]) -> Result<PathBuf> {
+    Ok(PathBuf::from(
+        std::str::from_utf8(bytes).map_err(|_| "path is not valid UTF-8")?,
+    ))
+}
+
+#[cfg(unix)]
 fn os_bytes(value: &std::ffi::OsStr) -> Result<&BStr> {
     use std::os::unix::ffi::OsStrExt;
     Ok(BStr::new(value.as_bytes()))
@@ -678,16 +781,44 @@ mod tests {
             "2026-01-01T00:00:00+0060",
             "@1767225600 0000",
             "2026/01/01T00:00:00Z",
+            "2026-01-01T-1:00:00Z",
+            "2026-01-01T00:-5:00Z",
+            "@@1767225600 +0000",
+            "-5 +0000",
         ] {
             assert_eq!(parse_date(invalid), None, "{invalid}");
         }
     }
 
     #[test]
+    fn messages_follow_c_git_whitespace_cleanup() {
+        assert_eq!(stripspace(b"a  \nb"), b"a\nb\n");
+        assert_eq!(stripspace(b"\n\nsubject\n"), b"subject\n");
+        assert_eq!(stripspace(b"a\n\n\n\nb\n"), b"a\n\nb\n");
+        assert_eq!(stripspace(b"\nx\n"), b"x\n");
+        assert_eq!(stripspace(b"  \n\t\n"), b"");
+        assert_eq!(
+            stripspace(b"keep  inner\tspace  \n\n"),
+            b"keep  inner\tspace\n"
+        );
+    }
+
+    #[test]
+    fn identities_drop_crud_like_c_git() {
+        assert_eq!(without_crud(b"Test "), b"Test");
+        assert_eq!(without_crud(b"  ,Jane Doe,; "), b"Jane Doe");
+        assert_eq!(without_crud(b" .C,;"), b".C");
+        assert_eq!(without_crud(b"<user@example.com>"), b"user@example.com");
+        assert_eq!(without_crud(b"a<b>c\nd"), b"abcd");
+        assert_eq!(without_crud(b" ;,: "), b"");
+    }
+
+    #[test]
     fn pathspecs_join_lexically_and_stay_inside_the_worktree() -> Result<()> {
         let join = |prefix: &[u8], path: &[u8]| repo_relative(prefix, BStr::new(path));
         assert_eq!(join(b"", b".")?, b".");
-        assert_eq!(join(b"", b"./a//b/")?, b"a/b");
+        assert_eq!(join(b"", b"./a//b/")?, b"a/b/");
+        assert_eq!(join(b"", b"./")?, b".");
         assert_eq!(join(b"sub/dir", b"../x")?, b"sub/x");
         assert_eq!(join(b"sub", b"..")?, b".");
         assert_eq!(join(b"", b"caf\xe9")?, b"caf\xe9");
@@ -695,6 +826,7 @@ mod tests {
         assert!(join(b"", b"/abs").is_err());
         assert!(join(b"", b":(glob)*").is_err());
         assert!(join(b"", b"").is_err());
+        assert_eq!(join(b"sub", b"dir/")?, b"sub/dir/");
         Ok(())
     }
 }
