@@ -89,7 +89,10 @@ impl Repository {
             let old = if cached {
                 head_by_path.get(change.path.as_slice()).copied()
             } else {
-                indexed.filter(|entry| !entry.intent_to_add)
+                // Removed ITA files have the stored empty blob as their old
+                // version. Otherwise there would be no version on either side
+                // and the deletion header would disappear from the patch.
+                indexed.filter(|entry| !entry.intent_to_add || change.code == b'D')
             };
             let old = old.map(|entry| self.diff_blob(entry)).transpose()?;
             let new = if cached {

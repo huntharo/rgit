@@ -216,6 +216,13 @@ impl Repository {
                         "special tracked worktree file",
                     ));
                 }
+                // A nested .git marker suppresses the untracked directory walk,
+                // but tracked paths still consult attributes in these parents.
+                if index + 1 < parts.len() && metadata.is_dir() {
+                    for name in [".gitattributes", ".gitignore"] {
+                        regular_metadata_file(&path.join(name))?;
+                    }
+                }
             }
         }
         let info_dir = self.inner.common_dir().join("info");
