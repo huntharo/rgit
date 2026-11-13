@@ -47,6 +47,27 @@ enum Command {
         #[arg(short = 'u', long, default_value = "normal", num_args = 0..=1, default_missing_value = "all")]
         untracked_files: String,
     },
+    /// Show staged or unstaged changes, without invoking external diff drivers.
+    Diff {
+        #[arg(long, alias = "staged")]
+        cached: bool,
+        #[arg(long, conflicts_with = "name_status")]
+        name_only: bool,
+        #[arg(long)]
+        name_status: bool,
+        #[arg(long)]
+        quiet: bool,
+        #[arg(long)]
+        exit_code: bool,
+        #[arg(short = 'z')]
+        nul: bool,
+        #[arg(long)]
+        no_renames: bool,
+        #[arg(long)]
+        no_ext_diff: bool,
+        #[arg(long)]
+        no_textconv: bool,
+    },
     /// List index paths and optionally their object IDs, modes and stages.
     LsFiles {
         #[arg(short = 's', long)]
@@ -186,6 +207,35 @@ fn run(cli: Cli, out: &mut impl Write) -> Result<u8> {
                 out.write_all(&[entry.index, entry.worktree, b' '])?;
                 write_entry_path(out, &entry.path, nul, true)?;
             }
+        }
+        Command::Diff {
+            cached,
+            name_only,
+            name_status,
+            quiet,
+            exit_code,
+            nul,
+            ..
+        } => {
+            let entries = repo.diff_entries(cached)?;
+            let different = !entries.is_empty();
+            if !quiet {
+                // Finish decoding and formatting before emitting any bytes.
+                let mut output = Vec::new();
+                if name_only || name_status {
+                    for entry in entries {
+                        if name_status {
+                            output.extend_from_slice(&[entry.code, if nul { 0 } else { b'\t' }]);
+                        }
+                        write_entry_path(&mut output, &entry.path, nul, false)?;
+                    }
+                } else {
+                    output = repo.diff_patch(cached)?;
+                }
+                out.write_all(&output)?;
+            }
+            out.flush()?;
+            return Ok(u8::from((quiet || exit_code) && different));
         }
         Command::LsFiles {
             stage,
