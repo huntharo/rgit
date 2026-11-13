@@ -1,6 +1,7 @@
 # Development
 
 Install Rust with rustup and C Git for the conformance tests.
+On macOS, Python 3 is also required for the native APFS shared-mapping tests.
 
 ```sh
 cargo build --workspace --locked
