@@ -98,6 +98,7 @@ fn spec(point: &str, mode: Mode) -> String {
 fn stale_locks_refuse_then_clear(
     s: &Scenario,
     locks: &[PathBuf],
+    preserve: Preserve,
     rerun: &mut dyn FnMut() -> Result<std::process::Output>,
 ) -> Result {
     if locks.is_empty() {
@@ -113,12 +114,7 @@ fn stale_locks_refuse_then_clear(
     }) {
         return Err(format!("diagnostic names none of {locks:?}: {}", describe(&output)).into());
     }
-    assert_preserved(
-        &before,
-        &snapshot(s.dir())?,
-        Preserve::AllowNewObjects,
-        "stale lock refusal",
-    )?;
+    assert_preserved(&before, &snapshot(s.dir())?, preserve, "stale lock refusal")?;
     for lock in locks {
         fs::remove_file(lock)?;
     }
@@ -204,7 +200,7 @@ fn add_case(hash: Hash, point: &str, mode: Mode) -> Result {
     if locks != expected_locks {
         return Err(format!("locks {locks:?}, expected {expected_locks:?}").into());
     }
-    stale_locks_refuse_then_clear(&s, &locks, &mut || {
+    stale_locks_refuse_then_clear(&s, &locks, Preserve::AllowNewObjects, &mut || {
         Driver::Rgit.add(&s.root(), &["a", "dir"])
     })?;
 
@@ -314,7 +310,7 @@ fn commit_case(hash: Hash, shape: Shape, point: &str, mode: Mode) -> Result {
     }
     if head_state == Published::Old {
         let root = s.root();
-        stale_locks_refuse_then_clear(&s, &locks, &mut || {
+        stale_locks_refuse_then_clear(&s, &locks, Preserve::AllowNewObjects, &mut || {
             Driver::Rgit.commit(&root, &["interrupted"], when)
         })?;
         ok_quiet(
@@ -328,27 +324,33 @@ fn commit_case(hash: Hash, shape: Shape, point: &str, mode: Mode) -> Result {
         return assert_state_with(&s.model, false);
     }
 
-    // Published (lock.after-rename): the published ref's own lock is gone by
-    // definition. Requirement (coordinator, G1 WP3 item 2): no lock at all
-    // remains. Checked last so the recovery path below still runs and
-    // reports; ADR 0003 invariant 2 alone would tolerate a stale lock.
-    if locks.contains(&ref_lock) {
-        return Err(format!("published ref still has its lock {}", ref_lock.display()).into());
-    }
-    let leftover = (!locks.is_empty()).then(|| {
-        format!(
-            "{point} {mode:?}: ref published but stale lock(s) {locks:?} remain; \
-             requirement is no leftover lock after publication"
+    // Published (lock.after-rename): the published ref's own lock is gone.
+    // Decision (G1 WP3, ADR 0003 invariant 2): a commit on a branch holds
+    // HEAD.lock across the branch rename so HEAD cannot be re-pointed
+    // mid-commit (C Git's files backend also locks HEAD for its log-only
+    // update), so an ABORT here may leave exactly HEAD.lock. Any other
+    // leftover lock, any lock after :error, and any lock on a detached-HEAD
+    // commit is a failure.
+    let permitted: Vec<PathBuf> = match (shape, mode) {
+        (Shape::Branch | Shape::Unborn, Mode::Abort) => vec![git_dir.join("HEAD.lock")],
+        _ => vec![],
+    };
+    if !locks.is_empty() && locks != permitted {
+        return Err(format!(
+            "{point} {mode:?} {shape:?}: ref published but locks {locks:?} remain; only {permitted:?} may"
         )
-    });
+        .into());
+    }
+    if !locks.is_empty() {
+        eprintln!(
+            "NOTE: {hash:?} {shape:?} {point} {mode:?}: ref published; documented stale HEAD.lock remains"
+        );
+    }
     s.model = new;
     // Published without its reflog entry; a further commit must be refused
-    // by any stale lock, then succeed and log from the published value.
-    follow_up_commit_logs_from(&mut s, shape, &oid, &locks)?;
-    match leftover {
-        Some(message) => Err(message.into()),
-        None => Ok(()),
-    }
+    // by the stale HEAD.lock (exit 128, named, byte-identical), then succeed
+    // once it is removed and log from the published value.
+    follow_up_commit_logs_from(&mut s, shape, &oid, &locks)
 }
 
 fn reflog_path(s: &Scenario, shape: Shape) -> PathBuf {
@@ -371,7 +373,11 @@ fn follow_up_commit_logs_from(
     s.add(0, &[b"follow-up"])?;
     let when = s.model.tick();
     let root = s.root();
-    stale_locks_refuse_then_clear(s, stale_locks, &mut || {
+    // The refused follow-up leaves every existing byte (refs, HEAD, index,
+    // logs, the stale lock, existing objects) identical. It may add only new
+    // unreferenced loose objects: ADR 0003 writes objects before taking the
+    // ref lock (`commit.objects-written` precedes `commit.ref-locked`).
+    stale_locks_refuse_then_clear(s, stale_locks, Preserve::AllowNewObjects, &mut || {
         Driver::Rgit.commit(&root, &["follow-up"], when)
     })?;
     ok_quiet(
@@ -505,22 +511,112 @@ fn init_case(hash: Hash, mode: Mode) -> Result {
     if fs::symlink_metadata(repo.join(".git")).is_ok() {
         return Err("init published .git before init.before-publish".into());
     }
-    let leftovers: Vec<_> = snapshot(sandbox.path())?
-        .into_keys()
-        .filter(|p| p.as_os_str() != ".lifecycle-home")
-        .collect();
-    if !leftovers.is_empty() {
-        eprintln!("NOTE: init {hash:?} {mode:?} left private state: {leftovers:?}");
+    // Documented: the private `.git.rgit-init-*` directory is removed only
+    // if the process survives. Abort leaves exactly one; :error leaves none.
+    let private: Vec<PathBuf> = match fs::read_dir(&repo) {
+        Ok(entries) => entries
+            .map(|e| e.map(|e| e.path()))
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with(".git.rgit-init-"))
+            })
+            .collect(),
+        Err(_) => vec![],
+    };
+    let expected_private = usize::from(mode == Mode::Abort);
+    if private.len() != expected_private || private.iter().any(|p| !p.is_dir()) {
+        return Err(format!(
+            "{mode:?}: expected {expected_private} private init dir(s), found {private:?}"
+        )
+        .into());
     }
+    let others: Vec<_> = snapshot(sandbox.path())?
+        .into_keys()
+        .filter(|p| {
+            p.as_os_str() != ".lifecycle-home"
+                && p.as_os_str() != "repo"
+                && !private
+                    .iter()
+                    .any(|d| sandbox.path().join(p).starts_with(d))
+        })
+        .collect();
+    if !others.is_empty() {
+        return Err(format!("{mode:?}: unexpected init leftovers {others:?}").into());
+    }
+    if let Some(dir) = private.first() {
+        eprintln!(
+            "NOTE: init {hash:?} {mode:?}: crash left documented private dir {}",
+            dir.display()
+        );
+    }
+    // Neither rgit nor C Git discovers a repository there.
+    if repo.is_dir() {
+        let rgit = run(Driver::Rgit
+            .command(&repo)
+            .args(["rev-parse", "--absolute-git-dir"]))?;
+        if rgit.status.success() {
+            return Err(format!(
+                "rgit discovered a repository after the crash: {}",
+                describe(&rgit)
+            )
+            .into());
+        }
+        let cgit = run(lifecycle_support::proc::git_cmd(&repo).args(["rev-parse", "--git-dir"]))?;
+        if cgit.status.success() {
+            return Err(format!(
+                "C Git discovered a repository after the crash: {}",
+                describe(&cgit)
+            )
+            .into());
+        }
+    }
+
     ok_quiet(&Driver::Rgit.init(sandbox.path(), &args)?, "retry init")?;
     let model = Model::new(hash, &repo, "main");
-    // A clean, unborn repository: no refs, no locks, empty status (so no
-    // leftover private directory is visible inside the worktree).
-    assert_state_with(&model, false)?;
     assert_eq!(
         git_text(&repo, &["rev-parse", "--is-bare-repository"])?,
         "false"
     );
+    assert_eq!(git_text(&repo, &["config", "--get", "core.bare"])?, "false");
+    assert_eq!(
+        git_text(&repo, &["rev-parse", "--show-object-format"])?,
+        hash.name()
+    );
+    // Status may additionally list only untracked entries under the private
+    // leftover; everything else must match the model.
+    let status = observe::status(&repo)?;
+    let expected = model.status(0);
+    let mut extra = Vec::new();
+    for record in status.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        let mut entry = record.to_vec();
+        entry.push(0);
+        if expected.windows(entry.len()).any(|w| w == entry.as_slice()) {
+            continue;
+        }
+        let text = String::from_utf8_lossy(record).into_owned();
+        let under_private = private.iter().any(|d| {
+            d.file_name()
+                .is_some_and(|n| text.starts_with(&format!("?? {}/", n.to_string_lossy())))
+        });
+        if !under_private {
+            return Err(format!(
+                "status entry {text:?} is neither modelled nor under the private dir"
+            )
+            .into());
+        }
+        extra.push(text);
+    }
+    if !extra.is_empty() {
+        eprintln!("NOTE: init {hash:?} {mode:?}: status lists leftover entries {extra:?}");
+    }
+    for dir in &private {
+        fs::remove_dir_all(dir)?;
+    }
+    // Without the leftover: a clean, unborn repository exactly as modelled
+    // (HEAD, object format, status, no refs, no locks, fsck).
+    assert_state_with(&model, false)?;
     Ok(())
 }
 
