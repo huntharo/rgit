@@ -534,8 +534,7 @@ fn native_path_bytes_are_used_when_filesystem_accepts_them() -> Result {
     match fs::write(root.path().join(name), b"native bytes") {
         Ok(()) => {}
         Err(error)
-            if error.kind() == std::io::ErrorKind::InvalidInput
-                || (cfg!(target_os = "macos") && error.raw_os_error() == Some(1)) =>
+            if cfg!(target_os = "macos") && matches!(error.raw_os_error(), Some(1) | Some(92)) =>
         {
             eprintln!(
                 "SKIP native non-UTF-8 filename: filesystem rejected it ({error}); raw index/tree byte tests still run"
@@ -552,6 +551,53 @@ fn native_path_bytes_are_used_when_filesystem_accepts_them() -> Result {
     inspect(root.path())?;
     git(root.path(), &["commit", "-m", "native bytes"])?;
     inspect_tree(root.path(), "HEAD")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn index_fifo_and_symlinks_are_refused_before_opening() -> Result {
+    use std::os::unix::fs::symlink;
+    use std::time::{Duration, Instant};
+    let root = fixture("sha1")?;
+    let index = root.path().join(".git/index");
+    let regular = root.path().join("saved-index");
+    fs::rename(&index, &regular)?;
+    for target in [None, Some(regular.as_path()), Some(Path::new("/dev/zero"))] {
+        if let Some(target) = target {
+            symlink(target, &index)?;
+        } else {
+            assert!(Command::new("mkfifo").arg(&index).status()?.success());
+        }
+        for args in [
+            vec!["ls-files", "--stage"],
+            vec!["status", "--porcelain", "-z"],
+        ] {
+            let mut child = Command::new(env!("CARGO_BIN_EXE_rgit"))
+                .arg("-C")
+                .arg(root.path())
+                .args(&args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while child.try_wait()?.is_none() {
+                if Instant::now() >= deadline {
+                    child.kill()?;
+                    child.wait()?;
+                    return Err(format!("{args:?} blocked on non-regular index {target:?}").into());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let output = child.wait_with_output()?;
+            assert_eq!(output.status.code(), Some(128), "{output:?}");
+            assert!(output.stdout.is_empty());
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("symlink or special index file")
+            );
+        }
+        fs::remove_file(&index)?;
+    }
     Ok(())
 }
 

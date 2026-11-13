@@ -45,6 +45,18 @@ impl Repository {
 
     pub(crate) fn read_index(&self) -> Result<gix::index::File, Error> {
         let path = self.inner.index_path();
+        // Opening a FIFO can block before descriptor metadata is available;
+        // following a symlink could read an unrelated file or an endless device.
+        // This preflight is conservative, not a race-free filesystem sandbox.
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(Error::UnsupportedCapability(
+                    "symlink or special index file",
+                ));
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
         let mut file = match std::fs::File::open(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(gix::index::File::from_state(
@@ -55,7 +67,13 @@ impl Repository {
             Err(error) => return Err(error.into()),
             Ok(file) => file,
         };
-        let timestamp = file.metadata()?.modified()?.into();
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(Error::UnsupportedCapability(
+                "symlink or special index file",
+            ));
+        }
+        let timestamp = metadata.modified()?.into();
         let mut data = Vec::new();
         file.read_to_end(&mut data)?;
         // Decode the bytes we verify, without File::at() transparently loading
