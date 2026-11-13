@@ -70,7 +70,11 @@ fn index_versions_flags_and_conflict_stages_match_c_git() -> Result {
                 "dir/ac",
                 "dir/b",
                 "space name",
-                "tab\tname",
+                if cfg!(windows) {
+                    "tab-name"
+                } else {
+                    "tab\tname"
+                },
             ] {
                 let path = root.path().join(name);
                 fs::create_dir_all(path.parent().ok_or("missing parent")?)?;
