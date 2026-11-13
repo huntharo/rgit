@@ -134,7 +134,8 @@ Differences from C Git:
 - `add` hashes every file under the pathspec instead of trusting stat data and
   buffers whole files. Racily clean entries are smudged as C Git does.
   Resolve-undo, untracked-cache and fsmonitor extensions are dropped when the
-  index is rewritten; `index.skipHash` is ignored and a checksum is always
+  index is rewritten (after an rgit `add`, `git update-index --unresolve` and
+  `git checkout -m` can no longer restore a resolved conflict); `index.skipHash` is ignored and a checksum is always
   written. No `safecrlf` warnings are printed.
 - `commit -m` applies C Git's default `whitespace` message cleanup and trims
   identities like C Git (leading/trailing whitespace and `,:;<>"'\`; inner
@@ -187,7 +188,12 @@ interrupted after the branch rename, that is `HEAD.lock` (the branch is
 already published and its own lock is gone). An interrupted `init` leaves no
 `.git`, only one private `.git.rgit-init-*` (bare: `.<name>.rgit-init-*`)
 directory; a later `init` succeeds and leaves that directory untouched, so it
-appears as untracked until deleted. rgit has no proof of staleness and never
+appears as untracked until deleted. A bare `init` into an existing empty
+directory populates it in place (preserving its inode, mode and ownership) and
+publishes `HEAD` last; interrupted before `HEAD`, the directory holds `config`,
+`objects/` and `refs/` but is not a repository, and a retry refuses it as
+non-empty until it is emptied manually. Errors that occur after a repository
+was published are reported as such ("the repository was created at ..."). rgit has no proof of staleness and never
 deletes a lock or temporary directory it did not create in the same process:
 remove one manually only after confirming that no rgit or Git process is still
 running against the repository. Errors handled without a crash clean up their

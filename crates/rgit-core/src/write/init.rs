@@ -232,8 +232,6 @@ pub struct InitPublishedError {
 
 impl InitPublishedError {
     /// The Git directory that now exists.
-    // Reachable once write/mod.rs re-exports this type (integration owner).
-    #[allow(dead_code)]
     pub fn git_dir(&self) -> &Path {
         &self.git_dir
     }

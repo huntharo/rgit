@@ -98,6 +98,7 @@ Pause uses `RGIT_FAILPOINT_READY` / `RGIT_FAILPOINT_RELEASE` file paths.
 | `lock.before-rename` | lock content synced, not yet renamed |
 | `lock.after-rename` | renamed, directory not yet synced |
 | `init.before-publish` | private Git directory complete, not yet renamed |
+| `init.before-head` | existing empty bare target populated in place except `HEAD`; `HEAD` not yet published |
 | `add.objects-written` | blobs synced, index lock not yet taken |
 | `add.index-locked` | `index.lock` held and written, before commit |
 | `commit.objects-written` | tree/commit synced, ref not yet locked |

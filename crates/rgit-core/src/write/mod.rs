@@ -23,7 +23,7 @@ mod refs;
 
 pub use commit::{CommitOutcome, CommitRequest, Signature};
 pub use index::{AddOutcome, AddRefusal};
-pub use init::{InitOptions, ObjectFormat, init};
+pub use init::{InitOptions, InitPublishedError, ObjectFormat, init};
 pub use refs::{RefExpectation, RefLog, RefUpdate, ReflogAppendError};
 
 pub(crate) use failpoint::hit as failpoint;
