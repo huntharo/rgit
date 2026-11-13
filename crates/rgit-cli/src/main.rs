@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
+use rgit_core::write::{CommitRequest, InitOptions, ObjectFormat, Signature};
 use rgit_core::{BStr, GraphLimits, ObjectKind, Repository, UntrackedMode};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -24,6 +25,32 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Create an empty repository (experimental; never reinitializes).
+    Init {
+        #[arg(short = 'q', long)]
+        quiet: bool,
+        #[arg(long)]
+        bare: bool,
+        #[arg(short = 'b', long, value_name = "NAME")]
+        initial_branch: Option<OsString>,
+        #[arg(long, value_name = "FORMAT", default_value = "sha1")]
+        object_format: String,
+        directory: Option<PathBuf>,
+    },
+    /// Stage literal paths or directories (experimental; no pathspec magic).
+    Add {
+        #[arg(required = true, allow_hyphen_values = false)]
+        paths: Vec<OsString>,
+    },
+    /// Record the index as a new commit on HEAD (experimental; no hooks).
+    Commit {
+        #[arg(short = 'm', long = "message", required = true, value_name = "MSG")]
+        messages: Vec<OsString>,
+        #[arg(long)]
+        allow_empty: bool,
+        #[arg(short = 'q', long)]
+        quiet: bool,
+    },
     /// Resolve one revision or inspect repository paths.
     RevParse(RevParse),
     /// Read object metadata or raw bytes: -t, -s, blob, tree, commit, tag.
@@ -140,8 +167,98 @@ fn main() -> ExitCode {
 fn run(cli: Cli, out: &mut impl Write) -> Result<u8> {
     // Canonicalize the explicit start directory, never process-global cwd.
     let directory = dunce::canonicalize(&cli.directory)?;
-    let repo = Repository::discover(directory)?;
+    if let Command::Init {
+        quiet,
+        bare,
+        initial_branch,
+        object_format,
+        directory: target,
+    } = &cli.command
+    {
+        let mut options = InitOptions {
+            bare: *bare,
+            object_format: match object_format.as_str() {
+                "sha1" => ObjectFormat::Sha1,
+                "sha256" => ObjectFormat::Sha256,
+                other => return Err(format!("unknown hash algorithm '{other}'").into()),
+            },
+            ..InitOptions::default()
+        };
+        if let Some(branch) = initial_branch {
+            options.initial_branch = os_bytes(branch)?.to_vec();
+        }
+        let target = target
+            .as_ref()
+            .map_or_else(|| directory.clone(), |path| directory.join(path));
+        let repo = rgit_core::write::init(&target, &options)?;
+        if !quiet {
+            out.write_all(b"Initialized empty Git repository in ")?;
+            let git_dir = dunce::canonicalize(repo.git_dir())?;
+            out.write_all(os_bytes(git_dir.as_os_str())?)?;
+            out.write_all(b"/\n")?;
+        }
+        out.flush()?;
+        return Ok(0);
+    }
+    let repo = Repository::discover(&directory)?;
     match cli.command {
+        Command::Init { .. } => unreachable!("handled before discovery"),
+        Command::Add { paths } => {
+            let prefix = worktree_prefix(&repo, &directory)?;
+            let paths = paths
+                .iter()
+                .map(|path| repo_relative(&prefix, os_bytes(path)?))
+                .collect::<Result<Vec<_>>>()?;
+            let paths: Vec<&BStr> = paths.iter().map(BStr::new).collect();
+            repo.add(&paths)?;
+        }
+        Command::Commit {
+            messages,
+            allow_empty,
+            quiet,
+        } => {
+            // Resolve every input before the library writes anything.
+            let author = identity(&repo, "AUTHOR")?;
+            let committer = identity(&repo, "COMMITTER")?;
+            let mut message = Vec::new();
+            for (index, part) in messages.iter().enumerate() {
+                if index > 0 {
+                    message.extend_from_slice(b"\n");
+                }
+                let part = os_bytes(part)?.to_vec();
+                let end = part
+                    .iter()
+                    .rposition(|byte| !byte.is_ascii_whitespace())
+                    .map_or(0, |end| end + 1);
+                message.extend_from_slice(&part[..end]);
+                message.push(b'\n');
+            }
+            if message.iter().all(u8::is_ascii_whitespace) {
+                return Err("aborting commit due to empty commit message".into());
+            }
+            let outcome = repo.commit(&CommitRequest {
+                message: message.clone(),
+                author,
+                committer,
+                allow_empty,
+            })?;
+            if !quiet {
+                let reference = outcome.reference.as_slice();
+                let branch = reference
+                    .strip_prefix(b"refs/heads/")
+                    .unwrap_or(b"detached HEAD");
+                let id = outcome.id.to_string();
+                out.write_all(b"[")?;
+                out.write_all(branch)?;
+                if outcome.parent.is_none() {
+                    out.write_all(b" (root-commit)")?;
+                }
+                write!(out, " {}] ", &id[..7])?;
+                let subject = message.split(|&byte| byte == b'\n').next().unwrap_or(b"");
+                out.write_all(subject)?;
+                out.write_all(b"\n")?;
+            }
+        }
         Command::RevParse(query) => {
             if query.show_toplevel {
                 let path = repo
@@ -304,6 +421,158 @@ fn run(cli: Cli, out: &mut impl Write) -> Result<u8> {
     Ok(0)
 }
 
+/// The `-C` directory relative to the worktree root, as `/`-separated bytes.
+fn worktree_prefix(repo: &Repository, directory: &Path) -> Result<Vec<u8>> {
+    let root = dunce::canonicalize(
+        repo.work_dir()
+            .ok_or("this operation must be run in a work tree")?,
+    )?;
+    let relative = directory
+        .strip_prefix(&root)
+        .map_err(|_| "the -C directory is outside the work tree")?;
+    let mut prefix = Vec::new();
+    for component in relative.components() {
+        if !prefix.is_empty() {
+            prefix.push(b'/');
+        }
+        prefix.extend_from_slice(os_bytes(component.as_os_str())?);
+    }
+    Ok(prefix)
+}
+
+/// Lexically join a command-line path onto the prefix without touching the
+/// filesystem; `..` may not leave the worktree. `.` for the root is kept.
+fn repo_relative(prefix: &[u8], path: &BStr) -> Result<Vec<u8>> {
+    if path.is_empty() {
+        return Err("empty path is not a valid pathspec".into());
+    }
+    if path.starts_with(b"/") || path.starts_with(b":") {
+        return Err(format!("unsupported pathspec: {path:?}").into());
+    }
+    let mut parts: Vec<&[u8]> = prefix
+        .split(|&byte| byte == b'/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let separators: &[u8] = if cfg!(windows) { b"/\\" } else { b"/" };
+    for part in path.split(|byte| separators.contains(byte)) {
+        match part {
+            b"" | b"." => {}
+            b".." => {
+                parts
+                    .pop()
+                    .ok_or_else(|| format!("{path:?} is outside the repository"))?;
+            }
+            part => parts.push(part),
+        }
+    }
+    Ok(if parts.is_empty() {
+        b".".to_vec()
+    } else {
+        parts.join(&b'/')
+    })
+}
+
+/// Identity from `GIT_<ROLE>_{NAME,EMAIL,DATE}`, else repository-local
+/// `user.name`/`user.email`; the timestamp defaults to now in UTC.
+fn identity(repo: &Repository, role: &str) -> Result<Signature> {
+    let lookup = |field: &str, key: &str| -> Result<Option<Vec<u8>>> {
+        match std::env::var_os(format!("GIT_{role}_{field}")) {
+            Some(value) => Ok(Some(os_bytes(&value)?.to_vec())),
+            None => Ok(repo.config_bytes(key)),
+        }
+    };
+    let name = lookup("NAME", "user.name")?;
+    let email = lookup("EMAIL", "user.email")?;
+    let (Some(name), Some(email)) = (name, email) else {
+        return Err(format!(
+            "{} identity unknown: set user.name and user.email in the repository config",
+            role.to_ascii_lowercase()
+        )
+        .into());
+    };
+    if name.iter().all(u8::is_ascii_whitespace) {
+        return Err("empty ident name not allowed".into());
+    }
+    let (seconds, offset_minutes) = match std::env::var(format!("GIT_{role}_DATE")) {
+        Ok(date) => parse_date(&date).ok_or_else(|| format!("invalid date format: {date}"))?,
+        Err(std::env::VarError::NotPresent) => (
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs()
+                .try_into()?,
+            0,
+        ),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Signature {
+        name,
+        email,
+        seconds,
+        offset_minutes,
+    })
+}
+
+/// Accept Git's internal `[@]<seconds> <±hhmm>` and ISO 8601
+/// `YYYY-MM-DD[T ]HH:MM:SS` with `Z`, `±HH:MM` or `±HHMM`.
+fn parse_date(date: &str) -> Option<(i64, i32)> {
+    let date = date.trim();
+    let offset = |zone: &str| -> Option<i32> {
+        if zone == "Z" {
+            return Some(0);
+        }
+        let sign = match zone.as_bytes().first()? {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return None,
+        };
+        let digits: String = zone[1..].chars().filter(|c| *c != ':').collect();
+        if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let (hours, minutes) = (
+            digits[..2].parse::<i32>().ok()?,
+            digits[2..].parse::<i32>().ok()?,
+        );
+        (minutes < 60).then_some(sign * (hours * 60 + minutes))
+    };
+    if let Some((seconds, zone)) = date.trim_start_matches('@').split_once(' ')
+        && let Ok(seconds) = seconds.parse::<i64>()
+    {
+        return Some((seconds, offset(zone)?));
+    }
+    let bytes = date.as_bytes();
+    if bytes.len() < 20 || !matches!(bytes[10], b'T' | b' ') {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| date.get(range)?.parse::<i64>().ok();
+    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
+    let separators = [bytes[4], bytes[7], bytes[13], bytes[16]];
+    if separators != [b'-', b'-', b':', b':']
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let zone = offset(&date[19..])?;
+    // Days since the Unix epoch for a proleptic Gregorian date.
+    let (y, m) = if month <= 2 {
+        (year - 1, month + 9)
+    } else {
+        (year, month - 3)
+    };
+    let era = y.div_euclid(400);
+    let year_of_era = y - era * 400;
+    let day_of_year = (153 * m + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    let local = days * 86_400 + hour * 3600 + minute * 60 + second;
+    Some((local - i64::from(zone) * 60, zone))
+}
+
 fn write_path(out: &mut impl Write, path: &Path) -> Result<()> {
     let path = dunce::canonicalize(path)?;
     #[cfg(windows)]
@@ -367,4 +636,54 @@ fn os_bytes(value: &std::ffi::OsStr) -> Result<&BStr> {
             .to_str()
             .ok_or("path or revision is not valid UTF-8")?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dates_match_git_internal_and_iso_forms() {
+        // `date -u -d 2026-01-01T00:00:00Z +%s` = 1767225600.
+        assert_eq!(parse_date("2026-01-01T00:00:00Z"), Some((1_767_225_600, 0)));
+        assert_eq!(
+            parse_date("2026-01-01 02:30:00+02:30"),
+            Some((1_767_225_600, 150))
+        );
+        assert_eq!(
+            parse_date("2025-12-31T19:00:00-0500"),
+            Some((1_767_225_600, -300))
+        );
+        assert_eq!(parse_date("@1767225600 +0000"), Some((1_767_225_600, 0)));
+        assert_eq!(parse_date("1767225600 -0130"), Some((1_767_225_600, -90)));
+        assert_eq!(parse_date("2000-02-29T00:00:00Z"), Some((951_782_400, 0)));
+        assert_eq!(parse_date("1969-12-31T23:59:59Z"), Some((-1, 0)));
+        for invalid in [
+            "",
+            "yesterday",
+            "2026-13-01T00:00:00Z",
+            "2026-01-01T24:00:00Z",
+            "2026-01-01T00:00:00",
+            "2026-01-01T00:00:00+0060",
+            "@1767225600 0000",
+            "2026/01/01T00:00:00Z",
+        ] {
+            assert_eq!(parse_date(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn pathspecs_join_lexically_and_stay_inside_the_worktree() -> Result<()> {
+        let join = |prefix: &[u8], path: &[u8]| repo_relative(prefix, BStr::new(path));
+        assert_eq!(join(b"", b".")?, b".");
+        assert_eq!(join(b"", b"./a//b/")?, b"a/b");
+        assert_eq!(join(b"sub/dir", b"../x")?, b"sub/x");
+        assert_eq!(join(b"sub", b"..")?, b".");
+        assert_eq!(join(b"", b"caf\xe9")?, b"caf\xe9");
+        assert!(join(b"sub", b"../..").is_err());
+        assert!(join(b"", b"/abs").is_err());
+        assert!(join(b"", b":(glob)*").is_err());
+        assert!(join(b"", b"").is_err());
+        Ok(())
+    }
 }

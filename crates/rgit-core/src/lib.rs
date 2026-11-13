@@ -189,6 +189,14 @@ impl Repository {
         self.inner.workdir()
     }
 
+    /// A repository-local configuration value as raw bytes, if set.
+    pub fn config_bytes(&self, key: &str) -> Option<Vec<u8>> {
+        self.inner
+            .config_snapshot()
+            .string(key)
+            .map(|value| value.to_vec())
+    }
+
     pub fn is_bare(&self) -> bool {
         self.inner.is_bare()
     }
