@@ -119,7 +119,9 @@ fn unsupported_commands_options_and_missing_objects_fail() -> Result {
     let root = fixture("sha1")?;
     for args in [
         vec!["fetch", "ext::anything"],
-        vec!["add", "file.txt"],
+        vec!["checkout", "other"],
+        vec!["add", "*.txt"],
+        vec!["commit", "--amend", "-m", "x"],
         vec!["show-ref", "--unknown"],
         vec!["rev-parse", "--verify", "does-not-exist"],
         vec!["cat-file", "-p", "HEAD"],

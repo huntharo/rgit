@@ -14,7 +14,7 @@ use super::proc::{Result, describe, home_for, identity, isolate, run};
 /// and scenarios whose subject is that command print an explicit SKIP. Flip
 /// to true at integration: every rgit-driver step then uses rgit, the
 /// fallback is unreachable and nothing is skipped.
-pub const RGIT_WRITES_INTEGRATED: bool = false;
+pub const RGIT_WRITES_INTEGRATED: bool = true;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Driver {

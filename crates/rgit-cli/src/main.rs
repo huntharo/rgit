@@ -35,7 +35,9 @@ enum Command {
         initial_branch: Option<OsString>,
         #[arg(long, value_name = "FORMAT", default_value = "sha1")]
         object_format: String,
-        directory: Option<PathBuf>,
+        /// Distinct id: `directory` is the global `-C` argument.
+        #[arg(value_name = "DIRECTORY")]
+        target: Option<PathBuf>,
     },
     /// Stage literal paths or directories (experimental; no pathspec magic).
     Add {
@@ -181,7 +183,7 @@ fn run(cli: Cli, out: &mut impl Write) -> Result<u8> {
         bare,
         initial_branch,
         object_format,
-        directory: target,
+        target,
     } = &cli.command
     {
         let mut options = InitOptions {
