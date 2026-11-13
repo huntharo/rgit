@@ -1,16 +1,19 @@
 //! OWNER: WP2 (commit/ref publication). Frozen public signatures.
 //!
-//! Order of a commit: refuse unsupported state, read the `HEAD` target, write
-//! and sync tree and commit objects, then publish through a compare-and-swap
-//! reference update against the value read first (docs/decisions/0003).
+//! Order of a commit: refuse unsupported state, read the `HEAD` target and
+//! preflight its reference, compute trees in memory and decide whether there
+//! is anything to commit, and only then write and sync tree and commit
+//! objects. Publication is a compare-and-swap reference update against the
+//! value read first (docs/decisions/0003). Every refusal happens before the
+//! first object write; only lock contention or a concurrent reference move
+//! discovered at publication can leave new, unreferenced objects behind.
 
-use std::io::Write;
-use std::path::Path;
+use std::collections::HashSet;
 
 use crate::{Error, ObjectId, ObjectKind, Repository};
 
 use super::refs::{Loose, format_signature, read_loose};
-use super::{LockFile, RefExpectation, RefLog, RefUpdate, sync_parent};
+use super::{LockFile, RefExpectation, RefLog, RefUpdate};
 
 /// A Git identity line: `name <email> seconds ±HHMM`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +66,14 @@ impl Repository {
     /// ([`Error::UnmergedIndex`]), intent-to-add entries and gitlinks are
     /// refused, and each blob must be present ([`Error::MissingObject`]).
     pub fn write_tree_from_index(&self) -> Result<ObjectId, Error> {
+        let plan = self.plan_tree_from_index()?;
+        self.write_planned_trees(&plan)?;
+        Ok(plan.root)
+    }
+
+    /// Validate the index and compute every tree object in memory, without
+    /// writing anything.
+    fn plan_tree_from_index(&self) -> Result<TreePlan, Error> {
         let index = self.read_index()?;
         let hash = self.inner.object_hash();
         if index.entries().iter().any(|entry| entry.stage_raw() != 0) {
@@ -70,32 +81,23 @@ impl Repository {
         }
         let mut files = Vec::with_capacity(index.entries().len());
         for entry in index.entries() {
-            use gix::index::entry::{Flags, Mode};
-            if entry.flags.contains(Flags::INTENT_TO_ADD) {
-                return Err(Error::UnsupportedCapability("intent-to-add index entries"));
-            }
-            match entry.mode {
-                Mode::FILE | Mode::FILE_EXECUTABLE | Mode::SYMLINK => {}
-                Mode::COMMIT => {
-                    return Err(Error::UnsupportedCapability(
-                        "gitlink (submodule) index entries",
-                    ));
-                }
-                _ => {
-                    return Err(Error::UnsupportedCapability(
-                        "sparse directory index entries",
-                    ));
-                }
-            }
-            if entry.id.kind() != hash {
-                return Err(Error::UnsupportedCapability(
-                    "object ID of a different hash algorithm",
-                ));
-            }
+            check_index_entry(entry, hash)?;
             self.require_kind(entry.id, ObjectKind::Blob)?;
             files.push((entry.path(&index), entry.mode.bits(), entry.id));
         }
-        self.write_trees(&files)
+        self.plan_trees(&files)
+    }
+
+    /// Store planned trees bottom-up; each is synced (an existing loose copy
+    /// too) by `write_loose_object`.
+    fn write_planned_trees(&self, plan: &TreePlan) -> Result<(), Error> {
+        for (expected, data) in &plan.objects {
+            let id = self.write_loose_object(ObjectKind::Tree, data)?;
+            if id != *expected {
+                return Err(super::refs::corrupt("tree object hash mismatch"));
+            }
+        }
+        Ok(())
     }
 
     /// Commit the index on top of HEAD (or as a root commit on an unborn
@@ -117,13 +119,19 @@ impl Repository {
         let head_path = self.inner.git_dir().join("HEAD");
         let (reference, parent) = match read_loose(&head_path, hash)? {
             None => return Err(super::refs::corrupt("HEAD is missing")),
-            Some(Loose::Direct(id)) => (b"HEAD".to_vec(), Some(id)),
+            Some(Loose::Direct(id)) => {
+                self.preflight_ref(b"HEAD", true)?;
+                (b"HEAD".to_vec(), Some(id))
+            }
             Some(Loose::Symbolic(branch)) => {
                 if !branch.starts_with(b"refs/heads/") {
                     return Err(Error::UnsupportedCapability(
                         "HEAD names a reference outside refs/heads/",
                     ));
                 }
+                // D/F conflicts, symlinked or symbolic refs and unusable
+                // reflog paths are refused before any object is written.
+                self.preflight_ref(&branch, true)?;
                 match self.read_ref(&branch)? {
                     None => (branch, None),
                     Some(Loose::Direct(id)) => (branch, Some(id)),
@@ -143,7 +151,9 @@ impl Repository {
             None => None,
         };
 
-        let tree = self.write_tree_from_index()?;
+        // Decide on an in-memory tree so a refusal writes nothing.
+        let plan = self.plan_tree_from_index()?;
+        let tree = plan.root;
         if !request.allow_empty && parent_tree.unwrap_or_else(|| ObjectId::empty_tree(hash)) == tree
         {
             return Err(Error::NothingToCommit);
@@ -158,7 +168,13 @@ impl Repository {
         data.extend_from_slice(&format_signature(&request.committer));
         data.extend_from_slice(b"\n\n");
         data.extend_from_slice(&request.message);
-        let id = self.write_object(ObjectKind::Commit, &data)?;
+        self.write_planned_trees(&plan)?;
+        let id = self.write_loose_object(ObjectKind::Commit, &data)?;
+        // The parent was not written by this operation; sync its loose copy
+        // (packed objects are durable already) before a ref names the child.
+        if let Some(parent) = parent {
+            self.sync_loose_object(parent)?;
+        }
         super::failpoint("commit.objects-written")?;
 
         let subject = request
@@ -243,9 +259,15 @@ impl Repository {
         Ok(())
     }
 
-    /// Build nested trees from index-ordered `(path, mode, id)` entries and
-    /// write them bottom-up, without recursion (paths may be arbitrarily deep).
-    fn write_trees(&self, files: &[(&gix::bstr::BStr, u32, ObjectId)]) -> Result<ObjectId, Error> {
+    /// Build nested trees from index-ordered `(path, mode, id)` entries in
+    /// memory, without recursion (paths may be arbitrarily deep). Trees are
+    /// listed bottom-up, each distinct tree once.
+    fn plan_trees(&self, files: &[(&gix::bstr::BStr, u32, ObjectId)]) -> Result<TreePlan, Error> {
+        let mut plan = TreePlan {
+            root: ObjectId::empty_tree(self.inner.object_hash()),
+            objects: Vec::new(),
+            seen: HashSet::new(),
+        };
         // Each open level: (directory path without trailing '/', entries).
         let mut stack: Vec<(Vec<u8>, Vec<TreeItem>)> = vec![(Vec::new(), Vec::new())];
         for (path, mode, id) in files {
@@ -262,7 +284,7 @@ impl Repository {
                 if inside {
                     break;
                 }
-                self.close_level(&mut stack)?;
+                self.close_level(&mut stack, &mut plan)?;
             }
             // Open the remaining directory components.
             let open_len = stack[stack.len() - 1].0.len();
@@ -283,15 +305,20 @@ impl Repository {
             });
         }
         while stack.len() > 1 {
-            self.close_level(&mut stack)?;
+            self.close_level(&mut stack, &mut plan)?;
         }
         let (_, items) = stack.pop().ok_or(Error::Injected("tree stack underflow"))?;
-        self.write_tree_object(items)
+        plan.root = self.plan_tree_object(items, &mut plan)?;
+        Ok(plan)
     }
 
-    fn close_level(&self, stack: &mut Vec<(Vec<u8>, Vec<TreeItem>)>) -> Result<(), Error> {
+    fn close_level(
+        &self,
+        stack: &mut Vec<(Vec<u8>, Vec<TreeItem>)>,
+        plan: &mut TreePlan,
+    ) -> Result<(), Error> {
         let (path, items) = stack.pop().ok_or(Error::Injected("tree stack underflow"))?;
-        let id = self.write_tree_object(items)?;
+        let id = self.plan_tree_object(items, plan)?;
         let name = match path.iter().rposition(|&byte| byte == b'/') {
             Some(slash) => path[slash + 1..].to_vec(),
             None => path,
@@ -307,7 +334,11 @@ impl Repository {
         Ok(())
     }
 
-    fn write_tree_object(&self, mut items: Vec<TreeItem>) -> Result<ObjectId, Error> {
+    fn plan_tree_object(
+        &self,
+        mut items: Vec<TreeItem>,
+        plan: &mut TreePlan,
+    ) -> Result<ObjectId, Error> {
         // Git orders tree entries as if directory names ended with '/'.
         items.sort_by(|a, b| a.sort_key().cmp(b.sort_key()));
         let mut data = Vec::new();
@@ -317,77 +348,46 @@ impl Repository {
             data.push(0);
             data.extend_from_slice(item.id.as_slice());
         }
-        self.write_object(ObjectKind::Tree, &data)
-    }
-
-    /// Store a loose object durably: compressed into a private temporary file
-    /// in the fan-out directory, synced and made read-only, then linked into
-    /// place without overwriting; the directory is synced afterwards. An
-    /// object already present (loose or packed) is not rewritten.
-    pub(super) fn write_object(&self, kind: ObjectKind, data: &[u8]) -> Result<ObjectId, Error> {
-        let hash = self.inner.object_hash();
-        let header = format!("{kind} {}\0", data.len());
-        let mut hasher = gix::hash::hasher(hash);
-        hasher.update(header.as_bytes());
-        hasher.update(data);
-        let id = hasher.try_finalize().map_err(gix::Error::from_error)?;
-        if self.require_present(id).is_ok() {
-            return Ok(id);
+        let id = gix::objs::compute_hash(self.inner.object_hash(), ObjectKind::Tree, &data)?;
+        if plan.seen.insert(id) {
+            plan.objects.push((id, data));
         }
-
-        let mut compressed = gix::zlib::stream::deflate::Write::new(
-            Vec::with_capacity(data.len() / 2 + 64),
-            gix::zlib::Compression::BEST_SPEED,
-        );
-        compressed.write_all(header.as_bytes())?;
-        compressed.write_all(data)?;
-        compressed.flush()?;
-        let compressed = compressed.into_inner();
-
-        let objects = self.inner.common_dir().join("objects");
-        if !std::fs::symlink_metadata(&objects)?.is_dir() {
-            return Err(Error::UnsupportedCapability(
-                "object directory is not a directory",
-            ));
-        }
-        let hex = id.to_hex().to_string();
-        let fanout = objects.join(&hex[..2]);
-        match std::fs::create_dir(&fanout) {
-            Ok(()) => sync_parent(&fanout)?,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if !std::fs::symlink_metadata(&fanout)?.is_dir() {
-                    return Err(Error::UnsupportedCapability(
-                        "object fan-out entry is not a directory",
-                    ));
-                }
-            }
-            Err(error) => return Err(error.into()),
-        }
-        let destination = fanout.join(&hex[2..]);
-        let mut temp = TempObject::create(&fanout)?;
-        let file = temp.file.as_mut().ok_or(Error::Injected("temp reused"))?;
-        file.write_all(&compressed)?;
-        file.sync_all()?;
-        make_read_only(file)?;
-        drop(temp.file.take());
-        match std::fs::hard_link(&temp.path, &destination) {
-            Ok(()) => {}
-            // Another writer stored the same content first; never overwrite.
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            // Filesystems without hard links: rename, unless already present.
-            Err(_) => match std::fs::symlink_metadata(&destination) {
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    std::fs::rename(&temp.path, &destination)?;
-                    temp.renamed = true;
-                }
-                Err(error) => return Err(error.into()),
-            },
-        }
-        drop(temp);
-        sync_parent(&destination)?;
         Ok(id)
     }
+}
+
+/// Tree objects computed from the index, bottom-up, not yet written.
+struct TreePlan {
+    root: ObjectId,
+    objects: Vec<(ObjectId, Vec<u8>)>,
+    seen: HashSet<ObjectId>,
+}
+
+/// Entries `write_tree_from_index` cannot represent are refused explicitly.
+fn check_index_entry(entry: &gix::index::Entry, hash: gix::hash::Kind) -> Result<(), Error> {
+    use gix::index::entry::{Flags, Mode};
+    if entry.flags.contains(Flags::INTENT_TO_ADD) {
+        return Err(Error::UnsupportedCapability("intent-to-add index entries"));
+    }
+    match entry.mode {
+        Mode::FILE | Mode::FILE_EXECUTABLE | Mode::SYMLINK => {}
+        Mode::COMMIT => {
+            return Err(Error::UnsupportedCapability(
+                "gitlink (submodule) index entries",
+            ));
+        }
+        _ => {
+            return Err(Error::UnsupportedCapability(
+                "sparse directory index entries",
+            ));
+        }
+    }
+    if entry.id.kind() != hash {
+        return Err(Error::UnsupportedCapability(
+            "object ID of a different hash algorithm",
+        ));
+    }
+    Ok(())
 }
 
 struct TreeItem {
@@ -401,69 +401,6 @@ impl TreeItem {
         let suffix = (self.mode == 0o040000).then_some(b'/');
         self.name.iter().copied().chain(suffix)
     }
-}
-
-/// A uniquely named temporary object file, removed on drop unless renamed.
-struct TempObject {
-    path: std::path::PathBuf,
-    file: Option<std::fs::File>,
-    renamed: bool,
-}
-
-impl TempObject {
-    fn create(directory: &Path) -> Result<Self, Error> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.subsec_nanos())
-            .unwrap_or_default();
-        for _ in 0..100 {
-            let path = directory.join(format!(
-                "tmp_obj_rgit_{}_{}_{nanos}",
-                std::process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            ));
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(file) => {
-                    return Ok(Self {
-                        path,
-                        file: Some(file),
-                        renamed: false,
-                    });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(Error::AlreadyExists(directory.to_owned()))
-    }
-}
-
-impl Drop for TempObject {
-    fn drop(&mut self) {
-        drop(self.file.take());
-        if !self.renamed {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
-fn make_read_only(file: &std::fs::File) -> Result<(), Error> {
-    let mut permissions = file.metadata()?.permissions();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        permissions.set_mode(0o444);
-    }
-    #[cfg(not(unix))]
-    permissions.set_readonly(true);
-    file.set_permissions(permissions)?;
-    Ok(())
 }
 
 /// Refuse identities C Git could not parse back: `<`, `>`, newline or NUL in
