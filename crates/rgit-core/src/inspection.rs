@@ -1,4 +1,5 @@
 use crate::{BStr, Error, ObjectId, ObjectKind, Repository};
+use std::io::Read;
 
 /// A persisted index entry, including conflict stages and intentional opt-outs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +27,7 @@ impl Repository {
             match object.kind {
                 ObjectKind::Tree => {
                     let tree_index = self.inner.index_from_tree(&id)?;
+                    validate_entries(&tree_index)?;
                     return entries(&tree_index);
                 }
                 ObjectKind::Commit => id = object.try_to_commit_ref()?.tree(),
@@ -42,24 +44,88 @@ impl Repository {
     }
 
     pub(crate) fn read_index(&self) -> Result<gix::index::File, Error> {
-        match std::fs::metadata(self.inner.index_path()) {
+        let path = self.inner.index_path();
+        let mut file = match std::fs::File::open(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(gix::index::File::from_state(
                     gix::index::State::new(self.inner.object_hash()),
-                    self.inner.index_path(),
+                    path,
                 ));
             }
             Err(error) => return Err(error.into()),
-            Ok(_) => {}
+            Ok(file) => file,
+        };
+        let timestamp = file.metadata()?.modified()?.into();
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)?;
+        // Decode the bytes we verify, without File::at() transparently loading
+        // and dissolving a split index. Never let index.skipHash disable checking
+        // a present checksum. An all-zero trailer is Git's documented omission.
+        let hash = self.inner.object_hash();
+        let (state, checksum) = gix::index::State::from_bytes(
+            &data,
+            timestamp,
+            hash,
+            gix::index::decode::Options::default(),
+        )?;
+        if let Some(checksum) = checksum {
+            let mut hasher = gix::hash::hasher(hash);
+            hasher.update(&data[..data.len() - hash.len_in_bytes()]);
+            hasher
+                .try_finalize()
+                .map_err(gix::Error::from_error)?
+                .verify(&checksum)?;
         }
-        let index = self.inner.open_index()?;
-        index.verify_integrity()?;
-        index.verify_entries()?;
-        if index.link().is_some() {
+        if state.link().is_some() {
             return Err(Error::UnsupportedCapability("split index"));
         }
-        Ok(index)
+        if state.is_sparse() {
+            return Err(Error::UnsupportedCapability("sparse index"));
+        }
+        validate_entries(&state)?;
+        Ok(gix::index::File::from_state(state, path))
     }
+}
+
+fn validate_entries(index: &gix::index::State) -> Result<(), Error> {
+    index.verify_entries()?;
+    let mut paths = std::collections::BTreeMap::<&[u8], u8>::new();
+    for entry in index.entries() {
+        let path = entry.path(index);
+        validate_path(path)?;
+        let stage = 1 << entry.stage_raw();
+        let prior = paths.entry(path).or_default();
+        if *prior != 0 && (*prior | stage) & 1 != 0 {
+            return Err(
+                gix::error::corruption("Index path mixes stage zero and conflict stages")
+                    .corrupted_error()
+                    .into(),
+            );
+        }
+        *prior |= stage;
+        if !matches!(entry.mode.bits(), 0o100644 | 0o100755 | 0o120000 | 0o160000) {
+            return Err(gix::error::corruption("Invalid index entry mode")
+                .corrupted_error()
+                .into());
+        }
+    }
+    // A file and its child may coexist in different conflict stages, but never
+    // within one stage (or with an unconflicted file/directory prefix).
+    for (path, stages) in &paths {
+        for (offset, byte) in path.iter().enumerate() {
+            if *byte == b'/'
+                && let Some(parent_stages) = paths.get(&path[..offset])
+                && (stages & parent_stages != 0 || (stages | parent_stages) & 1 != 0)
+            {
+                return Err(gix::error::corruption(
+                    "Index contains a file/directory conflict in one stage",
+                )
+                .corrupted_error()
+                .into());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn entries(index: &gix::index::State) -> Result<Vec<IndexEntry>, Error> {
@@ -92,13 +158,18 @@ pub(crate) fn validate_path(path: &[u8]) -> Result<(), Error> {
     if path.is_empty()
         || path.contains(&0)
         || path.split(|&byte| byte == b'/').any(|part| {
-            part.is_empty() || part == b"." || part == b".." || part.eq_ignore_ascii_case(b".git")
+            gix::validate::path::component(
+                BStr::new(part),
+                None,
+                gix::validate::path::component::Options {
+                    protect_windows: cfg!(windows),
+                    protect_hfs: cfg!(target_os = "macos"),
+                    protect_ntfs: cfg!(windows),
+                },
+            )
+            .is_err()
         })
     {
-        return Err(Error::InvalidPath(path.to_vec()));
-    }
-    #[cfg(windows)]
-    if path.contains(&b'\\') || path.contains(&b':') {
         return Err(Error::InvalidPath(path.to_vec()));
     }
     Ok(())
