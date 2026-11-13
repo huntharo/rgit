@@ -34,6 +34,12 @@ impl Repository {
         let head_id = self.inner.head_tree_id_or_empty()?.detach();
         let head = self.tree_entries(crate::BStr::new(head_id.to_string().as_bytes()))?;
         let staged = staged_changes(&head, &entries);
+        let entries_by_path: BTreeMap<_, _> = entries
+            .iter()
+            .filter(|entry| entry.stage == 0)
+            .map(|entry| (entry.path.as_slice(), entry))
+            .collect();
+        let mut filters = None;
         let mut result: BTreeMap<Vec<u8>, StatusEntry> = staged
             .into_iter()
             .map(|(path, code)| {
@@ -116,7 +122,7 @@ impl Repository {
                 untracked_paths.insert(path);
                 continue;
             }
-            let code = match summary {
+            let mut code = match summary {
                 Summary::Removed => b'D',
                 Summary::TypeChange => b'T',
                 Summary::Modified => b'M',
@@ -124,6 +130,16 @@ impl Repository {
                 Summary::Conflict => continue,
                 _ => return Err(Error::UnsupportedCapability("worktree rewrite status")),
             };
+            if matches!(code, b'M' | b'T') {
+                let indexed = entries_by_path
+                    .get(path.as_slice())
+                    .ok_or(Error::UnsupportedCapability("status without index entry"))?;
+                let Some(canonical_code) = self.canonical_worktree_change(indexed, &mut filters)?
+                else {
+                    continue;
+                };
+                code = canonical_code;
+            }
             let entry = result.entry(path.clone()).or_insert(StatusEntry {
                 path,
                 index: b' ',

@@ -18,6 +18,11 @@ struct Version {
     data: Vec<u8>,
 }
 
+type WorktreeFilters<'repo> = Option<(
+    gix::filter::Pipeline<'repo>,
+    gix::worktree::IndexPersistedOrInMemory,
+)>;
+
 impl Repository {
     /// Compare HEAD to the index (`cached`) or the index to tracked worktree files.
     /// Rename detection is disabled; conflicts are reported once with code U.
@@ -36,38 +41,12 @@ impl Repository {
                 .collect()
         } else {
             self.diff_worktree_preflight(&index)?;
-            let by_path: BTreeMap<_, _> = index
-                .iter()
-                .filter(|entry| entry.stage == 0)
-                .map(|entry| (entry.path.as_slice(), entry))
-                .collect();
-            let mut filters = None;
             let mut changes = BTreeMap::new();
             for candidate in self.status(UntrackedMode::None)? {
                 if candidate.worktree == b' ' || conflicts.contains(&candidate.path) {
                     continue;
                 }
-                let entry = by_path
-                    .get(candidate.path.as_slice())
-                    .copied()
-                    .ok_or(Error::UnsupportedCapability("diff without index entry"))?;
-                let old = if entry.intent_to_add {
-                    None
-                } else {
-                    Some(self.diff_blob(entry)?)
-                };
-                let new = self.diff_worktree_version(entry, &mut filters)?;
-                // Status can conservatively report M on a size mismatch before
-                // applying clean conversions. Compare canonical bytes here too,
-                // so name-only/exit-code agree with patch output for EOL/ident.
-                let code = match (old.as_ref(), new.as_ref()) {
-                    (None, Some(_)) => b'A',
-                    (Some(_), None) => b'D',
-                    (Some(a), Some(b)) if a.mode & 0o170000 != b.mode & 0o170000 => b'T',
-                    (Some(a), Some(b)) if a.mode != b.mode || a.data != b.data => b'M',
-                    _ => continue,
-                };
-                changes.insert(candidate.path, code);
+                changes.insert(candidate.path, candidate.worktree);
             }
             changes
         };
@@ -166,13 +145,32 @@ impl Repository {
         })
     }
 
+    /// Resolve conservative stat-size candidates using the same canonical bytes
+    /// as patches. In particular, EOL and ident expansion can change disk size.
+    pub(crate) fn canonical_worktree_change<'repo>(
+        &'repo self,
+        entry: &IndexEntry,
+        filters: &mut WorktreeFilters<'repo>,
+    ) -> Result<Option<u8>, Error> {
+        let old = if entry.intent_to_add {
+            None
+        } else {
+            Some(self.diff_blob(entry)?)
+        };
+        let new = self.diff_worktree_version(entry, filters)?;
+        Ok(match (old.as_ref(), new.as_ref()) {
+            (None, Some(_)) => Some(b'A'),
+            (Some(_), None) => Some(b'D'),
+            (Some(a), Some(b)) if a.mode & 0o170000 != b.mode & 0o170000 => Some(b'T'),
+            (Some(a), Some(b)) if a.mode != b.mode || a.data != b.data => Some(b'M'),
+            _ => None,
+        })
+    }
+
     fn diff_worktree_version<'repo>(
         &'repo self,
         entry: &IndexEntry,
-        filters: &mut Option<(
-            gix::filter::Pipeline<'repo>,
-            gix::worktree::IndexPersistedOrInMemory,
-        )>,
+        filters: &mut WorktreeFilters<'repo>,
     ) -> Result<Option<Version>, Error> {
         let root = self.work_dir().ok_or(Error::UnsupportedCapability(
             "worktree diff in bare repositories",
