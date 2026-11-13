@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Output, Stdio};
 
-use rgit_core::{DiffEntry, Repository};
+use rgit_core::{DiffEntry, Repository, StatusEntry, UntrackedMode};
 use tempfile::{TempDir, tempdir};
 
 #[allow(dead_code)]
@@ -260,15 +260,39 @@ fn builtin_eol_and_ident_filters_are_read_only_and_apply() -> Result {
             "real checkout baseline"
         );
         assert!(names(root, false)?.is_empty());
+        assert!(
+            repo.status(UntrackedMode::None)?.is_empty(),
+            "real checkout status"
+        );
         fs::write(root.join("file.txt"), b"$Id: expanded $\r\nold\r\n")?;
+        assert!(
+            repo.status(UntrackedMode::None)?.is_empty(),
+            "equivalent expanded ident/CRLF status"
+        );
         assert_eq!(
             repo.diff_entries(false)?,
             names(root, false)?,
             "normalized status"
         );
         fs::write(root.join("file.txt"), b"$Id: expanded $\r\nnew\r\n")?;
+        assert_eq!(
+            repo.status(UntrackedMode::None)?,
+            vec![StatusEntry {
+                path: b"file.txt".to_vec(),
+                index: b' ',
+                worktree: b'M',
+            }]
+        );
         if cached {
             git(root, &["add", "."])?;
+            assert_eq!(
+                repo.status(UntrackedMode::None)?,
+                vec![StatusEntry {
+                    path: b"file.txt".to_vec(),
+                    index: b'M',
+                    worktree: b' ',
+                }]
+            );
         }
         let before = snapshot(&root.join(".git"))?;
         let patch = repo.diff_patch(cached)?;
