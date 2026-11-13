@@ -1,5 +1,7 @@
 //! Test-only fault injection. Compiled to a no-op unless the `failpoints`
-//! feature is enabled; release binaries never read these variables.
+//! feature is enabled AND debug assertions are on, so an optimized release
+//! build never reads these variables even if the feature is enabled by
+//! accident.
 //!
 //! `RGIT_FAILPOINT=<name>` aborts the process at that point (simulated crash:
 //! no destructors, locks and temporary files stay behind).
@@ -12,13 +14,13 @@
 
 use crate::Error;
 
-#[cfg(not(feature = "failpoints"))]
+#[cfg(not(all(feature = "failpoints", debug_assertions)))]
 #[inline(always)]
 pub(crate) fn hit(_name: &'static str) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(feature = "failpoints")]
+#[cfg(all(feature = "failpoints", debug_assertions))]
 pub(crate) fn hit(name: &'static str) -> Result<(), Error> {
     let Some(spec) = std::env::var_os("RGIT_FAILPOINT") else {
         return Ok(());
