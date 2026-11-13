@@ -1,13 +1,13 @@
 # 0003: First recoverable local write lifecycle (G1 contract)
 
-Status: proposed for the G1 init/add/commit slice (Linear PWR-178, PWR-175,
+Status: accepted for the G1 init/add/commit slice (Linear PWR-178, PWR-175,
 PWR-174). Write support is experimental and unreleased.
 
 ## Scope
 
 `init`, `add`, `commit` and compare-and-swap reference publication for
-SHA-1 and SHA-256 repositories that use standard files refs and a version 2-4
-index without split/sparse extensions. Every other repository shape is refused
+SHA-1 and SHA-256 repositories that use standard files refs and a version 2
+or 3 index without split/sparse extensions. Every other repository shape is refused
 with a typed error before the first mutation: reftable, split or sparse
 indexes, `extensions.compatobjectformat`, in-progress merge/rebase/cherry-pick
 state, submodule (gitlink) staging, and any path whose attributes or config
@@ -38,7 +38,14 @@ reset variants and linked-worktree add/remove are later G1 issues.
    directory. An operation never modifies another worktree's HEAD or index.
 5. **Recovery.** After an interruption at any point, a fresh process observes
    either the complete previous state or the complete new state for each
-   published file; unreferenced objects may remain and are harmless.
+   published file; unreferenced objects may remain and are harmless. Locks the
+   interrupted process held may remain and refuse later writers until removed
+   (see the table below). An interrupted `init` leaves no `.git`, only its
+   private `.git.rgit-init-*` (or `.<name>.rgit-init-*` for bare) directory,
+   which a later `init` neither consumes nor deletes. rgit cannot prove a lock
+   or temporary directory stale and never removes one it did not create in the
+   same process; removal is a manual step after confirming no writer is
+   running. Handled errors (no crash) remove their own locks and temporaries.
 
 Durability: on Unix, file content and directory entries are synced before
 publication. On Windows, std offers no directory sync; guarantees there are
@@ -58,7 +65,7 @@ Consequences, all observable by a fresh process:
 | Interruption or failure | Reference | Reflog | Reported |
 | --- | --- | --- | --- |
 | Before the rename (including refusal, CAS conflict, held lock) | old value | unchanged | error; state unchanged except possible unreferenced objects |
-| Crash after the rename, before the appends | new value | entry missing | process died; no false entry is ever written |
+| Crash after the rename, before the appends | new value | entry missing | process died; no false entry is ever written. For a commit on a branch, `HEAD.lock` (held across the branch rename so `HEAD` cannot be re-pointed mid-commit) remains and refuses later writers until removed |
 | Append fails after the rename | new value | entry missing (or present in one log but not the other) | `ReflogAppendError`: the reference *was* updated; CLI exits 128 with that diagnostic |
 | Directory sync fails after the rename | new value visible | not appended | I/O error; durability of the new value is unknown |
 

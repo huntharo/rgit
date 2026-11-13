@@ -1,8 +1,10 @@
 # Compatibility contract
 
-This is a read-only foundation, not a replacement for daily Git workflows.
-Worktree status and diffs compare content without refreshing the on-disk index.
-Repository writes, network access and external execution are not implemented.
+This is an experimental foundation, not a replacement for daily Git workflows.
+Inspection commands never write. `init`, `add` and `commit` are an experimental
+local write slice (see [Local writes](#local-writes-experimental) and
+[decision 0003](decisions/0003-local-write-lifecycle.md)); every other mutation,
+network access and external execution are not implemented.
 
 ## Supported commands
 
@@ -23,6 +25,9 @@ Repository writes, network access and external execution are not implemented.
 | `rgit -C <directory> merge-base [-a/--all] <left> <right>` | Best common ancestor(s); no base exits 1 with no output. Multiple bases are sorted by object ID; plain mode returns one of them. |
 | `rgit -C <directory> merge-base --is-ancestor <left> <right>` | No stdout; exits 0 if left is an ancestor of right, 1 otherwise. Errors exit 128. |
 | `rgit -C <directory> rev-list --count <revision>` | Count unique reachable commits from one revision, including the tip. |
+| `rgit -C <directory> init [-q] [--bare] [-b/--initial-branch <name>] [--object-format sha1\|sha256] [<directory>]` | Create a repository; the target directory is created if absent. Never reinitializes: an existing repository exits 128 unchanged. |
+| `rgit -C <directory> add [--] <path>...` | Stage literal files or directories relative to `-C` (`.` for all). No pathspec magic or globbing. Silent on success. |
+| `rgit -C <directory> commit [-q] -m <message>... [--allow-empty]` | Commit the index on HEAD's branch, an unborn branch or a detached HEAD. Prints `[<branch> (root-commit) <abbrev>] <subject>`. |
 
 `-C` accepts one directory. Each rev-parse invocation accepts one query. Other
 commands/options fail explicitly. `cat-file -p`, batch mode, show-ref filtering,
@@ -37,8 +42,8 @@ checksum omission is accepted. Symlink and special index files are refused.
 Missing indexes are
 empty. Split and sparse indexes are explicitly unsupported. Trees and index
 paths retain byte ordering and conflict stages; malformed or unsafe paths fail.
-These operations never refresh or write an index, store a blob, or acquire an
-index lock. Tests snapshot repository and worktree bytes around inspection;
+Status, diff and listing never refresh or write an index, store a blob, or
+acquire an index lock. Tests snapshot repository and worktree bytes around inspection;
 those snapshots do not detect same-byte rewrites or metadata-only touches.
 
 Status deliberately compares tracked file content even when stat metadata and
@@ -78,6 +83,90 @@ refuse a repository that Git accepts and makes `-uno` traverse directories too.
 Preflight is not a race-free filesystem sandbox: a concurrent writer can replace
 paths between checks and reads. Race-resistant file access remains a requirement
 before claiming safe inspection of actively hostile worktrees.
+
+## Local writes (experimental)
+
+`init`, `add` and `commit` follow decision 0003: objects are written and synced
+before any index or reference names them; the index, `HEAD` and loose refs are
+replaced only through an exclusively created `<file>.lock`, synced and renamed;
+reference updates compare the expected value while holding the lock. A held
+lock refuses the operation (exit 128, naming the lock) and is never removed by
+rgit. On Unix, files and directory entries are synced; Windows has no directory
+sync, so its guarantees are atomic visibility only. Hooks never run; signing,
+`commit.gpgSign` and `i18n.commitEncoding` other than UTF-8 are refused.
+
+Every refusal below happens before the first object or index write:
+
+- Repositories: bare repositories for `add`/`commit`; reftable and other
+  unsupported extensions (at discovery); index version 4, `index.version` other
+  than 2/3, `feature.manyFiles`, split index, sparse checkout or sparse index;
+  `core.symlinks=false`; in-progress merge, cherry-pick, revert, rebase or
+  sequencer state.
+- Paths: globs and `:` magic, absolute paths and paths leaving the worktree,
+  pathspecs matching nothing, explicitly named ignored paths and any pathspec
+  under an ignored directory (C Git stages tracked content there but exits 1;
+  rgit refuses the whole call), symlinked parents, explicitly named special
+  files (FIFOs/sockets found while walking a directory are skipped), nested
+  repositories and gitlinks, skip-worktree and assume-unchanged entries,
+  conflicted entries, and case-fold or Unicode-normalization spelling
+  collisions when `core.ignorecase`/`core.precomposeunicode` is set.
+- Content: any `filter` or `working-tree-encoding` attribute; `ident` when the
+  content contains `$Id`; text/EOL/`core.autocrlf` settings that would convert
+  the content, and `core.safecrlf=true` content it would reject. Content whose
+  conversion is the identity (for example `text=auto` with LF only) is staged
+  verbatim.
+- Commit: unmerged or intent-to-add entries, gitlinks, a HEAD outside
+  `refs/heads/`, symbolic or symlinked branch refs, identities containing `<`,
+  `>`, newline or NUL, a NUL in the message, and an unchanged tree without
+  `--allow-empty`.
+
+Differences from C Git:
+
+- `init` refuses an existing repository instead of reinitializing it. Its
+  config mirrors C Git's probes (filemode, symlinks, ignorecase,
+  precomposeunicode) but writes no hooks, description or `info/exclude`.
+  The default branch is `master` because global `init.defaultBranch` is not read.
+- `add` hashes every file under the pathspec instead of trusting stat data and
+  buffers whole files. Racily clean entries are smudged as C Git does.
+  Resolve-undo, untracked-cache and fsmonitor extensions are dropped when the
+  index is rewritten; `index.skipHash` is ignored and a checksum is always
+  written. No `safecrlf` warnings are printed.
+- `commit` writes identities verbatim (no C Git whitespace trimming), never
+  runs hooks or editors, cannot amend, and refuses during merge, rebase or
+  sequencer operations. Without `GIT_*_DATE` the timestamp is the current time
+  with a `+0000` offset (no local time zone). Identity comes from
+  `GIT_{AUTHOR,COMMITTER}_{NAME,EMAIL}` or repository-local `user.*` only.
+  Nothing to commit exits 128, not 1. `commit` reads the index without taking
+  `index.lock`, so it commits the index snapshot it read; a concurrent `add`
+  published after that read is not included.
+- Objects are always written loose (zlib level 1); there is no packing or
+  auto-maintenance. Reflog lines are appended after the reference is
+  published, whereas C Git appends before; see decision 0003 for the full
+  failure table. A reflog append failure after publication exits 128 with a
+  diagnostic stating that the reference was updated.
+- Ignore and attribute rules come from the worktree, `info/` and
+  repository-local config only, consistent with isolated discovery.
+
+Recovery after interruption: a fresh process sees each of the index, `HEAD`
+and the branch ref either completely old or completely new. Abrupt termination
+bypasses cleanup, so a crash can leave the lock(s) the process held; they
+refuse later rgit and C Git writers until removed. For a commit on a branch
+interrupted after the branch rename, that is `HEAD.lock` (the branch is
+already published and its own lock is gone). An interrupted `init` leaves no
+`.git`, only one private `.git.rgit-init-*` (bare: `.<name>.rgit-init-*`)
+directory; a later `init` succeeds and leaves that directory untouched, so it
+appears as untracked until deleted. rgit has no proof of staleness and never
+deletes a lock or temporary directory it did not create in the same process:
+remove one manually only after confirming that no rgit or Git process is still
+running against the repository. Errors handled without a crash clean up their
+own locks and temporary directories. A write error is not proof that nothing
+changed: errors after a rename mean the new value is already visible.
+
+Native macOS APFS tests extend the live and final-unmap shared-mapping gates to
+the write path: bytes written through a closed-descriptor `MAP_SHARED` mapping,
+with mtime and ctime preserved, are staged and committed by a fresh `rgit add`
+and `rgit commit`. Same-second edits after `add` remain visible to `status` and
+the next `add`. Crash durability on power loss is not tested.
 
 ## Commit ancestry
 
@@ -139,8 +228,10 @@ does not bound total memory or delta work.
 ## Required next gates
 
 1. Consumer command inventory and full machine-readable compatibility matrix.
-2. Independent DAG, index/tree and acknowledged-ref models.
-3. Reftable interoperability, corruption handling and recovery contracts.
+2. Remaining G1 workflows: branch/switch, documented reset variants and
+   linked-worktree add/remove, each with the lifecycle oracle.
+3. Reftable interoperability, corruption handling and recovery contracts;
+   reftable is required before any write-enabled release.
 4. Preserve native live writable-mmap and fresh-process final-unmap APFS
    regressions, then extend the correctness gate to each future write-enabled
    workflow; no withdrawn broad ctime workaround.
