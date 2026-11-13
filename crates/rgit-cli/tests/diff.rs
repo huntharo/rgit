@@ -328,8 +328,7 @@ fn symlinks_type_changes_and_non_utf8_paths_apply() -> Result {
         let raw_supported = match fs::write(&raw, b"old \xff\n") {
             Ok(()) => true,
             Err(error)
-                if error.raw_os_error() == Some(1)
-                    || error.kind() == std::io::ErrorKind::InvalidInput =>
+                if cfg!(target_os = "macos") && matches!(error.raw_os_error(), Some(1 | 92)) =>
             {
                 eprintln!("SKIP non-UTF-8 worktree path: {error}");
                 false
