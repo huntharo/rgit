@@ -17,12 +17,43 @@ establish APFS mmap change detection.
 | `rgit -C <directory> cat-file -s <object>` | Uncompressed object byte length. |
 | `rgit -C <directory> cat-file <type> <object>` | Raw bytes for blob/tree/commit/tag, with bounded tag/commit peeling to the requested type. |
 | `rgit -C <directory> show-ref` | Sorted refs and unpeeled object IDs; empty list exits 1. Collect all refs before output so corruption cannot look like partial success. |
+| `rgit -C <directory> merge-base [-a/--all] <left> <right>` | Best common ancestor(s); no base exits 1 with no output. Multiple bases are sorted by object ID; plain mode returns one of them. |
+| `rgit -C <directory> merge-base --is-ancestor <left> <right>` | No stdout; exits 0 if left is an ancestor of right, 1 otherwise. Errors exit 128. |
+| `rgit -C <directory> rev-list --count <revision>` | Count unique reachable commits from one revision, including the tip. |
 
 `-C` accepts one directory. Each rev-parse invocation accepts one query. Other
 commands/options fail explicitly. `cat-file -p`, batch mode, show-ref filtering,
 JSON output and full Git revision/config compatibility are not implemented.
 Argument errors exit 2; operation errors exit 128. Diagnostic prose differs from
 C Git. A closed output pipe ends without a panic.
+
+## Commit ancestry
+
+Graph queries peel annotated tags to commits, load reachable parent edges and
+treat declared shallow commits as roots, even if their parents exist locally.
+Missing or malformed history is an error with no partial stdout. The graph is
+validated iteratively, so cycles fail rather than loop and deep ancestry does
+not consume the call stack. Dates and commit-graph generation metadata do not
+participate in ancestry decisions. Graph data is read from object storage.
+
+The CLI uses per-query limits of 1,000,000 commits and 4,000,000 parent links;
+library callers can supply `GraphLimits`. Shallow-file reads are separately
+capped at 66 bytes per permitted commit and one record per permitted commit.
+These bounds cover retained graph structures, not total RSS or underlying
+object/pack/delta decoding. Queries currently load the whole reachable graph,
+so even a simple query can cost O(V + E) and may reject unrelated corruption in
+that reachable history rather than stopping at the first sufficient answer.
+
+Only two-input merge-base and one-input rev-list count are supported. Octopus,
+independent/fork-point queries, revision ranges, filtered walks, commit listing,
+replacement refs and nonempty legacy graft files are not implemented. Repositories
+containing replacement refs or grafts are refused for graph queries, including
+when a Git configuration would disable them. A plain merge-base may choose a
+different valid best base than C Git. The independent oracle compares sets, not
+an unspecified traversal order.
+
+Roots and shallow boundaries are loaded once per query. There is no claim of an
+atomic snapshot against concurrent repository mutation or object pruning.
 
 ## Repository and platform boundaries
 
