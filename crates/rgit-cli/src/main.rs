@@ -158,6 +158,15 @@ fn main() -> ExitCode {
             {
                 return ExitCode::SUCCESS;
             }
+            // A reflog failure happens after the reference was published; name
+            // the underlying cause so the partial success is diagnosable.
+            if let Some(rgit_core::Error::Other(inner)) = error.downcast_ref::<rgit_core::Error>()
+                && let Some(reflog) = inner.downcast_ref::<rgit_core::write::ReflogAppendError>()
+                && let Some(cause) = std::error::Error::source(reflog)
+            {
+                eprintln!("fatal: {reflog}: {cause}");
+                return ExitCode::from(128);
+            }
             eprintln!("fatal: {error}");
             ExitCode::from(128)
         }

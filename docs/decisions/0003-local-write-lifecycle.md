@@ -42,8 +42,31 @@ reset variants and linked-worktree add/remove are later G1 issues.
 
 Durability: on Unix, file content and directory entries are synced before
 publication. On Windows, std offers no directory sync; guarantees there are
-visibility/atomic-rename only. Loose reflog appends follow the ref rename and
-are not part of the atomic publication.
+visibility/atomic-rename only.
+
+## Reference and reflog ordering
+
+A reference update is not a transaction across the reference and its reflogs.
+The order is: validate the name and the new object; take `<ref>.lock` (and,
+for a commit on a branch, `HEAD.lock`); read and compare the current value
+under the lock; write and sync the lock; rename it over the reference; sync the
+directory; then append one line to each applicable reflog (the reference's log
+and, when this worktree's `HEAD` names it, `HEAD`'s log), each append synced.
+
+Consequences, all observable by a fresh process:
+
+| Interruption or failure | Reference | Reflog | Reported |
+| --- | --- | --- | --- |
+| Before the rename (including refusal, CAS conflict, held lock) | old value | unchanged | error; state unchanged except possible unreferenced objects |
+| Crash after the rename, before the appends | new value | entry missing | process died; no false entry is ever written |
+| Append fails after the rename | new value | entry missing (or present in one log but not the other) | `ReflogAppendError`: the reference *was* updated; CLI exits 128 with that diagnostic |
+| Directory sync fails after the rename | new value visible | not appended | I/O error; durability of the new value is unknown |
+
+C Git appends the reflog before renaming the reference, so its failure modes
+differ: it can record an entry for an update that never became visible. rgit
+prefers a possibly missing entry to a false one. A caller (or test oracle)
+must never treat an error from a write operation as proof that the repository
+is unchanged; only the "before the rename" rows guarantee that.
 
 ## Ownership and frozen API
 
