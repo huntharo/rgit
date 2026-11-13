@@ -106,7 +106,7 @@ fn init_bare(
             if fs::read_dir(directory)?.next().is_some() {
                 return Err(Error::AlreadyExists(directory.to_owned()));
             }
-            populate_in_place(directory, options, head_ref)?;
+            populate_in_place(directory, options, head_ref, true, false)?;
             return finish(directory, directory);
         }
         Ok(_) => return Err(Error::AlreadyExists(directory.to_owned())),
@@ -140,12 +140,20 @@ fn finish(directory: &Path, git_dir: &Path) -> Result<Repository, Error> {
     Repository::discover(directory).map_err(|source| published(git_dir, "opening it", source))
 }
 
-/// Populate an existing empty directory as a bare repository without
-/// replacing it. Everything except `HEAD` is written and synced first; until
-/// `HEAD` exists the directory is not a repository for C Git or rgit. On a
-/// failure before `HEAD` is published, the entries this call created are
-/// removed (best effort) and the original error is returned.
-fn populate_in_place(root: &Path, options: &InitOptions, head_ref: &[u8]) -> Result<(), Error> {
+/// Populate an empty Git directory without replacing it: an existing empty
+/// bare target, or a directory this call created exclusively
+/// (`root_created`). Everything except `HEAD` is written and synced first;
+/// until `HEAD` exists the directory is not a repository for C Git or rgit.
+/// On a failure before `HEAD` is published, the entries this call created
+/// (and an exclusively created root) are removed, best effort, and the
+/// original error is returned.
+fn populate_in_place(
+    root: &Path,
+    options: &InitOptions,
+    head_ref: &[u8],
+    bare: bool,
+    root_created: bool,
+) -> Result<(), Error> {
     let mut created: Vec<PathBuf> = Vec::new();
     let mut head_temporary = None;
     let prepared = (|| -> Result<PathBuf, Error> {
@@ -154,7 +162,7 @@ fn populate_in_place(root: &Path, options: &InitOptions, head_ref: &[u8]) -> Res
             fs::create_dir(&path)?;
             created.push(path);
         }
-        let config = config_bytes(root, options, true)?;
+        let config = config_bytes(root, options, bare)?;
         let config_path = root.join("config");
         write_synced(&config_path, &config)?;
         created.push(config_path);
@@ -187,6 +195,10 @@ fn populate_in_place(root: &Path, options: &InitOptions, head_ref: &[u8]) -> Res
                     fs::remove_file(path)
                 };
             }
+            if root_created {
+                // Only ever an empty directory this call created exclusively.
+                let _ = fs::remove_dir(root);
+            }
             return Err(error);
         }
     };
@@ -201,22 +213,18 @@ fn populate_in_place(root: &Path, options: &InitOptions, head_ref: &[u8]) -> Res
 /// Publish the complete, synced `temporary` as `path` without ever replacing
 /// an existing entry. Uses a hard link (which fails if `path` exists) and
 /// returns `true`, leaving `temporary` for the caller to remove. Where hard
-/// links are unsupported it renames instead, only while `path` is still
-/// absent, and returns `false` because `temporary` no longer exists.
+/// links fail it uses an atomic no-replace rename and returns `false`
+/// (`temporary` is gone); where that is unsupported too, it refuses.
 fn publish_no_replace(temporary: &Path, path: &Path) -> Result<bool, Error> {
     match fs::hard_link(temporary, path) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             Err(Error::AlreadyExists(path.to_owned()))
         }
-        Err(link_error) => match fs::symlink_metadata(path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::rename(temporary, path)?;
-                Ok(false)
-            }
-            Ok(_) => Err(Error::AlreadyExists(path.to_owned())),
-            Err(_) => Err(link_error.into()),
-        },
+        Err(_) => {
+            super::rename_noreplace(temporary, path)?;
+            Ok(false)
+        }
     }
 }
 
@@ -290,6 +298,12 @@ fn create_directories(directory: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// Assemble the Git directory in `temporary` and publish it at `target` with
+/// an atomic no-replace rename: an entry that appears at `target` meanwhile,
+/// even an empty directory, makes it fail with [`Error::AlreadyExists`] and
+/// is left untouched. Where no such rename exists (for example Windows), the
+/// private directory is discarded and `target` is created exclusively and
+/// populated in place with `HEAD` last; there is no check-then-rename.
 fn publish_git_dir(
     temporary: &Path,
     target: &Path,
@@ -301,38 +315,30 @@ fn publish_git_dir(
     let result = (|| {
         assemble(temporary, options, head_ref, bare)?;
         super::failpoint("init.before-publish")?;
-        if !bare {
-            // Narrow the window in which a concurrent writer created `.git`.
-            refuse_existing(target)?;
-        }
-        rename_directory(temporary, target)?;
-        Ok(())
+        super::rename_noreplace(temporary, target)
     })();
     match result {
         Ok(()) => super::sync_parent(target)
             .map_err(|source| published(target, "syncing its parent directory", source)),
+        Err(Error::UnsupportedCapability(_)) => {
+            fs::remove_dir_all(temporary)?;
+            create_exclusively(target)?;
+            populate_in_place(target, options, head_ref, bare, true)
+        }
         Err(error) => {
+            // Only our private directory; never the entry at `target`.
             let _ = fs::remove_dir_all(temporary);
             Err(error)
         }
     }
 }
 
-fn rename_directory(from: &Path, to: &Path) -> Result<(), Error> {
-    match fs::rename(from, to) {
-        Ok(()) => Ok(()),
-        // A non-empty directory or other entry appeared at the destination.
-        Err(error)
-            if to.exists()
-                && matches!(
-                    error.kind(),
-                    std::io::ErrorKind::DirectoryNotEmpty
-                        | std::io::ErrorKind::AlreadyExists
-                        | std::io::ErrorKind::NotADirectory
-                        | std::io::ErrorKind::IsADirectory
-                ) =>
-        {
-            Err(Error::AlreadyExists(to.to_owned()))
+/// `mkdir` that fails if anything exists at `path`, then made durable.
+fn create_exclusively(path: &Path) -> Result<(), Error> {
+    match fs::create_dir(path) {
+        Ok(()) => super::sync_parent(path),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(Error::AlreadyExists(path.to_owned()))
         }
         Err(error) => Err(error.into()),
     }

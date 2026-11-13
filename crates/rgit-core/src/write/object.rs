@@ -4,8 +4,11 @@
 //! `<kind> <size>\0<data>` under `objects/<xx>/<rest>`. Content goes to an
 //! exclusively created temporary file in the destination fan-out directory,
 //! is synced, made read-only, then published with a hard link that never
-//! replaces an existing object. The fan-out directory is synced before
-//! returning, so an object is durable before any index or reference names it.
+//! replaces an existing object (or, where links are unsupported, an atomic
+//! no-replace rename; with neither, the write is refused). The fan-out
+//! directory is synced before returning, so an object is durable before any
+//! index or reference names it. An entry already present under the object's
+//! name counts as the object only after its content is inflated and hashed.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -35,6 +38,7 @@ impl Repository {
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_file() => {
                 // Another writer may have published it without syncing yet.
+                verify_loose_object(&path, &id)?;
                 sync_existing(&path)?;
                 return Ok(id);
             }
@@ -52,11 +56,15 @@ impl Repository {
         }
         ensure_directory(&objects, &fanout)?;
         let temporary = write_temporary(&fanout, kind, data)?;
-        let published = publish(&temporary, &path);
-        // The temporary name is garbage either way; failing to remove it is
-        // harmless (C Git's gc removes stale tmp_obj_* files).
-        let _ = fs::remove_file(&temporary);
+        let published = publish(&temporary, &path, &id);
+        // Remove only our own temporary file (absent after a rename). A
+        // competitor's entry at `path` is never touched.
+        let removed: Result<(), Error> = match fs::remove_file(&temporary) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        };
         published?;
+        removed?;
         super::sync_parent(&path)?;
         Ok(id)
     }
@@ -163,28 +171,74 @@ fn set_read_only(file: &File) -> Result<(), Error> {
 }
 
 /// Publish without ever replacing an existing object. Like C Git, prefer a
-/// hard link (fails if the name exists); fall back to rename only where links
-/// are unavailable and the destination is still absent.
-fn publish(temporary: &Path, path: &Path) -> Result<(), Error> {
+/// hard link (fails if the name exists). Where links fail, use an atomic
+/// no-replace rename; where that is unsupported too, refuse. An entry that
+/// already holds the name is accepted only if it inflates to this object.
+fn publish(temporary: &Path, path: &Path, id: &ObjectId) -> Result<(), Error> {
+    super::failpoint("object.before-publish")?;
     match fs::hard_link(temporary, path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Same name means same content in a content-addressed store.
-            if fs::symlink_metadata(path)?.is_file() {
-                sync_existing(path)
-            } else {
-                Err(Error::UnsupportedCapability(
-                    "symlink or special loose object file",
-                ))
-            }
+            verify_loose_object(path, id)?;
+            sync_existing(path)
         }
-        Err(link_error) => match fs::symlink_metadata(path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::rename(temporary, path)?;
-                Ok(())
+        Err(_) => match super::rename_noreplace(temporary, path) {
+            Ok(()) => Ok(()),
+            Err(Error::AlreadyExists(_)) => {
+                verify_loose_object(path, id)?;
+                sync_existing(path)
             }
-            Ok(metadata) if metadata.is_file() => sync_existing(path),
-            _ => Err(link_error.into()),
+            Err(Error::UnsupportedCapability(_)) => Err(Error::UnsupportedCapability(
+                "publishing loose objects needs hard links or an atomic no-replace rename",
+            )),
+            Err(error) => Err(error),
         },
     }
+}
+
+/// Verify that the loose object file at `path` is a regular file whose zlib
+/// stream inflates to a well-formed object hashing to `id`, without following
+/// a symlink, blocking on a FIFO or buffering the inflated content.
+pub(super) fn verify_loose_object(path: &Path, id: &ObjectId) -> Result<(), Error> {
+    use std::io::Read;
+    let corrupt = || -> Error {
+        gix::error::corruption("an existing loose object file does not hold the object it names")
+            .corrupted_error()
+            .into()
+    };
+    let mut file = super::open_leaf_nofollow(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(Error::UnsupportedCapability(
+            "symlink or special loose object file",
+        ));
+    }
+    let mut compressed = Vec::new();
+    file.read_to_end(&mut compressed)?;
+    let mut input = compressed.as_slice();
+    let mut state = gix::zlib::Decompress::new();
+    let mut hasher = gix::hash::hasher(id.kind());
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut header = Vec::new();
+    let mut total = 0u64;
+    loop {
+        let written = gix::zlib::stream::inflate::read(&mut input, &mut state, &mut chunk)
+            .map_err(|_| corrupt())?;
+        if written == 0 {
+            break;
+        }
+        hasher.update(&chunk[..written]);
+        if header.len() < 64 {
+            let take = (64 - header.len()).min(written);
+            header.extend_from_slice(&chunk[..take]);
+        }
+        total += written as u64;
+    }
+    let (_, size, header_len) = gix::objs::decode::loose_header(&header).map_err(|_| corrupt())?;
+    if !input.is_empty() || total != header_len as u64 + size {
+        return Err(corrupt());
+    }
+    if hasher.try_finalize().map_err(gix::Error::from_error)? != *id {
+        return Err(corrupt());
+    }
+    Ok(())
 }

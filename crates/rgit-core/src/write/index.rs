@@ -336,12 +336,20 @@ impl Repository {
             }
         }
 
-        let mut stack = self.inner.attributes(
-            &state,
-            gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
-            gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped,
-            None,
-        )?;
+        // Every .gitignore/.gitattributes a lookup can consult is read now,
+        // without following symlinks or blocking on FIFOs, and served to
+        // Gitoxide from memory: it never opens worktree metadata files itself.
+        let mut metadata = MetadataSnapshot::new(root, state.object_hash());
+        metadata.prescan(pathspecs, &tracked)?;
+        let mut stack = self
+            .inner
+            .attributes(
+                &metadata.index(),
+                gix::worktree::stack::state::attributes::Source::IdMapping,
+                gix::worktree::stack::state::ignore::Source::IdMapping,
+                None,
+            )?
+            .detach();
         let mut attributes = stack.selected_attribute_matches([
             "text",
             "eol",
@@ -354,9 +362,8 @@ impl Repository {
         // Expand pathspecs into tracked paths to refresh and new paths.
         let mut selected: BTreeSet<Vec<u8>> = BTreeSet::new();
         let mut fresh: BTreeSet<Vec<u8>> = BTreeSet::new();
-        let mut guard = MetadataGuard::new(root);
         let mut expander = Expander {
-            guard: &mut guard,
+            snapshot: &metadata,
             root,
             state: &state,
             tracked: &tracked,
@@ -390,10 +397,10 @@ impl Repository {
                 file_mode(root, path, config, existing)?
             };
             if !symlink {
-                guard.check(path, false)?;
+                metadata.check(path, false)?;
                 attributes.reset();
                 stack
-                    .at_entry(BStr::new(path), None)?
+                    .at_entry(BStr::new(path), None, &metadata)?
                     .matching_attributes(&mut attributes);
                 if let Some(reason) = conversion_refusal(&attributes, &data, config) {
                     return Err(refuse(AddRefusal::Conversion {
@@ -500,7 +507,8 @@ impl Repository {
     }
 
     /// True if `id` is already stored durably: an existing loose object is
-    /// synced first; packed/alternate objects are assumed durable.
+    /// verified (inflated and hashed) and synced first; packed/alternate
+    /// objects are assumed durable.
     fn object_is_durable(&self, id: &ObjectId) -> Result<bool, Error> {
         let hex = id.to_string();
         let loose = self
@@ -511,6 +519,8 @@ impl Repository {
             .join(&hex[2..]);
         match fs::symlink_metadata(&loose) {
             Ok(metadata) if metadata.is_file() => {
+                // Trust an existing loose file only once it holds this object.
+                super::object::verify_loose_object(&loose, id)?;
                 fs::File::open(&loose)?.sync_all()?;
                 super::sync_parent(&loose)?;
                 return Ok(true);
@@ -733,18 +743,18 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-struct Expander<'a, 'repo> {
-    guard: &'a mut MetadataGuard,
+struct Expander<'a> {
+    snapshot: &'a MetadataSnapshot,
     root: &'a Path,
     state: &'a gix::index::State,
     tracked: &'a BTreeMap<Vec<u8>, Tracked>,
-    stack: &'a mut gix::AttributeStack<'repo>,
+    stack: &'a mut gix::worktree::Stack,
     config: AddConfig,
     selected: &'a mut BTreeSet<Vec<u8>>,
     fresh: &'a mut BTreeSet<Vec<u8>>,
 }
 
-impl Expander<'_, '_> {
+impl Expander<'_> {
     fn expand(&mut self, spec: &[u8]) -> Result<(), Error> {
         let mut any_tracked = false;
         let prefix = {
@@ -867,9 +877,12 @@ impl Expander<'_, '_> {
     }
 
     fn excluded(&mut self, path: &[u8], is_dir: bool) -> Result<bool, Error> {
-        self.guard.check(path, is_dir)?;
+        self.snapshot.check(path, is_dir)?;
         let mode = is_dir.then_some(Mode::DIR);
-        Ok(self.stack.at_entry(BStr::new(path), mode)?.is_excluded())
+        Ok(self
+            .stack
+            .at_entry(BStr::new(path), mode, self.snapshot)?
+            .is_excluded())
     }
 
     /// Collect untracked, unignored files and symlinks below `spec`. Tracked
@@ -880,7 +893,7 @@ impl Expander<'_, '_> {
         let mut pending = vec![spec.to_vec()];
         while let Some(directory) = pending.pop() {
             let absolute = native(self.root, &directory)?;
-            self.guard.check(&directory, true)?;
+            self.snapshot.check(&directory, true)?;
             for child in fs::read_dir(&absolute)? {
                 let child = child?;
                 let name = name_bytes(&child.file_name())?;
@@ -1018,7 +1031,20 @@ fn read_worktree(root: &Path, path: &[u8], symlink: bool) -> Result<(Vec<u8>, St
     if !before.file_type().is_file() {
         return Err(changed());
     }
-    let mut file = fs::File::open(&absolute)?;
+    super::failpoint("add.before-leaf-open")?;
+    // Never follow a symlink or wait on a FIFO swapped in after the lstat:
+    // the open fails (symlink) or returns at once, and the descriptor must
+    // then be the same regular file the lstat saw.
+    let mut file = match super::open_leaf_nofollow(&absolute) {
+        Ok(file) => file,
+        Err(error) => {
+            return Err(match fs::symlink_metadata(&absolute) {
+                Ok(metadata) if !metadata.is_file() => changed(),
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => changed(),
+                _ => error.into(),
+            });
+        }
+    };
     let opened = file.metadata()?;
     if !opened.is_file() || fingerprint(&before)? != fingerprint(&opened)? {
         return Err(changed());
@@ -1224,25 +1250,153 @@ fn has_git_marker(directory: &Path) -> Result<bool, Error> {
     }
 }
 
-/// Before any ignore or attribute lookup for a path, verify the
-/// `.gitignore`/`.gitattributes` of every directory the lookup will read: the
-/// worktree root, each ancestor and, for a directory, the directory itself.
-/// Gitoxide opens these files while walking the path, so a FIFO among them
-/// would block and a symlink would be followed. Checked directories are cached.
-struct MetadataGuard {
+/// Largest `.gitignore`/`.gitattributes` file accepted (as for status).
+const METADATA_LIMIT: u64 = 8 * 1024 * 1024;
+
+/// The `.gitignore`/`.gitattributes` content of every directory an ignore or
+/// attribute lookup of this `add` can consult, read before any lookup through
+/// [`super::open_leaf_nofollow`] and validated on the opened descriptor:
+/// a symlink, FIFO, special or oversized file is refused, never followed or
+/// waited on. Gitoxide receives the bytes through id mappings and this
+/// in-memory object source, so a later swap of a metadata file cannot affect
+/// or block the lookup. A lookup in a directory that was not pre-read is an
+/// error rather than a silent "no patterns".
+struct MetadataSnapshot {
     root: PathBuf,
-    checked: HashSet<Vec<u8>>,
+    hash: gix::hash::Kind,
+    scanned: HashSet<Vec<u8>>,
+    files: BTreeMap<Vec<u8>, ObjectId>,
+    blobs: HashMap<ObjectId, Vec<u8>>,
 }
 
-impl MetadataGuard {
-    fn new(root: &Path) -> Self {
+impl MetadataSnapshot {
+    fn new(root: &Path, hash: gix::hash::Kind) -> Self {
         Self {
             root: root.to_owned(),
-            checked: HashSet::new(),
+            hash,
+            scanned: HashSet::new(),
+            files: BTreeMap::new(),
+            blobs: HashMap::new(),
         }
     }
 
-    fn check(&mut self, path: &[u8], is_dir: bool) -> Result<(), Error> {
+    /// Pre-read the root, every ancestor of each pathspec and of each tracked
+    /// path below it, and every directory in a pathspec's subtree (each
+    /// nested repository's own files, but not below it).
+    fn prescan(
+        &mut self,
+        pathspecs: &[Vec<u8>],
+        tracked: &BTreeMap<Vec<u8>, Tracked>,
+    ) -> Result<(), Error> {
+        self.read_directory(b"")?;
+        let mut seen = 0usize;
+        for spec in pathspecs {
+            if !self.read_ancestors(spec, true)? {
+                continue;
+            }
+            let mut prefix = spec.clone();
+            if !prefix.is_empty() {
+                prefix.push(b'/');
+            }
+            let under: Vec<Vec<u8>> = tracked
+                .range(prefix.clone()..)
+                .take_while(|(path, _)| path.starts_with(&prefix))
+                .map(|(path, _)| path.clone())
+                .collect();
+            for path in under {
+                self.read_ancestors(&path, false)?;
+            }
+            match fs::symlink_metadata(native(&self.root, spec)?) {
+                Ok(metadata) if metadata.is_dir() => {}
+                _ => continue,
+            }
+            let mut pending = vec![spec.clone()];
+            while let Some(directory) = pending.pop() {
+                for child in fs::read_dir(native(&self.root, &directory)?)? {
+                    let child = child?;
+                    seen += 1;
+                    if seen > 1_000_000 {
+                        return Err(Error::UnsupportedCapability(
+                            "worktree metadata preflight entry limit",
+                        ));
+                    }
+                    let name = name_bytes(&child.file_name())?;
+                    if directory.is_empty() && name == b".git" {
+                        continue;
+                    }
+                    if !child.file_type()?.is_dir() {
+                        continue;
+                    }
+                    let mut path = directory.clone();
+                    if !path.is_empty() {
+                        path.push(b'/');
+                    }
+                    path.extend_from_slice(&name);
+                    self.read_directory(&path)?;
+                    if !has_git_marker(&child.path())? {
+                        pending.push(path);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the leading directories of `path` (and `path` itself when
+    /// `include_self`). A component that is missing, not a directory or a
+    /// symlink is recorded as having no metadata, and nothing below it is
+    /// read; returns whether every component was a real directory.
+    fn read_ancestors(&mut self, path: &[u8], include_self: bool) -> Result<bool, Error> {
+        if path.is_empty() {
+            return Ok(true);
+        }
+        let parts: Vec<&[u8]> = path.split(|byte| *byte == b'/').collect();
+        let count = if include_self {
+            parts.len()
+        } else {
+            parts.len() - 1
+        };
+        for position in 0..count {
+            let directory = parts[..=position].join(&b'/');
+            let real = matches!(
+                fs::symlink_metadata(native(&self.root, &directory)?),
+                Ok(metadata) if metadata.is_dir()
+            );
+            if real {
+                self.read_directory(&directory)?;
+            } else {
+                // Lookups may still name it; it holds no metadata files.
+                for rest in position..parts.len() {
+                    self.scanned.insert(parts[..=rest].join(&b'/'));
+                }
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn read_directory(&mut self, directory: &[u8]) -> Result<(), Error> {
+        if !self.scanned.insert(directory.to_vec()) {
+            return Ok(());
+        }
+        for name in [&b".gitignore"[..], b".gitattributes"] {
+            let mut relative = directory.to_vec();
+            if !relative.is_empty() {
+                relative.push(b'/');
+            }
+            relative.extend_from_slice(name);
+            let Some(bytes) = read_metadata_leaf(&native(&self.root, &relative)?)? else {
+                continue;
+            };
+            let id = gix::objs::compute_hash(self.hash, ObjectKind::Blob, &bytes)?;
+            self.files.insert(relative, id);
+            self.blobs.insert(id, bytes);
+        }
+        Ok(())
+    }
+
+    /// Every directory a lookup of `path` consults must have been pre-read.
+    fn check(&self, path: &[u8], is_dir: bool) -> Result<(), Error> {
         let mut directories = vec![&path[..0]];
         for (offset, byte) in path.iter().enumerate() {
             if *byte == b'/' {
@@ -1252,16 +1406,89 @@ impl MetadataGuard {
         if is_dir && !path.is_empty() {
             directories.push(path);
         }
-        for directory in directories {
-            if self.checked.contains(directory) {
-                continue;
-            }
-            let absolute = native(&self.root, directory)?;
-            check_metadata_files(&[absolute.join(".gitignore"), absolute.join(".gitattributes")])?;
-            self.checked.insert(directory.to_vec());
+        if directories
+            .iter()
+            .all(|directory| self.scanned.contains(*directory))
+        {
+            Ok(())
+        } else {
+            Err(Error::UnsupportedCapability(
+                "ignore/attribute lookup outside the pre-read directories",
+            ))
         }
-        Ok(())
     }
+
+    /// A synthetic index naming each pre-read file, from which Gitoxide
+    /// derives its path-to-blob mappings.
+    fn index(&self) -> gix::index::State {
+        let mut index = gix::index::State::new(self.hash);
+        for (path, id) in &self.files {
+            index.dangerously_push_entry(
+                Stat::default(),
+                *id,
+                Flags::empty(),
+                Mode::FILE,
+                BStr::new(path),
+            );
+        }
+        index.sort_entries();
+        index
+    }
+}
+
+impl gix::objs::Find for MetadataSnapshot {
+    fn try_find<'a>(
+        &self,
+        id: &gix::hash::oid,
+        buffer: &'a mut Vec<u8>,
+    ) -> gix::Result<Option<gix::objs::Data<'a>>> {
+        let Some(bytes) = self.blobs.get(id) else {
+            return Ok(None);
+        };
+        buffer.clear();
+        buffer.extend_from_slice(bytes);
+        Ok(Some(gix::objs::Data {
+            kind: ObjectKind::Blob,
+            object_hash: self.hash,
+            data: buffer.as_slice(),
+        }))
+    }
+}
+
+/// Read one metadata file without following a symlink or blocking on a FIFO.
+/// Absent is `None`; anything but a regular file within the size limit, as
+/// seen on the opened descriptor, is refused.
+fn read_metadata_leaf(path: &Path) -> Result<Option<Vec<u8>>, Error> {
+    let refused =
+        || Error::UnsupportedCapability("symlink, special or oversized attribute/ignore file");
+    let file = match super::open_leaf_nofollow(path) {
+        Ok(file) => file,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => {
+            // O_NOFOLLOW reports a symlink as an error (ELOOP).
+            return Err(match fs::symlink_metadata(path) {
+                Ok(metadata) if !metadata.is_file() => refused(),
+                _ => error.into(),
+            });
+        }
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > METADATA_LIMIT {
+        return Err(refused());
+    }
+    let mut bytes = Vec::new();
+    file.take(METADATA_LIMIT + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > METADATA_LIMIT {
+        return Err(refused());
+    }
+    Ok(Some(bytes))
 }
 
 /// Ignore/attribute sources must be regular files of bounded size; never
