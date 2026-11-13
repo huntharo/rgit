@@ -683,16 +683,19 @@ fn external_clean_smudge_and_process_filters_are_refused_without_execution() -> 
         write(root.path(), ".gitattributes", b"* filter=blocked\n")?;
         write(root.path(), "file.txt", b"changed\n")?;
         // The shell command is an execution tripwire, never a fixture command.
+        // Use an absolute marker so an unexpected helper cwd cannot hide it.
+        let marker = root.path().join("FILTER_EXECUTED");
+        let quoted_marker = marker
+            .to_str()
+            .ok_or("non-UTF-8 fixture directory")?
+            .replace('\'', "'\\''");
+        let tripwire = format!("touch '{quoted_marker}'; cat");
         git(
             root.path(),
-            &[
-                "config",
-                &format!("filter.blocked.{kind}"),
-                "touch FILTER_EXECUTED; cat",
-            ],
+            &["config", &format!("filter.blocked.{kind}"), &tripwire],
         )?;
         refused(root.path(), "filter")?;
-        assert!(!root.path().join("FILTER_EXECUTED").exists());
+        assert!(!marker.exists());
     }
     Ok(())
 }
