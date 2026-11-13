@@ -181,9 +181,15 @@ neither is available the operation is refused or, for `init` on Windows, uses
 exclusive directory creation; there is no check-then-rename fallback.
 Worktree files are opened without following a final symlink and without
 blocking on a FIFO (`O_NOFOLLOW|O_NONBLOCK`), and the opened descriptor is
-validated before its bytes are used. Parent directories are still resolved by
-path: an ancestor directory swapped for a symlink concurrently is not
-detected. Preflight is therefore not a filesystem sandbox against an actively
+validated before its bytes are used. `.gitignore` and `.gitattributes` files
+in the worktree are pre-read the same way and handed to Gitoxide from memory;
+`.git/info/exclude` and `.git/info/attributes` are still opened by Gitoxide
+after an `lstat` check. An already-present loose object is accepted only after
+its content is inflated and its hash verified. Parent directories are still
+resolved by path: an ancestor directory swapped for a symlink concurrently is
+not detected. On Windows the leaf fingerprint is size and modification time
+only, and the exclusive-creation fallback for `init` is used because no
+atomic no-replace rename is available. Preflight is therefore not a filesystem sandbox against an actively
 hostile concurrent writer.
 
 Recovery after interruption: a fresh process sees each of the index, `HEAD`
