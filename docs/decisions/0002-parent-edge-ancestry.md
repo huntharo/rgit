@@ -14,8 +14,9 @@ it. Sort the resulting IDs; plain merge-base selects the first valid base.
 Dates and acceleration metadata do not determine traversal order or ancestry.
 
 This prioritizes a simple correctness contract over the optimized paint walks
-in C Git or existing Gitoxide merge-base paths. Cost is O(V + E) in the full
-reachable graph; there is no early exit. Limits bound retained nodes/links,
+in C Git or existing Gitoxide merge-base paths. Graph building and traversal are
+O(V + E); sorting B resulting bases adds O(B log B). There is no early exit.
+Limits bound retained nodes/links,
 not underlying object decoding memory. Optimizations require preserving the
 independent oracle and measurement before adoption.
 
