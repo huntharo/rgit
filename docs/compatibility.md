@@ -148,11 +148,18 @@ Differences from C Git:
   repository-local config only, consistent with isolated discovery.
 
 Recovery after interruption: a fresh process sees each of the index, `HEAD`
-and the branch ref either completely old or completely new. A crash can leave
-the lock(s) the process held, which refuse later writers until removed, as
-with C Git. For a commit on a branch interrupted after the branch rename, that
-includes `HEAD.lock`. An interrupted `init` leaves no `.git` but a private
-`.git.rgit-init-*` directory to delete. A write error is not proof that nothing
+and the branch ref either completely old or completely new. Abrupt termination
+bypasses cleanup, so a crash can leave the lock(s) the process held; they
+refuse later rgit and C Git writers until removed. For a commit on a branch
+interrupted after the branch rename, that is `HEAD.lock` (the branch is
+already published and its own lock is gone). An interrupted `init` leaves no
+`.git`, only one private `.git.rgit-init-*` (bare: `.<name>.rgit-init-*`)
+directory; a later `init` succeeds and leaves that directory untouched, so it
+appears as untracked until deleted. rgit has no proof of staleness and never
+deletes a lock or temporary directory it did not create in the same process:
+remove one manually only after confirming that no rgit or Git process is still
+running against the repository. Errors handled without a crash clean up their
+own locks and temporary directories. A write error is not proof that nothing
 changed: errors after a rename mean the new value is already visible.
 
 Native macOS APFS tests extend the live and final-unmap shared-mapping gates to

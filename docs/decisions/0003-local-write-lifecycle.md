@@ -42,7 +42,10 @@ reset variants and linked-worktree add/remove are later G1 issues.
    interrupted process held may remain and refuse later writers until removed
    (see the table below). An interrupted `init` leaves no `.git`, only its
    private `.git.rgit-init-*` (or `.<name>.rgit-init-*` for bare) directory,
-   which must be removed manually.
+   which a later `init` neither consumes nor deletes. rgit cannot prove a lock
+   or temporary directory stale and never removes one it did not create in the
+   same process; removal is a manual step after confirming no writer is
+   running. Handled errors (no crash) remove their own locks and temporaries.
 
 Durability: on Unix, file content and directory entries are synced before
 publication. On Windows, std offers no directory sync; guarantees there are
