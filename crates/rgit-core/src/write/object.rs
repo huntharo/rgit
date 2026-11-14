@@ -10,11 +10,11 @@
 //! index or reference names it. An entry already present under the object's
 //! name counts as the object only after its content is inflated and hashed.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::fsx::{Anchor, Kind, Root};
 use crate::{Error, ObjectId, ObjectKind, Repository};
 
 impl Repository {
@@ -25,86 +25,134 @@ impl Repository {
     }
 
     /// Store an object of any kind durably and return its ID. An object that
-    /// already exists is not rewritten; an existing loose copy is synced so
-    /// the caller may rely on it being durable.
+    /// already exists is not rewritten; an existing loose copy is verified
+    /// and synced so the caller may rely on it being durable.
     pub(crate) fn write_loose_object(
         &self,
         kind: ObjectKind,
         data: &[u8],
     ) -> Result<ObjectId, Error> {
+        self.write_loose_object_at(&self.common_anchor()?, kind, data)
+    }
+
+    /// [`Self::write_loose_object`] relative to an already opened common
+    /// Git directory anchor. Every path below `common` is resolved through
+    /// descriptors without following symlinks.
+    pub(crate) fn write_loose_object_at(
+        &self,
+        common: &Anchor,
+        kind: ObjectKind,
+        data: &[u8],
+    ) -> Result<ObjectId, Error> {
         let id = gix::objs::compute_hash(self.inner.object_hash(), kind, data)?;
-        let objects = self.inner.common_dir().join("objects");
-        let (fanout, path) = loose_path(&objects, &id);
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_file() => {
-                // Another writer may have published it without syncing yet.
-                verify_loose_object(&path, &id)?;
-                sync_existing(&path)?;
-                return Ok(id);
-            }
-            Ok(_) => {
-                return Err(Error::UnsupportedCapability(
-                    "symlink or special loose object file",
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        let objects = common.sub(b"objects")?;
+        let (fanout, name) = loose_names(&id);
+        if existing_loose(&objects, &id)? {
+            return Ok(id);
         }
         if !id.is_empty_tree() && self.inner.has_object(id) {
             // Packed (or alternate) objects are already durable.
             return Ok(id);
         }
-        ensure_directory(&objects, &fanout)?;
-        let temporary = write_temporary(&fanout, kind, data)?;
-        let published = publish(&temporary, &path, &id);
+        super::failpoint("object.before-fanout")?;
+        if objects.mkdir(&fanout)? {
+            objects.sync()?;
+        }
+        let fan = objects.sub(&fanout)?;
+        let temporary = write_temporary(&fan, kind, data)?;
+        let published = publish(&fan, &temporary, &name, &id);
         // Remove only our own temporary file (absent after a rename). A
-        // competitor's entry at `path` is never touched.
-        let removed: Result<(), Error> = match fs::remove_file(&temporary) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+        // competitor's entry at the object name is never touched.
+        let removed = match fan.unlink(&temporary) {
+            Err(Error::Io(error)) if error.kind() != std::io::ErrorKind::NotFound => {
+                Err(Error::Io(error))
+            }
             _ => Ok(()),
         };
         published?;
         removed?;
-        super::sync_parent(&path)?;
+        fan.sync()?;
+        same_entry(common, &fan, &id)?;
         Ok(id)
     }
-}
 
-fn loose_path(objects: &Path, id: &ObjectId) -> (PathBuf, PathBuf) {
-    let hex = id.to_string();
-    let fanout = objects.join(&hex[..2]);
-    let path = fanout.join(&hex[2..]);
-    (fanout, path)
-}
-
-fn sync_existing(path: &Path) -> Result<(), Error> {
-    super::sync_existing_file(path)
-}
-
-/// Create the fan-out directory if needed, syncing `objects/` when it was.
-fn ensure_directory(objects: &Path, fanout: &Path) -> Result<(), Error> {
-    match fs::symlink_metadata(objects) {
-        Ok(metadata) if metadata.is_dir() => {}
-        Ok(_) => {
-            return Err(Error::UnsupportedCapability(
-                "symlink or special objects directory",
-            ));
-        }
-        Err(error) => return Err(error.into()),
+    /// Anchor on the common Git directory (objects, shared refs, info/).
+    pub(crate) fn common_anchor(&self) -> Result<Anchor, Error> {
+        Anchor::open(self.inner.common_dir(), Root::CommonDir)
     }
-    match fs::create_dir(fanout) {
-        Ok(()) => super::sync_parent(fanout),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            if fs::symlink_metadata(fanout)?.is_dir() {
-                Ok(())
-            } else {
-                Err(Error::UnsupportedCapability(
-                    "symlink or special object fan-out directory",
-                ))
-            }
-        }
-        Err(error) => Err(error.into()),
+
+    /// Anchor on the per-worktree Git directory (HEAD, index, worktree refs).
+    pub(crate) fn git_dir_anchor(&self) -> Result<Anchor, Error> {
+        Anchor::open(self.inner.git_dir(), Root::GitDir)
     }
+
+    /// Anchor on the worktree root; bare repositories have none.
+    pub(crate) fn worktree_anchor(&self) -> Result<Anchor, Error> {
+        let root = self
+            .inner
+            .workdir()
+            .ok_or(Error::UnsupportedCapability("worktree required"))?;
+        Anchor::open(root, Root::Worktree)
+    }
+}
+
+/// `(xx, rest)` of a loose object's name.
+fn loose_names(id: &ObjectId) -> (Vec<u8>, Vec<u8>) {
+    let hex = id.to_string().into_bytes();
+    (hex[..2].to_vec(), hex[2..].to_vec())
+}
+
+fn loose_rel(id: &ObjectId) -> Vec<u8> {
+    let (fanout, name) = loose_names(id);
+    [fanout, b"/".to_vec(), name].concat()
+}
+
+/// If a loose copy of `id` exists below `objects`, verify and sync it and
+/// return `true`. A symlinked or special entry (or fan-out) is refused.
+pub(super) fn existing_loose(objects: &Anchor, id: &ObjectId) -> Result<bool, Error> {
+    let rel = loose_rel(id);
+    match objects.lstat(&rel)? {
+        None => Ok(false),
+        Some(meta) if matches!(meta.kind, Kind::File { .. }) => {
+            // Another writer may have published it without syncing yet.
+            sync_read_only(&verify_loose_object(objects, &rel, id)?)?;
+            objects.sub(&loose_names(id).0)?.sync()?;
+            Ok(true)
+        }
+        Some(_) => Err(Error::UnsupportedCapability(
+            "symlink or special loose object file",
+        )),
+    }
+}
+
+/// After publication, the object name reached by a fresh no-follow walk from
+/// the common directory must be the entry under the held fan-out descriptor.
+/// Otherwise `objects/` or `objects/xx` was replaced during the write and
+/// the object may not be where readers look; refuse rather than report it.
+fn same_entry(common: &Anchor, fan: &Anchor, id: &ObjectId) -> Result<(), Error> {
+    let (_, name) = loose_names(id);
+    let held = fan.lstat(&name)?.map(|meta| meta.id);
+    let walked = [b"objects/".to_vec(), loose_rel(id)].concat();
+    let fresh = common.lstat(&walked).ok().flatten().map(|meta| meta.id);
+    if held.is_some() && held == fresh {
+        Ok(())
+    } else {
+        Err(Error::UnsupportedCapability(
+            "object directory was replaced while the object was written",
+        ))
+    }
+}
+
+/// Flush a file another writer created, through our read-only handle. On
+/// Windows `FlushFileBuffers` needs a writable handle (loose objects are
+/// read-only), so, as before this change, durability there relies on the
+/// writer that created it.
+fn sync_read_only(file: &File) -> Result<(), Error> {
+    #[cfg(unix)]
+    file.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = file;
+    Ok(())
 }
 
 /// Unique-per-process temporary names; `create_new` guarantees exclusivity.
@@ -122,18 +170,16 @@ pub(super) fn unique_suffix() -> String {
     )
 }
 
-/// Write the compressed object to a fresh temporary file, synced and
-/// read-only. The file is removed on any failure.
-fn write_temporary(fanout: &Path, kind: ObjectKind, data: &[u8]) -> Result<PathBuf, Error> {
+/// Write the compressed object to a fresh temporary file in `fan`, synced
+/// and read-only; returns its name. The file is removed on any failure.
+fn write_temporary(fan: &Anchor, kind: ObjectKind, data: &[u8]) -> Result<Vec<u8>, Error> {
     let mut attempts = 0;
-    let (path, file) = loop {
-        let path = fanout.join(format!("tmp_obj_{}", unique_suffix()));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => break (path, file),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempts < 8 => {
-                attempts += 1;
-            }
-            Err(error) => return Err(error.into()),
+    let (name, file) = loop {
+        let name = format!("tmp_obj_{}", unique_suffix()).into_bytes();
+        match fan.create_new(&name, 0o644) {
+            Ok(file) => break (name, file),
+            Err(Error::AlreadyExists(_)) if attempts < 8 => attempts += 1,
+            Err(error) => return Err(error),
         }
     };
     let result = (|| -> Result<(), Error> {
@@ -148,16 +194,16 @@ fn write_temporary(fanout: &Path, kind: ObjectKind, data: &[u8]) -> Result<PathB
         Ok(())
     })();
     if let Err(error) = result {
-        let _ = fs::remove_file(&path);
+        let _ = fan.unlink(&name);
         return Err(error);
     }
-    Ok(path)
+    Ok(name)
 }
 
 #[cfg(unix)]
 fn set_read_only(file: &File) -> Result<(), Error> {
     use std::os::unix::fs::PermissionsExt;
-    file.set_permissions(fs::Permissions::from_mode(0o444))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o444))?;
     Ok(())
 }
 
@@ -173,20 +219,15 @@ fn set_read_only(file: &File) -> Result<(), Error> {
 /// hard link (fails if the name exists). Where links fail, use an atomic
 /// no-replace rename; where that is unsupported too, refuse. An entry that
 /// already holds the name is accepted only if it inflates to this object.
-fn publish(temporary: &Path, path: &Path, id: &ObjectId) -> Result<(), Error> {
+fn publish(fan: &Anchor, temporary: &[u8], name: &[u8], id: &ObjectId) -> Result<(), Error> {
     super::failpoint("object.before-publish")?;
-    match fs::hard_link(temporary, path) {
+    let existing = || -> Result<(), Error> { sync_read_only(&verify_loose_object(fan, name, id)?) };
+    match fan.hard_link(temporary, name) {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            verify_loose_object(path, id)?;
-            sync_existing(path)
-        }
-        Err(_) => match super::rename_noreplace(temporary, path) {
+        Err(Error::AlreadyExists(_)) => existing(),
+        Err(_) => match fan.rename_noreplace(temporary, name) {
             Ok(()) => Ok(()),
-            Err(Error::AlreadyExists(_)) => {
-                verify_loose_object(path, id)?;
-                sync_existing(path)
-            }
+            Err(Error::AlreadyExists(_)) => existing(),
             Err(Error::UnsupportedCapability(_)) => Err(Error::UnsupportedCapability(
                 "publishing loose objects needs hard links or an atomic no-replace rename",
             )),
@@ -195,22 +236,22 @@ fn publish(temporary: &Path, path: &Path, id: &ObjectId) -> Result<(), Error> {
     }
 }
 
-/// Verify that the loose object file at `path` is a regular file whose zlib
-/// stream inflates to a well-formed object hashing to `id`, without following
-/// a symlink, blocking on a FIFO or buffering the inflated content.
-pub(super) fn verify_loose_object(path: &Path, id: &ObjectId) -> Result<(), Error> {
+/// Verify that the loose object file `rel` below `anchor` is a regular file
+/// whose zlib stream inflates to a well-formed object hashing to `id`,
+/// without following a symlink, blocking on a FIFO or buffering the inflated
+/// content. Returns the verified handle (for syncing).
+pub(super) fn verify_loose_object(
+    anchor: &Anchor,
+    rel: &[u8],
+    id: &ObjectId,
+) -> Result<File, Error> {
     use std::io::Read;
     let corrupt = || -> Error {
         gix::error::corruption("an existing loose object file does not hold the object it names")
             .corrupted_error()
             .into()
     };
-    let mut file = super::open_leaf_nofollow(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(Error::UnsupportedCapability(
-            "symlink or special loose object file",
-        ));
-    }
+    let (mut file, _) = anchor.open_read(rel)?;
     let mut compressed = Vec::new();
     file.read_to_end(&mut compressed)?;
     let mut input = compressed.as_slice();
@@ -239,5 +280,5 @@ pub(super) fn verify_loose_object(path: &Path, id: &ObjectId) -> Result<(), Erro
     if hasher.try_finalize().map_err(gix::Error::from_error)? != *id {
         return Err(corrupt());
     }
-    Ok(())
+    Ok(file)
 }

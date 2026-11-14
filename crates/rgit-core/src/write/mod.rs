@@ -32,9 +32,9 @@ pub use refs::{
 };
 
 pub(crate) use failpoint::hit as failpoint;
-pub(crate) use lock::{LockFile, sync_parent};
+pub(crate) use lock::LockFile;
 #[cfg_attr(unix, allow(unused_imports))]
-pub(crate) use sys::{open_leaf_nofollow, rename_noreplace, sync_existing_file};
+pub(crate) use sys::{open_leaf_nofollow, rename_noreplace};
 
 /// The filesystem guarantee this build's write operations use, selected at
 /// compile time: [`FilesystemHardening::Anchored`] on Unix (descriptor-root

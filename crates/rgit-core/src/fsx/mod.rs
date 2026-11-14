@@ -26,10 +26,14 @@ use std::path::Path;
 
 use crate::Error;
 
+#[cfg(not(unix))]
 mod portable;
-// WP1 replaces this line with `#[cfg(unix)] mod unix; #[cfg(unix)] use unix as backend;`
-// plus `#[cfg(not(unix))] use portable as backend;`.
+#[cfg(unix)]
+mod unix;
+#[cfg(not(unix))]
 use portable as backend;
+#[cfg(unix)]
+use unix as backend;
 
 /// Which guarantee the compiled filesystem backend provides for write
 /// operations. Exposed as `rgit_core::write::FilesystemHardening`.

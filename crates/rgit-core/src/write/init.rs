@@ -5,11 +5,16 @@
 //! A crash before the rename leaves only an `*.rgit-init-*` temporary
 //! directory and no repository; after the rename the repository is complete.
 //! No hooks, sample hooks or templates are written.
+//!
+//! The only path resolved by name is the nearest existing directory at or
+//! above the target (followed like C Git, decision 0004); it is opened as an
+//! anchor before anything is created, and every directory and file below it
+//! is created and published through anchored operations.
 
-use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::fsx::{Anchor, Kind, Root};
 use crate::{BStr, Error, Repository};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,20 +84,14 @@ fn init_worktree(
     options: &InitOptions,
     head_ref: &[u8],
 ) -> Result<Repository, Error> {
-    let git_dir = directory.join(".git");
-    // Like C Git, a symlink to a directory is followed for the worktree.
-    match fs::metadata(directory) {
-        Ok(metadata) if metadata.is_dir() => {}
-        Ok(_) => return Err(Error::AlreadyExists(directory.to_owned())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            create_directories(directory)?;
-        }
-        Err(error) => return Err(error.into()),
+    let worktree = open_or_create(directory)?;
+    // A non-bare target is a repository if `.git` exists in any form.
+    if worktree.lstat(b".git")?.is_some() {
+        return Err(Error::AlreadyExists(directory.join(".git")));
     }
-    refuse_existing(&git_dir)?;
-    let temporary = directory.join(format!(".git.rgit-init-{}", super::object::unique_suffix()));
-    publish_git_dir(&temporary, &git_dir, options, head_ref, false)?;
-    finish(directory, &git_dir)
+    let temporary = format!(".git.rgit-init-{}", super::object::unique_suffix()).into_bytes();
+    publish_git_dir(&worktree, &temporary, b".git", options, head_ref, false)?;
+    finish(directory, &directory.join(".git"))
 }
 
 fn init_bare(
@@ -100,39 +99,89 @@ fn init_bare(
     options: &InitOptions,
     head_ref: &[u8],
 ) -> Result<Repository, Error> {
-    // Like C Git, a symlink to a directory is followed.
-    match fs::metadata(directory) {
-        Ok(metadata) if metadata.is_dir() => {
-            if fs::read_dir(directory)?.next().is_some() {
-                return Err(Error::AlreadyExists(directory.to_owned()));
-            }
-            populate_in_place(directory, options, head_ref, true, false)?;
-            return finish(directory, directory);
+    // Like C Git, an existing directory (or a symlink to one) is used as is.
+    if std::fs::metadata(directory).is_ok_and(|metadata| metadata.is_dir()) {
+        let target = Anchor::open(directory, Root::GitDir)?;
+        if !target.read_dir(b"")?.is_empty() {
+            return Err(Error::AlreadyExists(directory.to_owned()));
         }
-        Ok(_) => return Err(Error::AlreadyExists(directory.to_owned())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if fs::symlink_metadata(directory).is_ok() {
-                return Err(Error::UnsupportedCapability(
-                    "bare repository target is a dangling symbolic link",
-                ));
-            }
-        }
-        Err(error) => return Err(error.into()),
+        populate_in_place(&target, options, head_ref, true, None)?;
+        return finish(directory, directory);
     }
     let name = directory
         .file_name()
-        .ok_or_else(|| Error::InvalidPath(directory.as_os_str().as_encoded_bytes().to_vec()))?;
-    let parent = match directory.parent() {
+        .ok_or_else(|| Error::InvalidPath(directory.as_os_str().as_encoded_bytes().to_vec()))?
+        .as_encoded_bytes()
+        .to_vec();
+    let parent_path = match directory.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_owned(),
         _ => PathBuf::from("."),
     };
-    create_directories(&parent)?;
-    let mut temporary_name = std::ffi::OsString::from(".");
-    temporary_name.push(name);
-    temporary_name.push(format!(".rgit-init-{}", super::object::unique_suffix()));
-    let temporary = parent.join(temporary_name);
-    publish_git_dir(&temporary, directory, options, head_ref, true)?;
+    let parent = open_or_create(&parent_path)?;
+    match parent.lstat(&name)? {
+        None => {}
+        Some(meta) if meta.kind == Kind::Symlink => {
+            return Err(Error::UnsupportedCapability(
+                "bare repository target is a dangling symbolic link",
+            ));
+        }
+        Some(_) => return Err(Error::AlreadyExists(directory.to_owned())),
+    }
+    let mut temporary = b".".to_vec();
+    temporary.extend_from_slice(&name);
+    temporary
+        .extend_from_slice(format!(".rgit-init-{}", super::object::unique_suffix()).as_bytes());
+    publish_git_dir(&parent, &temporary, &name, options, head_ref, true)?;
     finish(directory, directory)
+}
+
+/// Open `directory` as the policy root, creating it first if absent. Only
+/// the nearest existing ancestor is resolved by path (following symlinks, as
+/// C Git does) and opened as an anchor; the missing components below it are
+/// created through that anchor, each made durable.
+fn open_or_create(directory: &Path) -> Result<Anchor, Error> {
+    let mut existing = directory.to_owned();
+    let mut missing: Vec<Vec<u8>> = Vec::new();
+    loop {
+        match std::fs::metadata(&existing) {
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => return Err(Error::AlreadyExists(existing)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let name = existing
+            .file_name()
+            .ok_or_else(|| Error::InvalidPath(existing.as_os_str().as_encoded_bytes().to_vec()))?;
+        missing.push(name.as_encoded_bytes().to_vec());
+        existing = match existing.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_owned(),
+            _ => PathBuf::from("."),
+        };
+    }
+    let root = Anchor::open(&existing, Root::Worktree)?;
+    if missing.is_empty() {
+        return Ok(root);
+    }
+    missing.reverse();
+    let mut relative = Vec::new();
+    for name in &missing {
+        if !relative.is_empty() {
+            relative.push(b'/');
+        }
+        relative.extend_from_slice(name);
+        if root.mkdir(&relative)? {
+            sync_parent_of(&root, &relative)?;
+        }
+    }
+    root.sub(&relative)
+}
+
+/// Sync the directory containing `rel` below `anchor`.
+fn sync_parent_of(anchor: &Anchor, rel: &[u8]) -> Result<(), Error> {
+    match rel.iter().rposition(|byte| *byte == b'/') {
+        Some(slash) => anchor.sub(&rel[..slash])?.sync(),
+        None => anchor.sync(),
+    }
 }
 
 /// Open the published repository; failure here is reported as published.
@@ -141,43 +190,38 @@ fn finish(directory: &Path, git_dir: &Path) -> Result<Repository, Error> {
 }
 
 /// Populate an empty Git directory without replacing it: an existing empty
-/// bare target, or a directory this call created exclusively
-/// (`root_created`). Everything except `HEAD` is written and synced first;
-/// until `HEAD` exists the directory is not a repository for C Git or rgit.
-/// On a failure before `HEAD` is published, the entries this call created
-/// (and an exclusively created root) are removed, best effort, and the
-/// original error is returned.
+/// bare target, or a directory this call created exclusively (`created`
+/// names it below its parent anchor). Everything except `HEAD` is written
+/// and synced first; until `HEAD` exists the directory is not a repository
+/// for C Git or rgit. On a failure before `HEAD` is published, the entries
+/// this call created (and an exclusively created directory) are removed,
+/// best effort, and the original error is returned.
 fn populate_in_place(
-    root: &Path,
+    root: &Anchor,
     options: &InitOptions,
     head_ref: &[u8],
     bare: bool,
-    root_created: bool,
+    created: Option<(&Anchor, &[u8])>,
 ) -> Result<(), Error> {
-    let mut created: Vec<PathBuf> = Vec::new();
+    let mut made: Vec<(Vec<u8>, bool)> = Vec::new();
     let mut head_temporary = None;
-    let prepared = (|| -> Result<PathBuf, Error> {
+    let prepared = (|| -> Result<Vec<u8>, Error> {
         for directory in DIRECTORIES {
-            let path = root.join(directory);
-            fs::create_dir(&path)?;
-            created.push(path);
+            mkdir_new(root, directory.as_bytes())?;
+            made.push((directory.as_bytes().to_vec(), true));
         }
         let config = config_bytes(root, options, bare)?;
-        let config_path = root.join("config");
-        write_synced(&config_path, &config)?;
-        created.push(config_path);
-        for directory in DIRECTORIES.iter().rev() {
-            sync_directory(&root.join(directory))?;
-        }
-        sync_directory(root)?;
+        write_synced(root, b"config", &config)?;
+        made.push((b"config".to_vec(), false));
+        sync_tree(root)?;
         super::failpoint("init.before-head")?;
-        let temporary = root.join(format!("HEAD.rgit-init-{}", super::object::unique_suffix()));
-        write_synced(&temporary, &head_bytes(head_ref))?;
+        let temporary = format!("HEAD.rgit-init-{}", super::object::unique_suffix()).into_bytes();
+        write_synced(root, &temporary, &head_bytes(head_ref))?;
         head_temporary = Some(temporary.clone());
         Ok(temporary)
     })();
     let published_head = prepared.and_then(|temporary| {
-        let linked = publish_no_replace(&temporary, &root.join("HEAD"))?;
+        let linked = publish_no_replace(root, &temporary, b"HEAD")?;
         Ok(linked.then_some(temporary))
     });
     let leftover = match published_head {
@@ -186,43 +230,44 @@ fn populate_in_place(
             // Undo only what this call created; the target stays a plain,
             // empty directory. Cleanup failures cannot hide the cause.
             if let Some(temporary) = head_temporary {
-                let _ = fs::remove_file(temporary);
+                let _ = root.unlink(&temporary);
             }
-            for path in created.iter().rev() {
-                let _ = if path.is_dir() {
-                    fs::remove_dir(path)
+            for (path, directory) in made.iter().rev() {
+                let _ = if *directory {
+                    root.rmdir(path)
                 } else {
-                    fs::remove_file(path)
+                    root.unlink(path)
                 };
             }
-            if root_created {
+            if let Some((parent, name)) = created {
                 // Only ever an empty directory this call created exclusively.
-                let _ = fs::remove_dir(root);
+                let _ = parent.rmdir(name);
             }
             return Err(error);
         }
     };
     // HEAD is published: from here on the repository exists.
+    let shown = root.display_path().to_owned();
     if let Some(temporary) = leftover {
-        fs::remove_file(&temporary)
-            .map_err(|source| published(root, "removing the temporary HEAD", source.into()))?;
+        root.unlink(&temporary)
+            .map_err(|source| published(&shown, "removing the temporary HEAD", source))?;
     }
-    sync_directory(root).map_err(|source| published(root, "syncing the repository", source))
+    root.sync()
+        .map_err(|source| published(&shown, "syncing the repository", source))
 }
 
-/// Publish the complete, synced `temporary` as `path` without ever replacing
-/// an existing entry. Uses a hard link (which fails if `path` exists) and
-/// returns `true`, leaving `temporary` for the caller to remove. Where hard
-/// links fail it uses an atomic no-replace rename and returns `false`
-/// (`temporary` is gone); where that is unsupported too, it refuses.
-fn publish_no_replace(temporary: &Path, path: &Path) -> Result<bool, Error> {
-    match fs::hard_link(temporary, path) {
+/// Publish the complete, synced `temporary` as `name` (both below `dir`)
+/// without ever replacing an existing entry. Uses a hard link (which fails
+/// if `name` exists) and returns `true`, leaving `temporary` for the caller
+/// to remove. Where hard links fail it uses an atomic no-replace rename and
+/// returns `false` (`temporary` is gone); where that is unsupported too, it
+/// refuses.
+fn publish_no_replace(dir: &Anchor, temporary: &[u8], name: &[u8]) -> Result<bool, Error> {
+    match dir.hard_link(temporary, name) {
         Ok(()) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(Error::AlreadyExists(path.to_owned()))
-        }
+        Err(Error::AlreadyExists(path)) => Err(Error::AlreadyExists(path)),
         Err(_) => {
-            super::rename_noreplace(temporary, path)?;
+            dir.rename_noreplace(temporary, name)?;
             Ok(false)
         }
     }
@@ -271,77 +316,77 @@ fn published(git_dir: &Path, step: &'static str, source: Error) -> Error {
     }))
 }
 
-/// A non-bare target is a repository if `.git` exists in any form.
-fn refuse_existing(git_dir: &Path) -> Result<(), Error> {
-    match fs::symlink_metadata(git_dir) {
-        Ok(_) => Err(Error::AlreadyExists(git_dir.to_owned())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-/// `create_dir_all`, then sync each newly created directory's parent.
-fn create_directories(directory: &Path) -> Result<(), Error> {
-    let mut missing = Vec::new();
-    let mut cursor = Some(directory);
-    while let Some(path) = cursor {
-        if path.as_os_str().is_empty() || fs::symlink_metadata(path).is_ok() {
-            break;
-        }
-        missing.push(path.to_owned());
-        cursor = path.parent();
-    }
-    fs::create_dir_all(directory)?;
-    for path in missing.iter().rev() {
-        super::sync_parent(path)?;
-    }
-    Ok(())
-}
-
-/// Assemble the Git directory in `temporary` and publish it at `target` with
-/// an atomic no-replace rename: an entry that appears at `target` meanwhile,
-/// even an empty directory, makes it fail with [`Error::AlreadyExists`] and
-/// is left untouched. Where no such rename exists (for example Windows), the
-/// private directory is discarded and `target` is created exclusively and
-/// populated in place with `HEAD` last; there is no check-then-rename.
+/// Assemble the Git directory in the private `temporary` (below `parent`)
+/// and publish it as `target` with an atomic no-replace rename: an entry
+/// that appears at `target` meanwhile, even an empty directory, makes it
+/// fail with [`Error::AlreadyExists`] and is left untouched. Where no such
+/// rename exists (for example on Windows), the private directory is
+/// discarded and `target` is created exclusively and populated in place with
+/// `HEAD` last; there is no check-then-rename.
 fn publish_git_dir(
-    temporary: &Path,
-    target: &Path,
+    parent: &Anchor,
+    temporary: &[u8],
+    target: &[u8],
     options: &InitOptions,
     head_ref: &[u8],
     bare: bool,
 ) -> Result<(), Error> {
-    fs::create_dir(temporary)?;
+    mkdir_new(parent, temporary)?;
     let result = (|| {
-        assemble(temporary, options, head_ref, bare)?;
+        let private = parent.sub(temporary)?;
+        assemble(&private, options, head_ref, bare)?;
+        drop(private);
         super::failpoint("init.before-publish")?;
-        super::rename_noreplace(temporary, target)
+        parent.rename_noreplace(temporary, target)
     })();
+    let shown = || shown(parent, target);
     match result {
-        Ok(()) => super::sync_parent(target)
-            .map_err(|source| published(target, "syncing its parent directory", source)),
+        Ok(()) => parent
+            .sync()
+            .map_err(|source| published(&shown(), "syncing its parent directory", source)),
         Err(Error::UnsupportedCapability(_)) => {
-            fs::remove_dir_all(temporary)?;
-            create_exclusively(target)?;
-            populate_in_place(target, options, head_ref, bare, true)
+            remove_tree(parent, temporary)?;
+            mkdir_new(parent, target)?;
+            parent.sync()?;
+            let created = parent.sub(target)?;
+            populate_in_place(&created, options, head_ref, bare, Some((parent, target)))
         }
         Err(error) => {
             // Only our private directory; never the entry at `target`.
-            let _ = fs::remove_dir_all(temporary);
+            let _ = remove_tree(parent, temporary);
             Err(error)
         }
     }
 }
 
-/// `mkdir` that fails if anything exists at `path`, then made durable.
-fn create_exclusively(path: &Path) -> Result<(), Error> {
-    match fs::create_dir(path) {
-        Ok(()) => super::sync_parent(path),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(Error::AlreadyExists(path.to_owned()))
-        }
-        Err(error) => Err(error.into()),
+/// Diagnostic path for messages only; never used for I/O.
+fn shown(anchor: &Anchor, rel: &[u8]) -> PathBuf {
+    anchor
+        .display_path()
+        .join(String::from_utf8_lossy(rel).as_ref())
+}
+
+/// `mkdir` that fails if anything exists at `rel`, including a directory.
+fn mkdir_new(anchor: &Anchor, rel: &[u8]) -> Result<(), Error> {
+    if anchor.mkdir(rel)? {
+        Ok(())
+    } else {
+        Err(Error::AlreadyExists(shown(anchor, rel)))
     }
+}
+
+/// Remove the private directory tree `rel` this call created, through the
+/// anchor and without following symlinks.
+fn remove_tree(anchor: &Anchor, rel: &[u8]) -> Result<(), Error> {
+    for (name, kind) in anchor.read_dir(rel)? {
+        let child = [rel, b"/", &name].concat();
+        if kind == Kind::Dir {
+            remove_tree(anchor, &child)?;
+        } else {
+            anchor.unlink(&child)?;
+        }
+    }
+    anchor.rmdir(rel)
 }
 
 const DIRECTORIES: [&str; 6] = [
@@ -360,23 +405,33 @@ fn head_bytes(head_ref: &[u8]) -> Vec<u8> {
     head
 }
 
-fn assemble(root: &Path, options: &InitOptions, head_ref: &[u8], bare: bool) -> Result<(), Error> {
+fn assemble(
+    root: &Anchor,
+    options: &InitOptions,
+    head_ref: &[u8],
+    bare: bool,
+) -> Result<(), Error> {
     for directory in DIRECTORIES {
-        fs::create_dir(root.join(directory))?;
+        mkdir_new(root, directory.as_bytes())?;
     }
-    write_synced(&root.join("HEAD"), &head_bytes(head_ref))?;
+    write_synced(root, b"HEAD", &head_bytes(head_ref))?;
     let config = config_bytes(root, options, bare)?;
-    write_synced(&root.join("config"), &config)?;
+    write_synced(root, b"config", &config)?;
+    sync_tree(root)
+}
+
+/// Sync the created directories bottom-up, then the root itself.
+fn sync_tree(root: &Anchor) -> Result<(), Error> {
     for directory in DIRECTORIES.iter().rev() {
-        sync_directory(&root.join(directory))?;
+        root.sub(directory.as_bytes())?.sync()?;
     }
-    sync_directory(root)
+    root.sync()
 }
 
 /// Mirror the `[core]` settings C Git's `init` writes, including its
 /// filesystem probes (executable bit, symlinks, case and, on macOS, Unicode
 /// normalization), so C Git treats the repository identically.
-fn config_bytes(root: &Path, options: &InitOptions, bare: bool) -> Result<Vec<u8>, Error> {
+fn config_bytes(root: &Anchor, options: &InitOptions, bare: bool) -> Result<Vec<u8>, Error> {
     let sha256 = options.object_format == ObjectFormat::Sha256;
     // C Git writes the extension section first for SHA-256 repositories.
     let mut config = String::new();
@@ -407,82 +462,64 @@ fn config_bytes(root: &Path, options: &InitOptions, bare: bool) -> Result<Vec<u8
     Ok(config.into_bytes())
 }
 
+/// Git's probe: does toggling the executable bit stick? Done on the probe
+/// file's own descriptor.
 #[cfg(unix)]
-fn probe_filemode(root: &Path) -> Result<bool, Error> {
+fn probe_filemode(root: &Anchor) -> Result<bool, Error> {
     use std::os::unix::fs::PermissionsExt;
-    let path = root.join("config");
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)?;
-    drop(file);
-    let mode = fs::symlink_metadata(&path)?.permissions().mode();
+    let file = root.create_new(b"config", 0o666)?;
+    let mode = file.metadata()?.permissions().mode();
     let toggled = mode ^ 0o100;
-    let trusted = fs::set_permissions(&path, fs::Permissions::from_mode(toggled)).is_ok()
-        && fs::symlink_metadata(&path)?.permissions().mode() & 0o100 == toggled & 0o100;
-    fs::remove_file(&path)?;
+    let trusted = file
+        .set_permissions(std::fs::Permissions::from_mode(toggled))
+        .is_ok()
+        && file.metadata()?.permissions().mode() & 0o100 == toggled & 0o100;
+    drop(file);
+    root.unlink(b"config")?;
     Ok(trusted)
 }
 
 #[cfg(not(unix))]
-fn probe_filemode(_root: &Path) -> Result<bool, Error> {
+fn probe_filemode(_root: &Anchor) -> Result<bool, Error> {
     Ok(false)
 }
 
 /// Git's probe: can a symlink be created? A probe link that cannot be
 /// removed is an error rather than a stray entry in the Git directory.
-fn probe_symlinks(root: &Path) -> Result<bool, Error> {
-    let link = root.join("tXXXXXX");
-    #[cfg(unix)]
-    let created = std::os::unix::fs::symlink("testing", &link).is_ok();
+fn probe_symlinks(root: &Anchor) -> Result<bool, Error> {
     // Git for Windows records `core.symlinks=false` at init unless symlinks
     // were enabled through configuration rgit does not read; match it rather
     // than probing whether this process happens to hold symlink privileges.
-    #[cfg(windows)]
-    let created = {
-        let _ = &link;
-        false
-    };
-    #[cfg(not(any(unix, windows)))]
-    let created = false;
+    if !cfg!(unix) {
+        return Ok(false);
+    }
+    let created = root.symlink(b"testing", b"tXXXXXX").is_ok();
     if created {
-        fs::remove_file(&link)?;
+        root.unlink(b"tXXXXXX")?;
     }
     Ok(created)
 }
 
 /// Git's probe: after creating `config`, can it be found as `CoNfIg`?
-fn probe_ignorecase(root: &Path) -> Result<bool, Error> {
-    let path = root.join("config");
-    File::create(&path)?;
-    let folded = fs::symlink_metadata(root.join("CoNfIg")).is_ok();
-    fs::remove_file(&path)?;
+fn probe_ignorecase(root: &Anchor) -> Result<bool, Error> {
+    drop(root.create_new(b"config", 0o666)?);
+    let folded = root.lstat(b"CoNfIg")?.is_some();
+    root.unlink(b"config")?;
     Ok(folded)
 }
 
 /// Git's probe: is a precomposed (NFC) name reachable by its NFD spelling?
 #[cfg(target_os = "macos")]
-fn probe_precompose(root: &Path) -> Result<bool, Error> {
-    use std::os::unix::ffi::OsStrExt;
-    let nfc = root.join(std::ffi::OsStr::from_bytes(b"\xc3\xa4"));
-    let nfd = root.join(std::ffi::OsStr::from_bytes(b"a\xcc\x88"));
-    File::create(&nfc)?;
-    let reachable = fs::symlink_metadata(&nfd).is_ok();
-    fs::remove_file(&nfc)?;
+fn probe_precompose(root: &Anchor) -> Result<bool, Error> {
+    drop(root.create_new(b"\xc3\xa4", 0o666)?);
+    let reachable = root.lstat(b"a\xcc\x88")?.is_some();
+    root.unlink(b"\xc3\xa4")?;
     Ok(reachable)
 }
 
-fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), Error> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+fn write_synced(root: &Anchor, rel: &[u8], bytes: &[u8]) -> Result<(), Error> {
+    let mut file = root.create_new(rel, 0o666)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    Ok(())
-}
-
-fn sync_directory(path: &Path) -> Result<(), Error> {
-    #[cfg(unix)]
-    File::open(path)?.sync_all()?;
-    #[cfg(not(unix))]
-    let _ = path;
     Ok(())
 }

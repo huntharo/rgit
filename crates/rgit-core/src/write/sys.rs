@@ -70,18 +70,6 @@ pub(crate) fn open_leaf_nofollow(path: &Path) -> std::io::Result<File> {
     options.open(path)
 }
 
-/// Flush an existing file that another writer (or an earlier run) created,
-/// then its directory. Unix syncs through a read-only descriptor. On Windows
-/// this implementation does not re-sync: `FlushFileBuffers` needs a writable
-/// handle and loose objects are read-only, so durability relies on the writer.
-// Used by the legacy path backend; the anchored Unix backend does not.
-#[cfg_attr(unix, allow(dead_code))]
-pub(crate) fn sync_existing_file(path: &Path) -> Result<(), Error> {
-    #[cfg(unix)]
-    File::open(path)?.sync_all()?;
-    super::sync_parent(path)
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
