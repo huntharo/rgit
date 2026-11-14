@@ -122,7 +122,7 @@ fn init_bare(
         None => {}
         Some(meta) if meta.kind == Kind::Symlink => {
             return Err(Error::UnsupportedCapability(
-                "bare repository target is a dangling symbolic link",
+                "bare repository target is a symbolic link that does not name a directory",
             ));
         }
         Some(_) => return Err(Error::AlreadyExists(directory.to_owned())),

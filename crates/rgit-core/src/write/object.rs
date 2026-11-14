@@ -13,12 +13,13 @@
 //! Reads on write paths: a loose object is opened only through the objects
 //! anchor (no-follow, non-blocking, regular files only), so a loose file
 //! swapped for a FIFO or symlink is refused rather than waited on or
-//! followed. Packed objects and alternates are still read by Gitoxide, by
-//! path, after [`check_object_store`] verified through the anchor that every
-//! pack, index, reverse index, mtimes and multi-pack-index entry and
-//! `objects/info/alternates` is a regular file: packs and alternates are
-//! opened by Gitoxide by path after an anchored kind check, and a swap after
-//! that check is not covered.
+//! followed. Packed objects are still read by Gitoxide, by path, after
+//! [`check_object_store`] verified through the anchor that every pack,
+//! index, reverse index, mtimes and multi-pack-index entry is a regular
+//! file; a swap after that check is not covered. For alternates, only the
+//! `objects/info/alternates` file itself is kind-checked: the object
+//! directories it names are read by Gitoxide by path with no check, so
+//! alternate object stores are not covered by descriptor-root identity.
 
 use std::fs::File;
 use std::io::Write;
@@ -275,6 +276,9 @@ pub(super) fn read_loose(
 /// directory whose pack-related entries are regular files and that
 /// `objects/info/alternates` is a regular file if present. This narrows, but
 /// does not close, the window in which Gitoxide could open a swapped file.
+/// Only the alternates file is checked: the object directories it names are
+/// read by Gitoxide by path with no check, so alternate object stores are
+/// not covered.
 pub(crate) fn check_object_store(common: &Anchor) -> Result<(), Error> {
     let special = || Error::UnsupportedCapability("symlink or special pack or alternates file");
     match common.lstat(b"objects/pack")? {

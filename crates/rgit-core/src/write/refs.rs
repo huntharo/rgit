@@ -837,20 +837,25 @@ impl LockIdentity {
 }
 
 /// Map a post-publication error from `LockFile::commit` (see
-/// `lock::after_publication`): unsynced becomes
-/// [`RefPublishedUnsyncedError`], unreachable becomes
-/// [`RefPublishedUnreachableError`].
+/// `lock::after_publication`) explicitly by type:
+/// `LockPublishedUnsyncedError` becomes [`RefPublishedUnsyncedError`] and
+/// `LockPublishedUnreachableError` becomes [`RefPublishedUnreachableError`].
+/// Any other post-publication error is returned unchanged: relabelling it
+/// could turn an uncertain outcome into "was updated".
 fn published_after_error(reference: Vec<u8>, logged: bool, source: Error) -> Error {
-    let unreachable = matches!(&source, Error::Other(error)
-        if error.is::<super::LockPublishedUnreachableError>());
-    if unreachable {
+    let Error::Other(error) = &source else {
+        return source;
+    };
+    if error.is::<super::LockPublishedUnsyncedError>() {
+        Error::Other(Box::new(RefPublishedUnsyncedError { reference, source }))
+    } else if error.is::<super::LockPublishedUnreachableError>() {
         Error::Other(Box::new(RefPublishedUnreachableError {
             reference,
             logged,
             source,
         }))
     } else {
-        Error::Other(Box::new(RefPublishedUnsyncedError { reference, source }))
+        source
     }
 }
 
@@ -1015,6 +1020,41 @@ impl std::error::Error for RefLoggedNotPublishedError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A post-publication error of a kind this mapping does not know (for
+    /// example one added to `after_publication` later) passes through
+    /// unchanged; it is never relabelled as "was updated".
+    #[test]
+    fn unknown_post_publication_errors_pass_through_unchanged() {
+        #[derive(Debug)]
+        struct Uncertain;
+        impl std::fmt::Display for Uncertain {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("rename outcome uncertain")
+            }
+        }
+        impl std::error::Error for Uncertain {}
+
+        let mapped = published_after_error(
+            b"refs/heads/main".to_vec(),
+            true,
+            Error::Other(Box::new(Uncertain)),
+        );
+        assert!(
+            matches!(&mapped, Error::Other(error) if error.is::<Uncertain>()),
+            "{mapped:?}"
+        );
+        assert_eq!(mapped.to_string(), "rename outcome uncertain");
+        let injected = published_after_error(
+            b"refs/heads/main".to_vec(),
+            true,
+            Error::Injected("lock.after-rename"),
+        );
+        assert!(
+            matches!(injected, Error::Injected("lock.after-rename")),
+            "{injected:?}"
+        );
+    }
 
     #[test]
     fn unreachable_publication_is_never_reported_as_not_updated() {

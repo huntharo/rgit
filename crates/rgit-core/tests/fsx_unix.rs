@@ -118,7 +118,7 @@ fn child_action() -> Result {
     };
     match result {
         Ok(()) => println!("RESULT ok"),
-        Err(Error::AlreadyExists(_)) => println!("RESULT already-exists"),
+        Err(Error::AlreadyExists(path)) => println!("RESULT already-exists {}", path.display()),
         Err(error) => println!(
             "RESULT {} {error}",
             post_publication(&error).unwrap_or("error")
@@ -330,11 +330,32 @@ fn object_writes_are_not_redirected_by_a_swapped_fanout() -> Result {
             symlink(&outside, &fanout)?;
             let result = child.finish()?;
 
-            assert!(
-                result.starts_with("error") || result == "already-exists",
-                "{point}: {result}"
-            );
             assert_eq!(fingerprint(&outside)?, before, "{point}: outside changed");
+            if point == "object.before-fanout" {
+                // The fan-out mkdir finds the symlink: a symlink is not "a
+                // directory already exists", and it is never followed.
+                assert_eq!(
+                    result,
+                    format!("already-exists {}", fanout.display()),
+                    "{point}"
+                );
+            } else {
+                // Published under the held (moved) fan-out, then refused
+                // because the name readers walk no longer reaches it.
+                assert_eq!(
+                    result,
+                    "error unsupported capability: object directory was replaced while the \
+                     object was written",
+                    "{point}"
+                );
+                let moved = repo.join(".git/objects/moved").join(&id[2..]);
+                assert!(moved.is_file(), "{point}: object not in the moved fan-out");
+                // Restoring the moved directory yields a valid object store.
+                fs::remove_file(&fanout)?;
+                fs::rename(repo.join(".git/objects/moved"), &fanout)?;
+                git(&repo, &["cat-file", "-e", &id])?;
+                common::fsck(&repo)?;
+            }
         }
     }
     Ok(())
@@ -364,10 +385,27 @@ fn ref_and_reflog_writes_are_not_redirected() -> Result {
             symlink(&outside, &target)?;
             let result = child.finish()?;
 
-            assert!(
-                result.starts_with("error") || result == "already-exists",
-                "{swap}: {result}"
-            );
+            if swap == "refs/heads" {
+                // Creating the ref directory finds the symlink, which is
+                // refused (never followed) as an existing non-directory.
+                assert_eq!(
+                    result,
+                    format!("already-exists {}", target.display()),
+                    "{swap}"
+                );
+            } else {
+                // Probing the reflog walks `logs` without following it; the
+                // symlinked component is reported as an entry where a
+                // directory is needed (macOS and Linux alike).
+                assert_eq!(
+                    result,
+                    format!(
+                        "already-exists {}",
+                        repo.join(".git/logs/refs/heads/master").display()
+                    ),
+                    "{swap}"
+                );
+            }
             assert_eq!(fingerprint(&outside)?, before, "{swap}: outside changed");
             assert!(
                 !repo.join(".git/refs/heads.moved/master").exists()
