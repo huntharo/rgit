@@ -342,11 +342,23 @@ fn absent_target_uses_before_publish(driver: Driver) -> Result {
         let sandbox = sandbox()?;
         let mut command = driver.init_cmd(sandbox.path(), &bare_args(hash, "absent.git"));
         with_failpoint(&mut command, "init.before-head");
-        ok_quiet(
-            &run(&mut command)?,
-            "absent target armed at init.before-head",
-        )?;
-        assert_valid_bare(&sandbox.path().join("absent.git"), hash)?;
+        if cfg!(windows) {
+            // No atomic no-replace rename on Windows: an absent target is
+            // created exclusively and populated in place, HEAD last, so
+            // init.before-head is reached and nothing names a repository.
+            expect_abort(&run(&mut command)?, "init.before-head")?;
+            let target = sandbox.path().join("absent.git");
+            if fs::symlink_metadata(target.join("HEAD")).is_ok() {
+                return Err("absent target got HEAD before init.before-head".into());
+            }
+            eprintln!("NOTE: Windows absent bare target uses in-place population");
+        } else {
+            ok_quiet(
+                &run(&mut command)?,
+                "absent target armed at init.before-head",
+            )?;
+            assert_valid_bare(&sandbox.path().join("absent.git"), hash)?;
+        }
 
         let mut command = driver.init_cmd(sandbox.path(), &bare_args(hash, "absent2.git"));
         with_failpoint(&mut command, "init.before-publish");

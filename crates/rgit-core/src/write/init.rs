@@ -435,8 +435,14 @@ fn probe_symlinks(root: &Path) -> Result<bool, Error> {
     let link = root.join("tXXXXXX");
     #[cfg(unix)]
     let created = std::os::unix::fs::symlink("testing", &link).is_ok();
+    // Git for Windows records `core.symlinks=false` at init unless symlinks
+    // were enabled through configuration rgit does not read; match it rather
+    // than probing whether this process happens to hold symlink privileges.
     #[cfg(windows)]
-    let created = std::os::windows::fs::symlink_file("testing", &link).is_ok();
+    let created = {
+        let _ = &link;
+        false
+    };
     #[cfg(not(any(unix, windows)))]
     let created = false;
     if created {

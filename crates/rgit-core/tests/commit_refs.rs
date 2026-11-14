@@ -1550,6 +1550,21 @@ mod failpoints {
             let mut running = child(&dir, "commit.ref-locked:pause", Some(&sync))?.spawn()?;
             wait_for(&sync.join("ready"))?;
             let lock = git_dir.join("refs/heads/main.lock");
+            if cfg!(windows) {
+                // A held lock cannot be deleted on Windows (no FILE_SHARE_DELETE),
+                // so the replacement cannot happen; the paused commit publishes.
+                match std::fs::remove_file(&lock) {
+                    Err(error) if error.raw_os_error() == Some(32) => {}
+                    other => return Err(format!("held lock removable: {other:?}").into()),
+                }
+                std::fs::write(sync.join("release"), b"")?;
+                assert!(running.wait()?.success());
+                let result = child_result(&dir)?;
+                assert!(result.starts_with("ok "), "{result}");
+                assert!(!lock.exists() && !git_dir.join("HEAD.lock").exists());
+                fsck(&dir)?;
+                continue;
+            }
             std::fs::remove_file(&lock)?;
             std::fs::write(&lock, b"foreign\n")?;
             std::fs::write(sync.join("release"), b"")?;

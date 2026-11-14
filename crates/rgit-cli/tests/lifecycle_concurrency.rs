@@ -362,6 +362,24 @@ fn replaced_lock_never_published_or_unlinked(driver: Driver) -> Result {
             if !exists(&lock) {
                 return Err(format!("{point} paused without {}", lock.display()).into());
             }
+            if cfg!(windows) {
+                // The held lock is opened without FILE_SHARE_DELETE, so no
+                // other process can remove or replace it: the scenario this
+                // test guards against cannot be set up. Assert that instead.
+                let removed = fs::remove_file(&lock);
+                match removed {
+                    Err(error) if error.raw_os_error() == Some(32) => {}
+                    other => {
+                        return Err(format!("held lock removable on Windows: {other:?}").into());
+                    }
+                }
+                let output = paused.release()?;
+                if !output.status.success() {
+                    return Err(format!("{point} after refused removal: {output:?}").into());
+                }
+                eprintln!("NOTE: {point}: Windows refused deleting the held lock (os error 32)");
+                continue;
+            }
             fs::remove_file(&lock)?;
             let foreign = b"foreign writer's lock\n";
             fs::write(&lock, foreign)?;
