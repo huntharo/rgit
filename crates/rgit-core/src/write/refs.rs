@@ -275,7 +275,8 @@ impl Repository {
         let result = match lock.commit() {
             Ok(()) => Ok(()),
             // Uncertain post-rename outcome (Windows legacy lock): the rename
-            // returned success but the target no longer has our identity.
+            // returned success but the target could not be confirmed to still
+            // have our identity.
             // Returned as is, whether or not a reflog was appended, before
             // any other classification: it is neither "updated" nor "not
             // updated".

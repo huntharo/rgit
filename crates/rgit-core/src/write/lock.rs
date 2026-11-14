@@ -218,8 +218,9 @@ impl<'a> LockFile<'a> {
     /// which the root no longer reaches at that name; state uncertain).
     /// Nothing is ever rolled back. The path form keeps its pre-hardening
     /// errors (an error after its rename is returned as is), except that on
-    /// Windows a target that no longer has our identity after the rename is
-    /// [`RenameOutcomeUncertainError`], also a post-publication type.
+    /// Windows a target that cannot be confirmed to still have our identity
+    /// after the rename is [`RenameOutcomeUncertainError`], also a
+    /// post-publication type.
     pub(crate) fn commit(mut self) -> Result<(), Error> {
         let file = self.file.as_mut().ok_or(Error::Injected("lock reused"))?;
         file.flush()?;
@@ -748,8 +749,11 @@ impl std::fmt::Display for ObservedTarget {
     }
 }
 
-/// A path-form lock rename returned success, but the target no longer has the
-/// identity of the lock file this writer created. The outcome is UNCERTAIN:
+/// A path-form lock rename returned success, but the target could not be
+/// confirmed to still have the identity of the lock file this writer created:
+/// either a different identity was observed there, or the target was absent,
+/// or it could not be observed at all ([`ObservedTarget::Unavailable`], where
+/// the identity may be unknown). The outcome is UNCERTAIN:
 /// the value may have been published by us and then replaced by another
 /// (possibly legitimate) writer, or the rename may have published a file
 /// that replaced our lock in the close-before-rename window. It does not mean
@@ -801,9 +805,18 @@ impl RenameOutcomeUncertainError {
 
 impl std::fmt::Display for RenameOutcomeUncertainError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A mismatch is only asserted when it was observed: a different
+        // identity, or a confirmed absence. Otherwise our identity simply
+        // could not be confirmed.
+        let finding = match &self.observed {
+            ObservedTarget::Unavailable { id: None, .. } => {
+                "could not confirm that the target still has our identity"
+            }
+            _ => "the target no longer has our identity",
+        };
         write!(
             f,
-            "rename to {} returned success, but the target no longer has our identity; \
+            "rename to {} returned success, but {finding}; \
              it may have been published by us and then replaced, or the rename published \
              another file (observed: {})",
             self.target.display(),
@@ -1422,5 +1435,31 @@ mod tests {
             PathBuf::from("x"),
             Error::Injected("lock.after-rename")
         )));
+    }
+
+    /// The outer message asserts a mismatch only when one was observed; with
+    /// an unavailable observation and no identity it says the identity could
+    /// not be confirmed.
+    #[test]
+    fn uncertain_display_asserts_mismatch_only_when_observed() {
+        let error = |observed| RenameOutcomeUncertainError {
+            target: PathBuf::from("HEAD"),
+            ours: (1, 2),
+            observed,
+        };
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+
+        let unknown = error(ObservedTarget::unavailable(None, &denied)).to_string();
+        assert!(
+            unknown.contains("could not confirm that the target still has our identity"),
+            "{unknown}"
+        );
+        assert!(!unknown.contains("no longer has our identity"), "{unknown}");
+
+        let probed = error(ObservedTarget::unavailable(Some((1, 3)), &denied)).to_string();
+        assert!(probed.contains("no longer has our identity"), "{probed}");
+
+        let absent = error(ObservedTarget::Absent).to_string();
+        assert!(absent.contains("no longer has our identity"), "{absent}");
     }
 }
