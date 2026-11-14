@@ -73,16 +73,28 @@ impl Repository {
                 "symlink or special index file",
             ));
         }
-        let timestamp = metadata.modified()?.into();
+        let modified = metadata.modified()?;
         let mut data = Vec::new();
         file.read_to_end(&mut data)?;
+        self.decode_index(&data, modified)
+    }
+
+    /// Decode and validate index bytes that the caller already read (through
+    /// whatever access path it trusts), with `modified` as the index file's
+    /// timestamp. No file is opened here.
+    pub(crate) fn decode_index(
+        &self,
+        data: &[u8],
+        modified: std::time::SystemTime,
+    ) -> Result<gix::index::File, Error> {
+        let path = self.inner.index_path();
         // Decode the bytes we verify, without File::at() transparently loading
         // and dissolving a split index. Never let index.skipHash disable checking
         // a present checksum. An all-zero trailer is Git's documented omission.
         let hash = self.inner.object_hash();
         let (state, checksum) = gix::index::State::from_bytes(
-            &data,
-            timestamp,
+            data,
+            modified.into(),
             hash,
             gix::index::decode::Options::default(),
         )?;

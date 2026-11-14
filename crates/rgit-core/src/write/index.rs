@@ -203,6 +203,22 @@ impl Repository {
             git: self.git_dir_anchor()?,
             common: self.common_anchor()?,
         };
+        // The in-progress markers Gitoxide's `Repository::state` looks for,
+        // checked through the Git directory anchor (no path lookups).
+        for marker in [
+            &b"rebase-apply"[..],
+            b"rebase-merge",
+            b"CHERRY_PICK_HEAD",
+            b"MERGE_HEAD",
+            b"BISECT_LOG",
+            b"REVERT_HEAD",
+        ] {
+            if anchors.git.lstat(marker)?.is_some() {
+                return Err(Error::UnsupportedCapability(
+                    "add during an in-progress merge, rebase, cherry-pick or similar operation",
+                ));
+            }
+        }
         for _ in 0..2 {
             if let Some(outcome) = self.add_attempt(&anchors, &pathspecs, config)? {
                 return Ok(outcome);
@@ -213,11 +229,6 @@ impl Repository {
 
     fn add_preflight_config(&self) -> Result<AddConfig, Error> {
         self.inspection_execution_policy()?;
-        if self.inner.state().is_some() {
-            return Err(Error::UnsupportedCapability(
-                "add during an in-progress merge, rebase, cherry-pick or similar operation",
-            ));
-        }
         let snapshot = self.inner.config_snapshot();
         let config = snapshot.plumbing();
         let flag = |key: &str, default: bool| -> Result<bool, Error> {
@@ -284,7 +295,7 @@ impl Repository {
         }
         super::failpoint("add.objects-written")?;
         let mut lock = super::LockFile::acquire_at(&anchors.git, b"index")?;
-        if read_index_bytes(&anchors.git)? != prepared.snapshot {
+        if read_index_bytes(&anchors.git)?.map(|(bytes, _)| bytes) != prepared.snapshot {
             return Ok(None);
         }
         if !prepared.changed {
@@ -315,11 +326,11 @@ impl Repository {
         config: AddConfig,
     ) -> Result<Option<Prepared>, Error> {
         let wt = &anchors.worktree;
-        let snapshot = read_index_bytes(&anchors.git)?;
-        let file = self.read_index()?;
-        if read_index_bytes(&anchors.git)? != snapshot {
-            return Ok(None);
-        }
+        // Decode exactly the bytes read through the Git directory anchor;
+        // the index is never opened by path (a FIFO swapped in cannot block).
+        let read = read_index_bytes(&anchors.git)?;
+        let file = self.decode_read_index(read.as_ref())?;
+        let snapshot = read.map(|(bytes, _)| bytes);
         if file.version() == gix::index::Version::V4 {
             return Err(Error::UnsupportedCapability(
                 "writing a version 4 (path-compressed) index",
@@ -1538,9 +1549,10 @@ fn read_metadata_leaf(anchor: &Anchor, rel: &[u8]) -> Result<Option<Vec<u8>>, Er
     Ok(Some(bytes))
 }
 
-/// Raw index bytes (through the Git directory anchor) for snapshot
-/// comparison; `None` if there is no index.
-fn read_index_bytes(git: &Anchor) -> Result<Option<Vec<u8>>, Error> {
+/// Raw index bytes and modification time, read through the Git directory
+/// anchor (no-follow, non-blocking, regular files only); `None` if there is
+/// no index.
+fn read_index_bytes(git: &Anchor) -> Result<Option<(Vec<u8>, std::time::SystemTime)>, Error> {
     match git.lstat(b"index")? {
         None => return Ok(None),
         Some(meta) if !matches!(meta.kind, Kind::File { .. }) => {
@@ -1553,9 +1565,37 @@ fn read_index_bytes(git: &Anchor) -> Result<Option<Vec<u8>>, Error> {
     let (mut file, _) = match git.open_read(b"index") {
         Ok(opened) => opened,
         Err(_) if git.lstat(b"index")?.is_none() => return Ok(None),
+        Err(Error::UnsupportedCapability(_)) => {
+            return Err(Error::UnsupportedCapability(
+                "symlink or special index file",
+            ));
+        }
         Err(error) => return Err(error),
     };
+    let modified = file.metadata()?.modified()?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    Ok(Some(bytes))
+    Ok(Some((bytes, modified)))
+}
+
+impl Repository {
+    /// The index as read through the Git directory anchor (an absent index
+    /// is empty); never opened by path.
+    pub(super) fn read_index_anchored(&self, git: &Anchor) -> Result<gix::index::File, Error> {
+        let read = read_index_bytes(git)?;
+        self.decode_read_index(read.as_ref())
+    }
+
+    fn decode_read_index(
+        &self,
+        read: Option<&(Vec<u8>, std::time::SystemTime)>,
+    ) -> Result<gix::index::File, Error> {
+        match read {
+            Some((bytes, modified)) => self.decode_index(bytes, *modified),
+            None => Ok(gix::index::File::from_state(
+                gix::index::State::new(self.inner.object_hash()),
+                self.inner.index_path(),
+            )),
+        }
+    }
 }

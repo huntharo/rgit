@@ -9,7 +9,7 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::{MetadataExt, symlink};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -497,6 +497,44 @@ fn a_replaced_head_lock_stops_publication() -> Result {
                 );
             }
         }
+    }
+    Ok(())
+}
+
+/// R1: the index is read only through the Git directory anchor (no-follow,
+/// non-blocking) and decoded from those bytes. Swapped for a FIFO after the
+/// snapshot read, the under-lock re-read refuses instead of blocking; an
+/// index that is a FIFO from the start is refused by add and commit alike.
+#[test]
+fn an_index_swapped_for_a_fifo_never_blocks() -> Result {
+    for format in FORMATS {
+        let temp = tempfile::tempdir()?;
+        let repo = temp.path().join("repo");
+        init(&repo, &options(format))?;
+        fs::write(repo.join("tracked"), b"tracked\n")?;
+        Repository::discover(&repo)?.add(&[BStr::new("tracked")])?;
+        fs::write(repo.join("new.txt"), b"new\n")?;
+        let index = repo.join(".git/index");
+
+        let child = start(Some("add.before-descend"), "add:new.txt", &repo)?;
+        fs::remove_file(&index)?;
+        mkfifo(&index)?;
+        let result = child.finish()?;
+        assert!(
+            result.contains("special index file"),
+            "{format:?}: {result}"
+        );
+        assert!(fs::symlink_metadata(&index)?.file_type().is_fifo());
+
+        for scenario in ["add:new.txt", "commit"] {
+            let result = start(None, scenario, &repo)?.finish()?;
+            assert!(
+                result.contains("special index file"),
+                "{format:?} {scenario}: {result}"
+            );
+        }
+        assert!(!repo.join(".git/index.lock").exists());
+        assert!(!repo.join(".git/refs/heads/master").exists());
     }
     Ok(())
 }

@@ -67,16 +67,16 @@ impl Repository {
     /// ([`Error::UnmergedIndex`]), intent-to-add entries and gitlinks are
     /// refused, and each blob must be present ([`Error::MissingObject`]).
     pub fn write_tree_from_index(&self) -> Result<ObjectId, Error> {
-        let common = self.common_anchor()?;
-        let plan = self.plan_tree_from_index()?;
-        self.write_planned_trees(&common, &plan)?;
+        let anchors = RefAnchors::open(self)?;
+        let plan = self.plan_tree_from_index(&anchors.git)?;
+        self.write_planned_trees(&anchors.common, &plan)?;
         Ok(plan.root)
     }
 
     /// Validate the index and compute every tree object in memory, without
     /// writing anything.
-    fn plan_tree_from_index(&self) -> Result<TreePlan, Error> {
-        let index = self.read_index()?;
+    fn plan_tree_from_index(&self, git: &Anchor) -> Result<TreePlan, Error> {
+        let index = self.read_index_anchored(git)?;
         let hash = self.inner.object_hash();
         if index.entries().iter().any(|entry| entry.stage_raw() != 0) {
             return Err(Error::UnmergedIndex);
@@ -156,7 +156,7 @@ impl Repository {
         };
 
         // Decide on an in-memory tree so a refusal writes nothing.
-        let plan = self.plan_tree_from_index()?;
+        let plan = self.plan_tree_from_index(&anchors.git)?;
         let tree = plan.root;
         if !request.allow_empty && parent_tree.unwrap_or_else(|| ObjectId::empty_tree(hash)) == tree
         {
