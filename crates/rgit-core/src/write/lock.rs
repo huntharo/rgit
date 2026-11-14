@@ -812,9 +812,11 @@ mod tests {
         std::fs::rename(&ours_path, &target)?;
         observe_after_rename(&target, ours)?;
 
-        // Replaced after publication (or published in place of ours).
-        std::fs::remove_file(&target)?;
-        std::fs::write(&target, b"someone else")?;
+        // Replaced after publication (or published in place of ours). The
+        // replacement is written first and renamed over the target, so it
+        // never reuses our inode (ext4 can hand a freed inode straight back).
+        std::fs::write(dir.join("replacement"), b"someone else")?;
+        std::fs::rename(dir.join("replacement"), &target)?;
         let replaced = Identity::of_path(&target)?;
         match observe_after_rename(&target, ours) {
             Err(Error::Other(error)) => {
