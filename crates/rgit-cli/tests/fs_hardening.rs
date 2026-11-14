@@ -474,7 +474,13 @@ fn info_file_swapped_to_fifo_while_paused(hash: Hash, name: &str) -> Result {
 /// refuse; the replacement keeps its bytes and inode; nothing outside
 /// changes.
 #[cfg(unix)]
-fn lock_recreated(hash: Hash, commit: bool, lock_rel: &str, as_symlink: bool) -> Result {
+fn lock_recreated(
+    hash: Hash,
+    commit: bool,
+    lock_rel: &str,
+    as_symlink: bool,
+    refusal_only: bool,
+) -> Result {
     let mut fx = Fixture::new(hash)?;
     let when = fx.s.model.tick();
     let (mut command, point) = if commit {
@@ -525,7 +531,13 @@ fn lock_recreated(hash: Hash, commit: bool, lock_rel: &str, as_symlink: bool) ->
     // make the writer refuse. HEAD.lock of a branch commit is only a guard,
     // never published: completing is acceptable provided the replacement is
     // neither published nor unlinked (checked below).
-    let guard_only = lock_rel == "HEAD.lock";
+    // `refusal_only` (decision for PWR-194): HEAD.lock is the guard under
+    // which the writer decides whether HEAD names the branch and appends to
+    // logs/HEAD; if it is no longer ours that decision is stale, so the
+    // branch must not be published. The refusal judgement below then also
+    // proves the branch, both reflogs and HEAD unchanged and the writer's
+    // own branch lock released.
+    let guard_only = lock_rel == "HEAD.lock" && !refusal_only;
     let completed = output.status.code() == Some(0);
     if !(output.status.code() == Some(128) || (guard_only && completed)) {
         return Err(format!("{context}: writer did not refuse: {}", describe(&output)).into());
@@ -891,9 +903,17 @@ fn lock_identity(_: Driver) -> Result {
                 let kind = if as_symlink { "symlink" } else { "file" };
                 let label = format!("A4 {h} {lock} recreated as {kind}");
                 if let Err(e) = case(&label, expect_for(&label), || {
-                    lock_recreated(hash, commit, lock, as_symlink)
+                    lock_recreated(hash, commit, lock, as_symlink, false)
                 }) {
                     failures.push(e.to_string());
+                }
+                if lock == "HEAD.lock" {
+                    let label = format!("A4 {h} {lock} recreated as {kind} / refusal-only");
+                    if let Err(e) = case(&label, expect_for(&label), || {
+                        lock_recreated(hash, commit, lock, as_symlink, true)
+                    }) {
+                        failures.push(e.to_string());
+                    }
                 }
             }
         }
@@ -966,7 +986,10 @@ fn expect_for(name: &str) -> Expect {
     // goes through the swapped link, so its own temporary object or locks
     // stay orphaned in the original directory. The decoy itself is
     // untouched in both cases (enforced now by the non-strict variants).
-    const AFTER_ANCHORING: [&str; 2] = ["own temporary removed", "own locks removed"];
+    // A branch commit whose HEAD.lock guard was replaced must refuse (WP1
+    // re-verifies HEAD.lock ownership in refs.rs); the baseline completes.
+    const AFTER_ANCHORING: [&str; 3] =
+        ["own temporary removed", "own locks removed", "refusal-only"];
     if AFTER_ANCHORING.iter().any(|pattern| name.contains(pattern)) {
         Expect::AfterAnchoring
     } else {
