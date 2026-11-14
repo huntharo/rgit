@@ -13,6 +13,10 @@
 //! In both cases every decoy byte, entry and inode is untouched, no decoy
 //! content is staged or stored as an object, foreign locks keep their bytes
 //! and inode, every wait is bounded, and `git fsck --strict` passes.
+//!
+//! Races are exercised at deterministic pause points taken from the source.
+//! The results show behaviour at those boundaries only; they do not prove
+//! that no other interleaving between system calls exists.
 
 #[allow(dead_code)]
 #[path = "lifecycle_support/mod.rs"]
@@ -589,6 +593,135 @@ fn lock_recreated(
     no_decoy_objects(&fx)
 }
 
+/// A branch commit paused at `ref.logged` (both reflog lines appended, ref
+/// not yet renamed) whose HEAD.lock guard is removed and recreated: the
+/// guard check before the rename must stop publication, leaving the
+/// documented logged-not-published state. Ref unchanged, both logs hold
+/// exactly the new C Git line (no rollback), typed error, foreign HEAD.lock
+/// untouched, own branch lock released.
+#[cfg(unix)]
+fn head_lock_replaced_after_append(hash: Hash, as_symlink: bool) -> Result {
+    let mut fx = Fixture::new(hash)?;
+    fx.s.model.write(0, b"top", b"top v2\n")?;
+    fx.s.add(0, &[b"top"])?;
+    let when = fx.s.model.tick();
+    let (oid, _) = fx.s.model.predict_commit(0, &["locked"], when);
+    let old_oid =
+        fx.s.model
+            .head_commit(0)
+            .ok_or("fixture branch is unborn")?;
+    let line = format!(
+        "{old_oid} {oid} {} <{}> {when} +0000\tcommit: locked\n",
+        lifecycle_support::proc::NAME,
+        lifecycle_support::proc::EMAIL
+    );
+    let git_dir = fx.git_dir();
+    let logs = [
+        git_dir.join("logs/HEAD"),
+        git_dir.join("logs/refs/heads/main"),
+    ];
+    let logs_before = logs
+        .iter()
+        .map(fs::read)
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let appended = |before: &Vec<u8>| {
+        let mut bytes = before.clone();
+        bytes.extend_from_slice(line.as_bytes());
+        bytes
+    };
+    let decoy = fx.decoy("lock-target", b"outside lock target\n")?;
+    let lock = git_dir.join("HEAD.lock");
+    let paused = Paused::spawn(
+        &mut fx.s.driver.commit_cmd(&fx.repo(), &["locked"], when, &[]),
+        "ref.logged",
+    )?;
+    for (log, before) in logs.iter().zip(&logs_before) {
+        if fs::read(log)? != appended(before) {
+            return Err(
+                format!("paused at ref.logged without the line in {}", log.display()).into(),
+            );
+        }
+    }
+    fs::remove_file(&lock)?;
+    if as_symlink {
+        std::os::unix::fs::symlink(&decoy, &lock)?;
+    } else {
+        fs::write(&lock, b"foreign writer\n")?;
+    }
+    let planted = (inode(&lock)?, fs::read_link(&lock).ok());
+    let planted_bytes = if as_symlink {
+        None
+    } else {
+        Some(fs::read(&lock)?)
+    };
+    let outside = record(&fx.outside)?;
+    let output = release(paused)?;
+    let kind = if as_symlink { "symlink" } else { "file" };
+    let context = format!("ref.logged with HEAD.lock recreated as a {kind}");
+    assert_untouched(&fx.outside, &outside, &context)?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.code() != Some(128)
+        || !stderr.contains("was not updated")
+        || !stderr.contains("reflog already records")
+    {
+        return Err(format!(
+            "{context}: expected the logged-not-published error: {}",
+            describe(&output)
+        )
+        .into());
+    }
+    // Fresh-process view: ref still old, both logs keep the appended line.
+    if observe::resolve(&fx.repo(), "refs/heads/main")?.as_deref() != Some(old_oid.as_str()) {
+        return Err(format!("{context}: the branch was published").into());
+    }
+    for (log, before) in logs.iter().zip(&logs_before) {
+        if fs::read(log)? != appended(before) {
+            return Err(format!("{context}: {} rolled back or changed", log.display()).into());
+        }
+    }
+    if (inode(&lock)?, fs::read_link(&lock).ok()) != planted
+        || (planted_bytes.is_some() && fs::read(&lock).ok() != planted_bytes)
+    {
+        return Err(format!("{context}: the foreign HEAD.lock was changed or replaced").into());
+    }
+    let own: Vec<_> = observe::locks(&git_dir)?
+        .into_iter()
+        .filter(|l| *l != lock)
+        .collect();
+    if !own.is_empty() {
+        return Err(format!("{context}: own locks left behind: {own:?}").into());
+    }
+    fs::remove_file(&lock)?;
+    observe::fsck(&fx.repo())?;
+    no_decoy_objects(&fx)
+}
+
+/// Decision 0004, acceptance 6: the backend is asserted, not assumed.
+#[test]
+fn backend_selection_is_asserted() {
+    use rgit_core::write::{FilesystemHardening, filesystem_hardening};
+    let selected = filesystem_hardening();
+    if cfg!(unix) {
+        if fs_hardening_support::REQUIRE_ANCHORED_ON_UNIX {
+            assert_eq!(
+                selected,
+                FilesystemHardening::Anchored,
+                "Unix acceptance requires the anchored backend"
+            );
+            eprintln!("PASS: Unix selects the anchored backend");
+        } else if selected == FilesystemHardening::Anchored {
+            eprintln!("NOTE: Unix selects Anchored; flip REQUIRE_ANCHORED_ON_UNIX to enforce it");
+        } else {
+            eprintln!(
+                "SKIP: Unix backend is {selected:?}, not Anchored (REQUIRE_ANCHORED_ON_UNIX=false until integration)"
+            );
+        }
+    } else {
+        assert_eq!(selected, FilesystemHardening::LegacyPath);
+        eprintln!("NOTE: Windows uses the legacy path backend; anchored guarantees not claimed");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Future WP1 pause points (gated by WP1_FS_FAILPOINTS).
 
@@ -908,9 +1041,18 @@ fn lock_identity(_: Driver) -> Result {
                     failures.push(e.to_string());
                 }
                 if lock == "HEAD.lock" {
-                    let label = format!("A4 {h} {lock} recreated as {kind} / refusal-only");
+                    let label =
+                        format!("A4 {h} {lock} recreated as {kind} before append / refusal-only");
                     if let Err(e) = case(&label, expect_for(&label), || {
                         lock_recreated(hash, commit, lock, as_symlink, true)
+                    }) {
+                        failures.push(e.to_string());
+                    }
+                    let label = format!(
+                        "A4 {h} {lock} recreated as {kind} after append / logged-not-published"
+                    );
+                    if let Err(e) = case(&label, expect_for(&label), || {
+                        head_lock_replaced_after_append(hash, as_symlink)
                     }) {
                         failures.push(e.to_string());
                     }
@@ -988,8 +1130,12 @@ fn expect_for(name: &str) -> Expect {
     // untouched in both cases (enforced now by the non-strict variants).
     // A branch commit whose HEAD.lock guard was replaced must refuse (WP1
     // re-verifies HEAD.lock ownership in refs.rs); the baseline completes.
-    const AFTER_ANCHORING: [&str; 3] =
-        ["own temporary removed", "own locks removed", "refusal-only"];
+    const AFTER_ANCHORING: [&str; 4] = [
+        "own temporary removed",
+        "own locks removed",
+        "refusal-only",
+        "logged-not-published",
+    ];
     if AFTER_ANCHORING.iter().any(|pattern| name.contains(pattern)) {
         Expect::AfterAnchoring
     } else {

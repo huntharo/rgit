@@ -12,12 +12,21 @@ use std::path::{Path, PathBuf};
 
 use crate::lifecycle_support::proc::{Result, Snap, snapshot};
 
-/// THE anchoring switch. Cases whose guarantee needs the anchored backend
-/// (decision 0004) still run while this is false; a failure then prints an
+/// Whether this build's write operations use the anchored backend, as the
+/// library reports it (decision 0004, acceptance 6): selection is asserted,
+/// never assumed. Cases whose guarantee needs anchoring are enforced exactly
+/// when this is true; otherwise they still run and a failure prints an
 /// explicit `SKIP: ... requires the anchored backend` line carrying the
-/// baseline failure as evidence. Flip to true when the anchored backends are
-/// integrated: those cases then fail the suite.
-pub const ANCHORED_BACKEND: bool = false;
+/// baseline failure as evidence.
+pub fn anchored() -> bool {
+    use rgit_core::write::{FilesystemHardening, filesystem_hardening};
+    filesystem_hardening() == FilesystemHardening::Anchored
+}
+
+/// THE integration switch for acceptance 6 on Unix. While false, the
+/// selection test prints an explicit SKIP if Unix is not yet Anchored; flip
+/// to true at integration and the test FAILS unless Unix selects Anchored.
+pub const REQUIRE_ANCHORED_ON_UNIX: bool = false;
 
 /// THE failpoint switch for pause points WP1 may add (`add.before-descend`,
 /// `object.before-fanout`, `refs.before-dir`). While false, those cases print
@@ -29,7 +38,7 @@ pub const WP1_FS_FAILPOINTS: bool = false;
 pub enum Expect {
     /// Must pass on every backend, including the baseline.
     Now,
-    /// Guaranteed only by the anchored backend (gated by ANCHORED_BACKEND).
+    /// Guaranteed only by the anchored backend (enforced when `anchored()`).
     AfterAnchoring,
     /// Needs a WP1 pause point that does not exist yet (WP1_FS_FAILPOINTS).
     NeedsFailpoint(&'static str),
@@ -47,7 +56,7 @@ pub fn case(name: &str, expect: Expect, body: impl FnOnce() -> Result) -> Result
         return Ok(());
     }
     let result = body();
-    let gated = expect == Expect::AfterAnchoring && !ANCHORED_BACKEND;
+    let gated = expect == Expect::AfterAnchoring && !anchored();
     match (result, gated) {
         (Ok(()), false) => {
             eprintln!("PASS: {name}");
@@ -55,13 +64,13 @@ pub fn case(name: &str, expect: Expect, body: impl FnOnce() -> Result) -> Result
         }
         (Ok(()), true) => {
             eprintln!(
-                "NOTE: {name}: already holds on the baseline backend (ANCHORED_BACKEND=false)"
+                "NOTE: {name}: already holds on the baseline backend (backend is not Anchored)"
             );
             Ok(())
         }
         (Err(error), true) => {
             eprintln!(
-                "SKIP: {name}: requires the anchored backend (ANCHORED_BACKEND=false); baseline failure: {}",
+                "SKIP: {name}: requires the anchored backend (backend is not Anchored); baseline failure: {}",
                 first_line(&error.to_string())
             );
             Ok(())
