@@ -79,6 +79,7 @@ integration owner:
 | `add.before-descend` | worktree anchor open, before descending into a path's ancestors |
 | `object.before-fanout` | before `objects/xx` is opened or created |
 | `refs.before-dir` | before a ref or reflog parent directory is opened or created |
+| `object.before-read` | a loose object was `lstat`ed through the anchor as a regular file, not yet opened |
 
 `display_path()` is for diagnostics only; hardened call sites never join it
 back into a path for I/O. `.git/info/{exclude,attributes}` are read from the
