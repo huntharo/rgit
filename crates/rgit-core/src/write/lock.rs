@@ -461,55 +461,78 @@ mod tests {
         Ok(())
     }
 
-    /// The parent directory is held from acquire to release: after the
-    /// parent is swapped for a new directory, commit publishes into the
-    /// ORIGINAL directory or refuses, nothing is published into the new one,
-    /// and dropping a lock never unlinks in the new one (where a foreign lock
-    /// with the same name lives).
+    /// Entries of `dir` with their bytes and inode, for "untouched" checks.
+    #[cfg(unix)]
+    fn tree(dir: &Path) -> Result<Vec<(std::ffi::OsString, Vec<u8>, u64)>, Error> {
+        use std::os::unix::fs::MetadataExt;
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let metadata = std::fs::symlink_metadata(entry.path())?;
+            entries.push((
+                entry.file_name(),
+                std::fs::read(entry.path())?,
+                metadata.ino(),
+            ));
+        }
+        entries.sort();
+        Ok(entries)
+    }
+
+    /// Retained parent anchor: after acquire, the lock's parent `refs/heads`
+    /// is renamed away and a decoy `refs/heads` (holding a foreign
+    /// `main.lock`) takes its place. The decoy and the foreign lock are never
+    /// touched. With the anchored backend every operation runs on the held
+    /// (original) parent, so commit publishes there and drop removes our lock
+    /// there; the legacy path backend re-resolves by name, sees the foreign
+    /// lock and refuses. Re-traversing the parent by name under the anchored
+    /// backend fails this test (it refuses instead of publishing).
     #[cfg(unix)]
     #[test]
-    fn anchored_lock_holds_its_parent_directory() -> Result<(), Error> {
-        use crate::fsx::Root;
+    fn anchored_lock_retains_its_parent_directory() -> Result<(), Error> {
+        use crate::fsx::{HARDENING, Hardening, Root};
         let dir = scratch("lock-parent-swap")?;
         let heads = dir.join("refs/heads");
-        let moved = dir.join("refs/heads-moved");
+        let original = dir.join("refs/heads-original");
         std::fs::create_dir_all(&heads)?;
         std::fs::write(heads.join("main"), b"old")?;
         let anchor = Anchor::open(&dir, Root::GitDir)?;
+        let anchored = HARDENING == Hardening::Anchored;
+        let swap = || -> Result<Vec<(std::ffi::OsString, Vec<u8>, u64)>, Error> {
+            std::fs::rename(&heads, &original)?;
+            std::fs::create_dir(&heads)?;
+            std::fs::write(heads.join("main.lock"), b"foreign")?;
+            tree(&heads)
+        };
+        let restore = || -> Result<(), Error> {
+            std::fs::remove_dir_all(&heads)?;
+            let _ = std::fs::remove_file(original.join("main.lock"));
+            std::fs::rename(&original, &heads)?;
+            Ok(())
+        };
 
         // Commit after the swap.
         let mut lock = LockFile::acquire_at(&anchor, b"refs/heads/main")?;
         lock.write_all(b"new")?;
-        std::fs::rename(&heads, &moved)?;
-        std::fs::create_dir(&heads)?;
+        let decoy = swap()?;
         let result = lock.commit();
-        assert!(
-            !heads.join("main").exists(),
-            "published into the new directory"
-        );
-        assert!(!heads.join("main.lock").exists());
-        match result {
-            // Published through the held (original) directory.
-            Ok(()) => {
-                assert_eq!(std::fs::read(moved.join("main"))?, b"new");
-                assert!(!moved.join("main.lock").exists());
-            }
-            // Refused: the original is unchanged.
-            Err(Error::Locked(_)) => assert_eq!(std::fs::read(moved.join("main"))?, b"old"),
-            Err(error) => return Err(error),
+        assert_eq!(tree(&heads)?, decoy, "decoy parent touched by commit");
+        if anchored {
+            result?;
+            assert_eq!(std::fs::read(original.join("main"))?, b"new");
+            assert!(!original.join("main.lock").exists());
+        } else {
+            assert!(matches!(result, Err(Error::Locked(_))), "{result:?}");
+            assert_eq!(std::fs::read(original.join("main"))?, b"old");
         }
+        restore()?;
 
-        // Drop after the swap, with a foreign lock of the same name in the
-        // new directory: it is never unlinked.
-        std::fs::remove_dir_all(&heads)?;
-        let _ = std::fs::remove_file(moved.join("main.lock"));
-        std::fs::rename(&moved, &heads)?;
+        // Drop after the swap.
         let lock = LockFile::acquire_at(&anchor, b"refs/heads/main")?;
-        std::fs::rename(&heads, &moved)?;
-        std::fs::create_dir(&heads)?;
-        std::fs::write(heads.join("main.lock"), b"foreign")?;
+        let decoy = swap()?;
         drop(lock);
-        assert_eq!(std::fs::read(heads.join("main.lock"))?, b"foreign");
+        assert_eq!(tree(&heads)?, decoy, "decoy parent touched by drop");
+        assert_eq!(original.join("main.lock").exists(), !anchored);
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
