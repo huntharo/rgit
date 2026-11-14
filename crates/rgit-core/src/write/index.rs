@@ -184,6 +184,14 @@ impl Repository {
     /// an untracked ignored path is refused. Tracked paths missing from the
     /// worktree are removed from the index. Unsupported capabilities are
     /// refused before any object or index write.
+    ///
+    /// An error after `index.lock` was renamed into place is returned as
+    /// [`LockPublishedUnsyncedError`](super::LockPublishedUnsyncedError) (the
+    /// new index was written; its durability is unknown) or
+    /// [`LockPublishedUnreachableError`](super::LockPublishedUnreachableError)
+    /// (the new index was written inside the original `.git` directory, which
+    /// may no longer be reachable at that name). Neither means "unchanged",
+    /// and neither is retried.
     pub fn add(&self, paths: &[&BStr]) -> Result<AddOutcome, Error> {
         if self.inner.workdir().is_none() {
             return Err(Error::UnsupportedCapability("add in a bare repository"));
@@ -316,6 +324,9 @@ impl Repository {
         )?;
         lock.write_all(&bytes)?;
         super::failpoint("add.index-locked")?;
+        // Post-publication errors (`lock::after_publication`) pass through
+        // unchanged: their text says the index was written, and `?` ends the
+        // operation instead of retrying. Any other error is pre-rename.
         lock.commit()?;
         Ok(Some(prepared.outcome))
     }

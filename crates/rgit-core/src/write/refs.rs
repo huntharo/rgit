@@ -78,8 +78,9 @@ impl Repository {
     /// line is appended for the reference (and for this worktree's `HEAD`
     /// when, under `HEAD.lock`, it names the reference) as
     /// `core.logAllRefUpdates` dictates, before the rename publishes the
-    /// value. See [`ReflogAppendError`], [`RefLoggedNotPublishedError`] and
-    /// [`RefPublishedUnsyncedError`] for failures around publication.
+    /// value. See [`ReflogAppendError`], [`RefLoggedNotPublishedError`],
+    /// [`RefPublishedUnsyncedError`] and [`RefPublishedUnreachableError`] for
+    /// failures around publication.
     pub fn update_ref(&self, update: &RefUpdate) -> Result<(), Error> {
         let anchors = RefAnchors::open(self)?;
         super::object::check_object_store(&anchors.common)?;
@@ -105,7 +106,9 @@ impl Repository {
     ///    compare it with the expectation; failpoint `options.locked`.
     /// 4. Append every reflog line (one write + fsync each) while holding the
     ///    locks; failpoint `ref.logged`.
-    /// 5. Rename the lock into place and sync the directory.
+    /// 5. Rename the lock into place and sync the directory. An error after
+    ///    the rename is post-publication: [`RefPublishedUnsyncedError`] or
+    ///    [`RefPublishedUnreachableError`], never "not updated".
     ///
     /// A failure or crash after step 4 but before the rename leaves the ref
     /// unchanged and its reflog with a line whose new value never became the
@@ -271,14 +274,22 @@ impl Repository {
 
         let result = match lock.commit() {
             Ok(()) => Ok(()),
-            // Renamed: visible, durability unknown; reflogs already appended.
-            Err(source) if lock_identity.renamed(anchor, &location.name) => {
+            // After the rename (LockFile's post-publication errors): the new
+            // value was published, so never report it as not updated.
+            Err(source) if super::lock::after_publication(&source) => {
+                Err(published_after_error(update.name.clone(), logged, source))
+            }
+            // The path form (non-Unix) keeps untyped post-rename errors;
+            // there, the target holding our lock file tells that it was
+            // renamed.
+            Err(source) if !cfg!(unix) && lock_identity.renamed(anchor, &location.name) => {
                 Err(Error::Other(Box::new(RefPublishedUnsyncedError {
                     reference: update.name.clone(),
                     source,
                 })))
             }
-            // Not renamed: the ref is unchanged, but its reflog says otherwise.
+            // Before the rename: the ref is unchanged, but its reflog says
+            // otherwise.
             Err(source) if logged => Err(Error::Other(Box::new(RefLoggedNotPublishedError {
                 reference: update.name.clone(),
                 source,
@@ -790,8 +801,7 @@ fn append_reflog(anchor: &Anchor, rel: &[u8], line: &[u8]) -> std::io::Result<()
 
 /// The expected identity of a held lock, from its held descriptor
 /// (`LockFile::held_id`). It is compared with the anchored, no-follow entry
-/// to refuse a lock that was removed or replaced and, after a failed
-/// `LockFile::commit`, to tell whether the rename (publication) happened.
+/// to refuse a lock that was removed or replaced.
 struct LockIdentity {
     identity: FileId,
 }
@@ -812,7 +822,8 @@ impl LockIdentity {
         self.names_ours(anchor, &Self::lock_rel(target))
     }
 
-    /// The target is now our lock file.
+    /// The target is now our lock file (used for the non-Unix path form,
+    /// whose post-rename errors are untyped).
     fn renamed(&self, anchor: &Anchor, target: &[u8]) -> bool {
         self.names_ours(anchor, target)
     }
@@ -825,9 +836,28 @@ impl LockIdentity {
     }
 }
 
-/// The reference WAS updated (renamed into place), but syncing its directory
-/// failed, so its durability across a crash is unknown. Its reflogs had
-/// already been appended. Returned inside [`Error::Other`].
+/// Map a post-publication error from `LockFile::commit` (see
+/// `lock::after_publication`): unsynced becomes
+/// [`RefPublishedUnsyncedError`], unreachable becomes
+/// [`RefPublishedUnreachableError`].
+fn published_after_error(reference: Vec<u8>, logged: bool, source: Error) -> Error {
+    let unreachable = matches!(&source, Error::Other(error)
+        if error.is::<super::LockPublishedUnreachableError>());
+    if unreachable {
+        Error::Other(Box::new(RefPublishedUnreachableError {
+            reference,
+            logged,
+            source,
+        }))
+    } else {
+        Error::Other(Box::new(RefPublishedUnsyncedError { reference, source }))
+    }
+}
+
+/// The reference WAS updated (renamed into place), but a step after the
+/// rename failed (syncing its directory), so its durability across a crash is
+/// unknown. Its reflogs had already been appended. Returned inside
+/// [`Error::Other`].
 #[derive(Debug)]
 pub struct RefPublishedUnsyncedError {
     reference: Vec<u8>,
@@ -845,7 +875,8 @@ impl std::fmt::Display for RefPublishedUnsyncedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "reference {:?} was updated, but syncing it failed ({}); its durability is unknown",
+            "reference {:?} was updated, but a step after publishing it failed ({}); its \
+             durability is unknown",
             BStr::new(&self.reference),
             self.source
         )
@@ -853,6 +884,55 @@ impl std::fmt::Display for RefPublishedUnsyncedError {
 }
 
 impl std::error::Error for RefPublishedUnsyncedError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// The reference's lock WAS renamed over it inside the directory held since
+/// the lock was taken, but afterwards the reference's name no longer reaches
+/// the published file (the directory was moved or replaced, or another writer
+/// replaced the reference). The state is uncertain, never "not updated", and
+/// nothing is rolled back. If `logged()`, its reflogs record the update.
+/// Returned inside [`Error::Other`].
+#[derive(Debug)]
+pub struct RefPublishedUnreachableError {
+    reference: Vec<u8>,
+    logged: bool,
+    source: Error,
+}
+
+impl RefPublishedUnreachableError {
+    /// The reference whose new value was published.
+    pub fn reference(&self) -> &[u8] {
+        &self.reference
+    }
+
+    /// Whether reflog lines recording the update were appended.
+    pub fn logged(&self) -> bool {
+        self.logged
+    }
+}
+
+impl std::fmt::Display for RefPublishedUnreachableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the update of reference {:?} was published{}, but it may not be visible at \
+             that name: the name no longer reaches the published file ({}); the state is \
+             uncertain",
+            BStr::new(&self.reference),
+            if self.logged {
+                " and its reflog records the update"
+            } else {
+                ""
+            },
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for RefPublishedUnreachableError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.source)
     }
@@ -929,5 +1009,26 @@ impl std::fmt::Display for RefLoggedNotPublishedError {
 impl std::error::Error for RefLoggedNotPublishedError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.source)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unreachable_publication_is_never_reported_as_not_updated() {
+        for logged in [true, false] {
+            let text = RefPublishedUnreachableError {
+                reference: b"refs/heads/main".to_vec(),
+                logged,
+                source: Error::Injected("lock.after-rename"),
+            }
+            .to_string();
+            assert!(text.contains("was published"), "{text}");
+            assert!(text.contains("may not be visible at that name"), "{text}");
+            assert_eq!(text.contains("reflog records the update"), logged, "{text}");
+            assert!(!text.contains("was not updated"), "{text}");
+        }
     }
 }

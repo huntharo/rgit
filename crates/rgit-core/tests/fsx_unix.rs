@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 
 use common::{Result, git};
 use rgit_core::write::{
-    CommitRequest, InitOptions, ObjectFormat, RefExpectation, RefLog, RefUpdate, Signature, init,
+    CommitRequest, InitOptions, LockPublishedUnreachableError, LockPublishedUnsyncedError,
+    ObjectFormat, RefExpectation, RefLog, RefPublishedUnreachableError, RefPublishedUnsyncedError,
+    RefUpdate, Signature, init,
 };
 use rgit_core::{BStr, Error, Repository};
 
@@ -117,9 +119,30 @@ fn child_action() -> Result {
     match result {
         Ok(()) => println!("RESULT ok"),
         Err(Error::AlreadyExists(_)) => println!("RESULT already-exists"),
-        Err(error) => println!("RESULT error {error}"),
+        Err(error) => println!(
+            "RESULT {} {error}",
+            post_publication(&error).unwrap_or("error")
+        ),
     }
     Ok(())
+}
+
+/// The post-publication classification of an error, if it is one.
+fn post_publication(error: &Error) -> Option<&'static str> {
+    let Error::Other(other) = error else {
+        return None;
+    };
+    if other.is::<RefPublishedUnsyncedError>() {
+        Some("ref-published-unsynced")
+    } else if other.is::<RefPublishedUnreachableError>() {
+        Some("ref-published-unreachable")
+    } else if other.is::<LockPublishedUnsyncedError>() {
+        Some("lock-published-unsynced")
+    } else if other.is::<LockPublishedUnreachableError>() {
+        Some("lock-published-unreachable")
+    } else {
+        None
+    }
 }
 
 struct Child {
@@ -128,11 +151,8 @@ struct Child {
     _control: tempfile::TempDir,
 }
 
-/// Start `scenario` in a child; with `pause`, wait until it reaches it.
-fn start(pause: Option<&str>, scenario: &str, repo: &Path) -> Result<Child> {
-    let control = tempfile::tempdir()?;
-    let ready = control.path().join("ready");
-    let release = control.path().join("release");
+/// The child command for `scenario`, with no failpoint set.
+fn child_command(scenario: &str, repo: &Path) -> Result<std::process::Command> {
     let mut command = std::process::Command::new(std::env::current_exe()?);
     command
         .args(["--exact", "child_action", "--nocapture", "--test-threads=1"])
@@ -146,6 +166,27 @@ fn start(pause: Option<&str>, scenario: &str, repo: &Path) -> Result<Child> {
         )
         .env_remove("RGIT_FAILPOINT")
         .stdout(std::process::Stdio::piped());
+    Ok(command)
+}
+
+/// Start `scenario` in a child with an error injected at `point`.
+fn start_injected(point: &str, scenario: &str, repo: &Path) -> Result<Child> {
+    let child = child_command(scenario, repo)?
+        .env("RGIT_FAILPOINT", format!("{point}:error"))
+        .spawn()?;
+    Ok(Child {
+        child,
+        release: None,
+        _control: tempfile::tempdir()?,
+    })
+}
+
+/// Start `scenario` in a child; with `pause`, wait until it reaches it.
+fn start(pause: Option<&str>, scenario: &str, repo: &Path) -> Result<Child> {
+    let control = tempfile::tempdir()?;
+    let ready = control.path().join("ready");
+    let release = control.path().join("release");
+    let mut command = child_command(scenario, repo)?;
     if let Some(point) = pause {
         command
             .env("RGIT_FAILPOINT", format!("{point}:pause"))
@@ -699,6 +740,68 @@ fn loose_objects_swapped_for_symlinks_are_never_read_through() -> Result {
         );
         assert!(!repo.join(".git/refs/heads/master").exists());
         assert_eq!((fs::read(&outside)?, fs::metadata(&outside)?.ino()), before);
+    }
+    Ok(())
+}
+
+/// A failure injected after the anchored rename (`lock.after-rename`) is
+/// reported as post-publication: the ref or index WAS updated, its
+/// durability is unknown, and the reflog records the update. It is never
+/// reported as "not updated" or "unchanged". The unreachable classification
+/// (the root no longer reaching the renamed file) has no deterministic pause
+/// point between the rename and its check; `lock.rs` unit tests cover it
+/// with a test-only hook, and `refs.rs` unit tests cover its message.
+#[test]
+fn failures_after_the_rename_report_the_published_update() -> Result {
+    for format in FORMATS {
+        for scenario in ["update-ref", "commit", "add:next"] {
+            let temp = tempfile::tempdir()?;
+            let repo = temp.path().join("repo");
+            init(&repo, &options(format))?;
+            git(&repo, &["config", "maintenance.auto", "false"])?;
+            fs::write(repo.join("base"), b"base\n")?;
+            git(&repo, &["add", "base"])?;
+            git(&repo, &["commit", "-q", "-m", "base"])?;
+            fs::write(repo.join("next"), b"next\n")?;
+            let head = rev_parse(&repo, "HEAD")?;
+            let result = start_injected("lock.after-rename", scenario, &repo)?.finish()?;
+            let context = format!("{format:?} {scenario}: {result}");
+            assert!(!result.contains("was not updated"), "{context}");
+            assert!(!result.contains("unchanged"), "{context}");
+            assert!(
+                result.contains("injected failure at lock.after-rename"),
+                "{context}"
+            );
+            match scenario {
+                "update-ref" => {
+                    assert!(result.starts_with("ref-published-unsynced "), "{context}");
+                    assert!(result.contains("was updated"), "{context}");
+                    assert_eq!(rev_parse(&repo, "refs/heads/topic")?, head);
+                    let log = fs::read_to_string(repo.join(".git/logs/refs/heads/topic"))?;
+                    assert!(log.contains("branch: Created from HEAD"), "{context}");
+                }
+                "commit" => {
+                    assert!(result.starts_with("ref-published-unsynced "), "{context}");
+                    assert_eq!(rev_parse(&repo, "HEAD^")?, head);
+                    let log = fs::read_to_string(repo.join(".git/logs/refs/heads/master"))?;
+                    assert!(log.contains("commit: raced"), "{context}");
+                }
+                _ => {
+                    assert!(result.starts_with("lock-published-unsynced "), "{context}");
+                    assert!(result.contains("was published"), "{context}");
+                    let staged = String::from_utf8(git(&repo, &["ls-files"])?.stdout)?;
+                    assert_eq!(staged, "base\nnext\n", "{context}");
+                }
+            }
+            for lock in ["index.lock", "HEAD.lock", "refs/heads/master.lock"] {
+                assert!(!repo.join(".git").join(lock).exists(), "{context}: {lock}");
+            }
+            assert!(
+                !repo.join(".git/refs/heads/topic.lock").exists(),
+                "{context}"
+            );
+            common::fsck(&repo)?;
+        }
     }
     Ok(())
 }

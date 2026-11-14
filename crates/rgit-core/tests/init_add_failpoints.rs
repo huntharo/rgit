@@ -14,7 +14,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use common::{Result, fsck, git};
-use rgit_core::write::{InitOptions, ObjectFormat, init};
+use rgit_core::write::{
+    InitOptions, LockPublishedUnreachableError, LockPublishedUnsyncedError, ObjectFormat, init,
+};
 use rgit_core::{BStr, Error, Repository};
 
 fn snapshot(dir: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
@@ -86,11 +88,28 @@ fn child_action() -> Result {
     };
     match result {
         Ok(()) => println!("RESULT ok"),
-        Err(Error::Injected(point)) => println!("RESULT injected {point}"),
-        Err(Error::AlreadyExists(_)) => println!("RESULT already-exists"),
-        Err(error) => println!("RESULT error {error}"),
+        Err(error) => println!("RESULT {}", classify(&error)),
     }
     Ok(())
+}
+
+/// The child's result line for an error. Post-publication lock errors are
+/// classified explicitly, followed by the classification of their cause.
+fn classify(error: &Error) -> String {
+    match error {
+        Error::Injected(point) => format!("injected {point}"),
+        Error::AlreadyExists(_) => "already-exists".to_owned(),
+        Error::Other(other) if other.is::<LockPublishedUnsyncedError>() => {
+            let cause = std::error::Error::source(other.as_ref())
+                .and_then(|cause| cause.downcast_ref::<Error>())
+                .map_or_else(|| "unknown".to_owned(), classify);
+            format!("published-unsynced {cause}")
+        }
+        Error::Other(other) if other.is::<LockPublishedUnreachableError>() => {
+            "published-unreachable".to_owned()
+        }
+        error => format!("error {error}"),
+    }
 }
 
 const RACE_BLOB: &[u8] = b"content raced by a competing writer\n";
@@ -437,13 +456,17 @@ fn injected_failures_leave_previous_state_intact() -> Result {
             assert!(!String::from_utf8(git(&root, &["ls-files"])?.stdout)?.contains("new.txt"));
         }
 
-        // Injected after the rename: the new index is visible; the error
-        // only reports unknown durability.
+        // Injected after the rename: the new index is visible. The anchored
+        // lock (Unix) reports it as post-publication (written, durability
+        // unknown), never as unchanged; the Windows path form keeps the
+        // plain injected error.
         let objects = snapshot(&root.join(".git/objects"))?;
-        injected(
-            run_child("lock.after-rename", "add", &root)?,
-            "lock.after-rename",
-        );
+        let outcome = run_child("lock.after-rename", "add", &root)?;
+        if cfg!(unix) {
+            assert_eq!(outcome, "published-unsynced injected lock.after-rename");
+        } else {
+            injected(outcome, "lock.after-rename");
+        }
         assert!(String::from_utf8(git(&root, &["ls-files"])?.stdout)?.contains("new.txt"));
         assert_eq!(snapshot(&root.join(".git/objects"))?, objects);
         fsck(&root)?;

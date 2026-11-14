@@ -28,8 +28,8 @@ pub use index::{AddOutcome, AddRefusal};
 pub use init::{InitOptions, InitPublishedError, ObjectFormat, init};
 pub use lock::{LockPublishedUnreachableError, LockPublishedUnsyncedError};
 pub use refs::{
-    RefExpectation, RefLog, RefLoggedNotPublishedError, RefPublishedUnsyncedError, RefUpdate,
-    ReflogAppendError,
+    RefExpectation, RefLog, RefLoggedNotPublishedError, RefPublishedUnreachableError,
+    RefPublishedUnsyncedError, RefUpdate, ReflogAppendError,
 };
 
 pub(crate) use failpoint::hit as failpoint;
