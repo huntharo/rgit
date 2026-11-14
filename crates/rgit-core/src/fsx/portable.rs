@@ -129,15 +129,17 @@ fn id_of_file(file: &File) -> Result<FileId, Error> {
 
 /// `lstat` with identity, not following a final symlink or junction.
 fn lstat_path(path: &Path) -> std::io::Result<Meta> {
-    let metadata = fs::symlink_metadata(path)?;
     #[cfg(unix)]
     {
+        let metadata = fs::symlink_metadata(path)?;
         Ok(meta_of(&metadata, id_of_metadata(&metadata)))
     }
     #[cfg(not(unix))]
     {
         // Open the entry itself (a reparse point is not followed; directories
-        // need backup semantics) with no data access, only to read identity.
+        // need backup semantics) with no data access, as std's
+        // `symlink_metadata` does, and read kind, times and identity from that
+        // one handle so they describe the same entry.
         let mut options = OpenOptions::new();
         #[cfg(windows)]
         {
@@ -149,6 +151,7 @@ fn lstat_path(path: &Path) -> std::io::Result<Meta> {
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
         }
         let handle = options.open(path)?;
+        let metadata = handle.metadata()?;
         let id = id_of_file(&handle).map_err(std::io::Error::other)?;
         Ok(meta_of(&metadata, id))
     }
@@ -315,4 +318,71 @@ impl Dir {
 
 pub(crate) fn file_id(file: &File) -> Result<FileId, Error> {
     id_of_file(file)
+}
+
+/// Native Windows evidence that the legacy backend's identity is the stable
+/// `(volume serial, file index)` pair and that `lstat` describes a reparse
+/// point itself rather than its target.
+#[cfg(all(test, windows))]
+mod windows_identity {
+    use super::*;
+
+    type Result = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn identity_is_stable_per_entry_and_distinct_between_entries() -> Result {
+        let root = tempfile::tempdir()?;
+        let dir = Dir::open(root.path())?;
+        fs::write(root.path().join("a"), b"a")?;
+        fs::write(root.path().join("b"), b"b")?;
+        fs::create_dir(root.path().join("d"))?;
+
+        let a = dir.lstat(b"a")?.ok_or("a missing")?;
+        let b = dir.lstat(b"b")?.ok_or("b missing")?;
+        let d = dir.lstat(b"d")?.ok_or("d missing")?;
+        assert!(matches!(a.kind, Kind::File { .. }));
+        assert_eq!(d.kind, Kind::Dir);
+        assert_ne!(a.id, b.id);
+        assert_ne!(a.id, d.id);
+        assert_ne!(a.id.index, 0, "file index must be populated");
+
+        // The entry handle, a data handle and a second lstat agree.
+        let (file, read_meta) = dir.open_read(b"a")?;
+        assert_eq!(file_id(&file)?, a.id);
+        assert_eq!(read_meta.id, a.id);
+        assert_eq!(dir.lstat(b"a")?.ok_or("a missing")?.id, a.id);
+
+        // Identity survives a rename and is shared by a hard link; a
+        // replacement under the old name is a different entry.
+        drop(file);
+        dir.rename_noreplace(b"a", b"renamed")?;
+        assert_eq!(dir.lstat(b"renamed")?.ok_or("renamed missing")?.id, a.id);
+        dir.hard_link(b"renamed", b"linked")?;
+        assert_eq!(dir.lstat(b"linked")?.ok_or("linked missing")?.id, a.id);
+        fs::write(root.path().join("a"), b"a")?;
+        assert_ne!(dir.lstat(b"a")?.ok_or("a missing")?.id, a.id);
+        Ok(())
+    }
+
+    #[test]
+    fn lstat_describes_a_symlink_not_its_target() -> Result {
+        let root = tempfile::tempdir()?;
+        let dir = Dir::open(root.path())?;
+        fs::write(root.path().join("target"), b"t")?;
+        if let Err(error) = std::os::windows::fs::symlink_file("target", root.path().join("link")) {
+            // ERROR_PRIVILEGE_NOT_HELD: no symlink privilege or Developer Mode.
+            if error.raw_os_error() == Some(1314) {
+                eprintln!("SKIP lstat_describes_a_symlink_not_its_target: {error}");
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+        let target = dir.lstat(b"target")?.ok_or("target missing")?;
+        let link = dir.lstat(b"link")?.ok_or("link missing")?;
+        assert_eq!(link.kind, Kind::Symlink);
+        assert_ne!(link.id, target.id, "lstat followed the reparse point");
+        let (file, _) = dir.open_read(b"target")?;
+        assert_eq!(file_id(&file)?, target.id);
+        Ok(())
+    }
 }

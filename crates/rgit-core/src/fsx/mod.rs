@@ -31,9 +31,11 @@ mod portable;
 // plus `#[cfg(not(unix))] use portable as backend;`.
 use portable as backend;
 
-/// Which guarantee the compiled backend provides.
+/// Which guarantee the compiled filesystem backend provides for write
+/// operations. Exposed as `rgit_core::write::FilesystemHardening`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Hardening {
+#[non_exhaustive]
+pub enum Hardening {
     /// Every component below a root is resolved through held directory
     /// descriptors without following symlinks (descriptor-root identity).
     Anchored,
@@ -78,9 +80,13 @@ pub(crate) struct Meta {
     pub(crate) kind: Kind,
     pub(crate) len: u64,
     pub(crate) id: FileId,
-    /// `(seconds, nanoseconds)`; ctime is the status-change time on Unix and
-    /// the creation time on Windows.
+    /// Modification time, `(seconds, nanoseconds)` since the Unix epoch.
     pub(crate) mtime: (i64, u32),
+    /// The index stat-data `ctime` field, `(seconds, nanoseconds)`. On Unix it
+    /// is the inode status-change time (`st_ctime`). On Windows it is the
+    /// creation time (`Metadata::created`), as Git for Windows records it.
+    /// Creation time does not change when content is edited in place, so no
+    /// check may rely on this field to detect such an edit.
     pub(crate) ctime: (i64, u32),
 }
 
