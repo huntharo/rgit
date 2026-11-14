@@ -67,11 +67,11 @@ enum Location<'a> {
         /// Leaf names inside `dir`.
         target: Vec<u8>,
         lock: Vec<u8>,
-        /// Full names below `root`.
+        /// Full target name below `root`.
         target_rel: Vec<u8>,
-        lock_rel: Vec<u8>,
-        /// Parent directory below `root` and its identity when acquired,
-        /// for a nested lock.
+        /// For a nested lock: the parent's name below `root` and the identity
+        /// of the held parent directory itself (`Anchor::id`, read from its
+        /// descriptor at acquire).
         parent: Option<(Vec<u8>, crate::fsx::FileId)>,
     },
 }
@@ -122,38 +122,25 @@ impl<'a> LockFile<'a> {
                 Err(error) => return Err(error),
             };
             let identity = Identity::of_file(&file)?;
-            let mut lock_rel = rel.to_vec();
-            lock_rel.extend_from_slice(b".lock");
-            let mut lock = Self {
+            // The held parent's own identity, compared before the rename with
+            // what the root reaches at the parent's name.
+            let parent = match (&dir, rel.iter().rposition(|&byte| byte == b'/')) {
+                (Held::Parent(held), Some(slash)) => Some((rel[..slash].to_vec(), held.id()?)),
+                _ => None,
+            };
+            let lock = Self {
                 location: Location::Anchored {
                     root: anchor,
                     dir,
                     target: leaf.to_vec(),
                     lock,
                     target_rel: rel.to_vec(),
-                    lock_rel,
-                    parent: None,
+                    parent,
                 },
                 file: Some(file),
                 identity,
                 released: false,
             };
-            // Record the parent's identity as reached from the root, and
-            // confirm that it is the held directory: our new lock is visible
-            // through it. Otherwise refuse (Drop removes our lock by handle).
-            if let Some(slash) = rel.iter().rposition(|&byte| byte == b'/') {
-                let parent_rel = rel[..slash].to_vec();
-                let parent_id = match anchor.lstat(&parent_rel)? {
-                    Some(meta) if meta.kind == crate::fsx::Kind::Dir => meta.id,
-                    _ => return Err(Error::Locked(lock.lock_display())),
-                };
-                if !lock.lock_reachable_from_root() {
-                    return Err(Error::Locked(lock.lock_display()));
-                }
-                if let Location::Anchored { parent, .. } = &mut lock.location {
-                    *parent = Some((parent_rel, parent_id));
-                }
-            }
             super::failpoint("lock.acquired")?;
             Ok(lock)
         }
@@ -294,32 +281,18 @@ impl<'a> LockFile<'a> {
         }
     }
 
-    /// Whether our lock is visible at its full name from the root anchor
-    /// (anchored form; always true for a lock directly below the root).
-    fn lock_reachable_from_root(&self) -> bool {
-        match &self.location {
-            Location::Anchored { root, lock_rel, .. } => root.lstat(lock_rel).is_ok_and(|meta| {
-                meta.is_some_and(|meta| Identity::of_id(meta.id) == Some(self.identity))
-            }),
-            Location::Path { .. } => true,
-        }
-    }
-
-    /// Whether the root still reaches the held parent: the parent entry is
-    /// the directory recorded at acquire, and our lock is visible through it.
+    /// Whether the root still reaches the held parent: the entry at the
+    /// parent's name below the root is a directory with the held directory's
+    /// own identity. (Our lock's presence in it is `still_ours`.)
     fn parent_reachable_from_root(&self) -> bool {
         match &self.location {
             Location::Anchored {
                 root,
                 parent: Some((parent_rel, parent_id)),
                 ..
-            } => {
-                root.lstat(parent_rel).is_ok_and(|meta| {
-                    meta.is_some_and(|meta| {
-                        meta.kind == crate::fsx::Kind::Dir && meta.id == *parent_id
-                    })
-                }) && self.lock_reachable_from_root()
-            }
+            } => root.lstat(parent_rel).is_ok_and(|meta| {
+                meta.is_some_and(|meta| meta.kind == crate::fsx::Kind::Dir && meta.id == *parent_id)
+            }),
             _ => true,
         }
     }
