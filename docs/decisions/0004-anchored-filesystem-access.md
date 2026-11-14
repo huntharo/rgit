@@ -99,8 +99,23 @@ per platform where the mechanism exists:
 3. `.git/info/exclude` and `.git/info/attributes` swapped for a FIFO or symlink
    at a pause point: bounded refusal or consistent completion, never a hang.
 4. Lock identity: a lock removed and recreated (Unix) is never published or
-   unlinked; on Windows deletion of a held lock is refused and the
-   close-before-rename window is either closed or explicitly bounded with a
-   concrete blocker.
+   unlinked. This includes `HEAD.lock` taken only as a guard: its identity is
+   checked through the held anchor before the reflog append and before the
+   rename. A mismatch before the append refuses (`Locked`, nothing logged or
+   published). A mismatch after the append reports the existing
+   logged-not-published state. A foreign lock's bytes and inode are preserved,
+   and nothing another writer produced is rolled back. On Windows, deletion
+   of a held lock is refused and the close-before-rename window is either
+   closed or explicitly bounded with a concrete blocker.
 5. Existing APFS live/final-unmap, lifecycle, failpoint and recovery suites
    stay green unchanged; meaningful guards are mutation-checked.
+6. Backend selection is asserted, not assumed. Unix acceptance requires
+   `rgit_core::write::filesystem_hardening() == Anchored` and runs every swap
+   case above with no anchoring-gated skip. Skips that print baseline-failure
+   evidence are only acceptable before integration. Windows asserts
+   `LegacyPath`, prints explicit non-anchored notes, and keeps every positive
+   write scenario.
+
+Races are exercised at deterministic pause points derived from the source.
+The tests show behaviour at those boundaries; they do not prove that no other
+interleaving between system calls exists.

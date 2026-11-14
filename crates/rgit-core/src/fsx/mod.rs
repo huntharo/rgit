@@ -31,9 +31,11 @@ mod portable;
 // plus `#[cfg(not(unix))] use portable as backend;`.
 use portable as backend;
 
-/// Which guarantee the compiled backend provides.
+/// Which guarantee the compiled filesystem backend provides for write
+/// operations. Exposed as `rgit_core::write::FilesystemHardening`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Hardening {
+#[non_exhaustive]
+pub enum Hardening {
     /// Every component below a root is resolved through held directory
     /// descriptors without following symlinks (descriptor-root identity).
     Anchored,
