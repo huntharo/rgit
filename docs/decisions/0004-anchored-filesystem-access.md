@@ -33,7 +33,8 @@ refused; every component is resolved without following symlinks.
 ## Frozen API (`crates/rgit-core/src/fsx/mod.rs`)
 
 `Anchor::{open, sub, lstat, open_read, read_link, read_dir, create_new, mkdir,
-rename_noreplace, rename_replace, hard_link, unlink, sync, display_path}`,
+rename_noreplace, rename_replace, hard_link, unlink, open_append, rmdir,
+symlink, sync, display_path}`,
 `fsx::file_id(&File) -> FileId`, types `Root`, `Kind`, `Meta`, `FileId`
 (`(dev, ino)` on Unix, `(volume serial, file index)` on Windows; never size or
 timestamps), and `LockFile::acquire_at(&Anchor, rel)`. A backend that cannot
@@ -50,7 +51,17 @@ weaker fallback. Signature changes go through the integration owner.
 | WP3 oracle | `crates/rgit-cli/tests/fs_hardening*.rs`, `crates/rgit-cli/tests/fs_hardening_support/**` (tests only) |
 
 New failpoints are proposed by their owner and recorded here by the
-integration owner. Own crates keep `unsafe_code = "forbid"`; dependencies may
+integration owner:
+
+| Name | Point |
+| --- | --- |
+| `add.before-descend` | worktree anchor open, before descending into a path's ancestors |
+| `object.before-fanout` | before `objects/xx` is opened or created |
+| `refs.before-dir` | before a ref or reflog parent directory is opened or created |
+
+`display_path()` is for diagnostics only; hardened call sites never join it
+back into a path for I/O. `.git/info/{exclude,attributes}` are read from the
+common directory only, as C Git does. Own crates keep `unsafe_code = "forbid"`; dependencies may
 use unsafe internally. Dependencies stay pinned (`--locked`); a new direct
 dependency needs integration approval. MSRV remains 1.88.
 

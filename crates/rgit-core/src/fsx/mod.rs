@@ -153,6 +153,25 @@ impl Anchor {
         self.inner.unlink(rel)
     }
 
+    /// Open a regular file for appending, creating it with permission bits
+    /// `mode` if absent. The final component is never followed, the open
+    /// never blocks, and anything but a regular file (as seen on the handle)
+    /// is refused. Returns the file and whether it was created.
+    pub(crate) fn open_append(&self, rel: &[u8], mode: u32) -> Result<(File, bool), Error> {
+        self.inner.open_append(rel, mode)
+    }
+
+    /// Remove an empty directory; never follows a final symlink.
+    pub(crate) fn rmdir(&self, rel: &[u8]) -> Result<(), Error> {
+        self.inner.rmdir(rel)
+    }
+
+    /// Create a symbolic link `rel` with target bytes `target`; never
+    /// replaces an existing entry.
+    pub(crate) fn symlink(&self, target: &[u8], rel: &[u8]) -> Result<(), Error> {
+        self.inner.symlink(target, rel)
+    }
+
     /// Flush the anchored directory's entries (no-op where unsupported; the
     /// limitation is documented per platform).
     pub(crate) fn sync(&self) -> Result<(), Error> {

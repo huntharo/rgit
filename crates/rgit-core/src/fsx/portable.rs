@@ -191,6 +191,46 @@ impl Dir {
         Ok(fs::remove_file(join(&self.path, rel)?)?)
     }
 
+    pub(crate) fn open_append(&self, rel: &[u8], mode: u32) -> Result<(File, bool), Error> {
+        let path = join(&self.path, rel)?;
+        let existed = fs::symlink_metadata(&path).is_ok();
+        let mut options = OpenOptions::new();
+        options.append(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        let file = options.open(&path)?;
+        if !file.metadata()?.is_file() {
+            return Err(Error::UnsupportedCapability("not a regular file"));
+        }
+        Ok((file, !existed))
+    }
+
+    pub(crate) fn rmdir(&self, rel: &[u8]) -> Result<(), Error> {
+        Ok(fs::remove_dir(join(&self.path, rel)?)?)
+    }
+
+    pub(crate) fn symlink(&self, target: &[u8], rel: &[u8]) -> Result<(), Error> {
+        let link = join(&self.path, rel)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(target), link)?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (target, link);
+            Err(Error::UnsupportedCapability(
+                "symbolic links on this platform",
+            ))
+        }
+    }
+
     pub(crate) fn sync(&self) -> Result<(), Error> {
         #[cfg(unix)]
         File::open(&self.path)?.sync_all()?;
