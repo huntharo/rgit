@@ -25,7 +25,10 @@
 //! always one of the post-publication types ([`LockPublishedUnsyncedError`],
 //! [`LockPublishedUnreachableError`]) inside [`Error::Other`], and
 //! [`after_publication`] says so; every other error happened before the
-//! rename and published nothing.
+//! rename and published nothing. The Windows path form adds one typed
+//! post-rename outcome, [`RenameOutcomeUncertainError`], which
+//! [`after_publication`] also recognises; its other post-rename errors stay
+//! untyped.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -214,7 +217,9 @@ impl<'a> LockFile<'a> {
     /// [`LockPublishedUnreachableError`] (renamed inside the held directory,
     /// which the root no longer reaches at that name; state uncertain).
     /// Nothing is ever rolled back. The path form keeps its pre-hardening
-    /// errors: an error after its rename is returned as is.
+    /// errors (an error after its rename is returned as is), except that on
+    /// Windows a target that no longer has our identity after the rename is
+    /// [`RenameOutcomeUncertainError`], also a post-publication type.
     pub(crate) fn commit(mut self) -> Result<(), Error> {
         let file = self.file.as_mut().ok_or(Error::Injected("lock reused"))?;
         file.flush()?;
@@ -550,29 +555,197 @@ const OBSERVED_CONTENT_LIMIT: u64 = 64 * 1024;
 /// or rewritten.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn observe_after_rename(target: &Path, ours: Identity) -> Result<(), Error> {
-    let observed = Identity::of_path(target).ok();
-    if observed == Some(ours) {
-        return Ok(());
+    match observe(target, ours) {
+        None => Ok(()),
+        Some(observed) => Err(Error::Other(Box::new(RenameOutcomeUncertainError {
+            target: target.to_owned(),
+            ours: ours.parts(),
+            observed,
+        }))),
     }
-    let content = (|| -> std::io::Result<Option<(Vec<u8>, u64)>> {
-        use std::io::Read;
-        let file = super::open_leaf_nofollow(target)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() {
-            return Ok(None);
+}
+
+/// One observation of `target`: a single no-follow open with read access
+/// (sharing read, write and delete), whose handle supplies the identity, the
+/// kind and the content. `None` means the target is our file.
+///
+/// If that open fails with anything but `NotFound`, a second, separate probe
+/// without data access (which no share mode denies) reads the identity alone,
+/// so a sharing conflict on our own published file is not misreported. That
+/// probe never contributes content.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn observe(target: &Path, ours: Identity) -> Option<ObservedTarget> {
+    let file = match open_for_observation(target) {
+        Ok(file) => file,
+        Err(error) => return classify_open_failure(error, || Identity::of_path(target), ours),
+    };
+    let id = match Identity::of_file(&file) {
+        Ok(id) => id,
+        Err(error) => {
+            return classify_open_failure(into_io(error), || Identity::of_path(target), ours);
         }
-        let mut bytes = Vec::new();
-        file.take(OBSERVED_CONTENT_LIMIT).read_to_end(&mut bytes)?;
-        Ok(Some((bytes, metadata.len())))
-    })()
-    .ok()
-    .flatten();
-    Err(Error::Other(Box::new(RenameOutcomeUncertainError {
-        target: target.to_owned(),
-        ours: ours.parts(),
-        observed: observed.map(Identity::parts),
-        content,
-    })))
+    };
+    if id == ours {
+        return None;
+    }
+    #[cfg(test)]
+    tests::between_open_and_read_hook();
+    Some(read_observed(&file, id))
+}
+
+/// Kind and content of an opened target whose identity is `id`, all from the
+/// same handle.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn read_observed(file: &File, id: Identity) -> ObservedTarget {
+    use std::io::Read;
+    let unavailable = |error: std::io::Error| ObservedTarget::unavailable(Some(id.parts()), &error);
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => return unavailable(error),
+    };
+    if !metadata.is_file() {
+        return ObservedTarget::NotRegular { id: id.parts() };
+    }
+    let mut content = Vec::new();
+    match file.take(OBSERVED_CONTENT_LIMIT).read_to_end(&mut content) {
+        Ok(_) => ObservedTarget::File {
+            id: id.parts(),
+            content,
+            len: metadata.len(),
+        },
+        Err(error) => unavailable(error),
+    }
+}
+
+/// The observation open failed. Only `NotFound` is a confirmed absence;
+/// anything else (sharing, permission, a symlink refused by no-follow) is
+/// unavailable with its error kind kept. The identity, if any, comes from a
+/// separate probe; a probe that finds our own file means "ours".
+#[cfg_attr(not(windows), allow(dead_code))]
+fn classify_open_failure(
+    error: std::io::Error,
+    probe: impl FnOnce() -> std::io::Result<Identity>,
+    ours: Identity,
+) -> Option<ObservedTarget> {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return Some(ObservedTarget::Absent);
+    }
+    let probed = probe().ok();
+    if probed == Some(ours) {
+        return None;
+    }
+    Some(ObservedTarget::unavailable(
+        probed.map(Identity::parts),
+        &error,
+    ))
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn into_io(error: Error) -> std::io::Error {
+    match error {
+        Error::Io(error) => error,
+        other => std::io::Error::other(other),
+    }
+}
+
+/// Open the entry at `path` itself for reading: no symlink following (Unix:
+/// `O_NOFOLLOW`, non-blocking so a FIFO cannot hang; Windows: the reparse
+/// point itself, directories allowed), sharing read, write and delete.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn open_for_observation(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use rustix::fs::OFlags;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags((OFlags::NOFOLLOW | OFlags::NONBLOCK).bits() as i32);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    options.open(path)
+}
+
+/// What the post-rename observation found at the target. Identities are
+/// `(volume, index)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ObservedTarget {
+    /// Confirmed absent: the open reported `NotFound`.
+    Absent,
+    /// An entry that is not a regular file (a directory, a symlink or other
+    /// reparse point, a FIFO), with the identity of the opened handle.
+    NotRegular { id: (u64, u128) },
+    /// A regular file. Identity, content (at most 64 KiB) and full length all
+    /// come from the same opened handle.
+    File {
+        id: (u64, u128),
+        content: Vec<u8>,
+        len: u64,
+    },
+    /// The target could not be observed (sharing violation, permission, a
+    /// symlink refused by no-follow, a read error). This is NOT a claim of
+    /// absence. `id` is the identity if one was obtained: from the opened
+    /// handle when the read failed, or from a separate probe without data
+    /// access when the open failed. No content is reported.
+    Unavailable {
+        id: Option<(u64, u128)>,
+        kind: std::io::ErrorKind,
+        raw_os_error: Option<i32>,
+        message: String,
+    },
+}
+
+impl ObservedTarget {
+    fn unavailable(id: Option<(u64, u128)>, error: &std::io::Error) -> Self {
+        Self::Unavailable {
+            id,
+            kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
+            message: error.to_string(),
+        }
+    }
+
+    /// The observed identity, if one was obtained.
+    pub fn id(&self) -> Option<(u64, u128)> {
+        match self {
+            Self::Absent => None,
+            Self::NotRegular { id } | Self::File { id, .. } => Some(*id),
+            Self::Unavailable { id, .. } => *id,
+        }
+    }
+}
+
+impl std::fmt::Display for ObservedTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Absent => f.write_str("no entry (not found)"),
+            Self::NotRegular {
+                id: (volume, index),
+            } => {
+                write!(f, "{volume:x}:{index:x}, not a regular file")
+            }
+            Self::File {
+                id: (volume, index),
+                len,
+                ..
+            } => write!(f, "file {volume:x}:{index:x}, {len} bytes"),
+            Self::Unavailable {
+                id, kind, message, ..
+            } => {
+                write!(f, "unavailable, {kind:?}: {message}")?;
+                match id {
+                    Some((volume, index)) => write!(f, "; probed identity {volume:x}:{index:x}"),
+                    None => f.write_str("; identity unknown"),
+                }
+            }
+        }
+    }
 }
 
 /// A path-form lock rename returned success, but the target no longer has the
@@ -581,19 +754,16 @@ fn observe_after_rename(target: &Path, ours: Identity) -> Result<(), Error> {
 /// (possibly legitimate) writer, or the rename may have published a file
 /// that replaced our lock in the close-before-rename window. It does not mean
 /// "unchanged" and does not prove foreign publication. The observed target
-/// state is reported; nothing is rolled back. This detects some replacement
-/// outcomes only; it does not close the window (see the Windows handle-rename
-/// proposal, PWR-197). Returned inside [`Error::Other`].
+/// state ([`ObservedTarget`]) is reported; nothing is rolled back. This
+/// detects some replacement outcomes only; it does not close the window (see
+/// the Windows handle-rename proposal, PWR-197). Returned inside
+/// [`Error::Other`].
 #[derive(Debug)]
 pub struct RenameOutcomeUncertainError {
     target: PathBuf,
     /// `(volume, index)` of the lock file we created.
     ours: (u64, u128),
-    /// `(volume, index)` of the target when observed, if it could be opened.
-    observed: Option<(u64, u128)>,
-    /// Up to 64 KiB of the observed target and its full length, if it was a
-    /// regular file.
-    content: Option<(Vec<u8>, u64)>,
+    observed: ObservedTarget,
 }
 
 impl RenameOutcomeUncertainError {
@@ -606,19 +776,26 @@ impl RenameOutcomeUncertainError {
         self.ours
     }
 
-    /// Identity of the target as observed after the rename, if any.
-    pub fn observed(&self) -> Option<(u64, u128)> {
-        self.observed
+    /// What was observed at the target after the rename.
+    pub fn observed(&self) -> &ObservedTarget {
+        &self.observed
     }
 
-    /// Up to 64 KiB of the observed target content, if it was a regular file.
+    /// Up to 64 KiB of the observed target content, read from the same
+    /// handle as its identity; only for [`ObservedTarget::File`].
     pub fn observed_content(&self) -> Option<&[u8]> {
-        self.content.as_ref().map(|(bytes, _)| bytes.as_slice())
+        match &self.observed {
+            ObservedTarget::File { content, .. } => Some(content),
+            _ => None,
+        }
     }
 
-    /// Full length of the observed target, if it was a regular file.
+    /// Full length of the observed target; only for [`ObservedTarget::File`].
     pub fn observed_len(&self) -> Option<u64> {
-        self.content.as_ref().map(|(_, len)| *len)
+        match &self.observed {
+            ObservedTarget::File { len, .. } => Some(*len),
+            _ => None,
+        }
     }
 }
 
@@ -628,16 +805,10 @@ impl std::fmt::Display for RenameOutcomeUncertainError {
             f,
             "rename to {} returned success, but the target no longer has our identity; \
              it may have been published by us and then replaced, or the rename published \
-             another file (observed: ",
-            self.target.display()
-        )?;
-        match (&self.observed, &self.content) {
-            (None, _) => write!(f, "no entry)"),
-            (Some((volume, index)), Some((_, len))) => {
-                write!(f, "file {volume:x}:{index:x}, {len} bytes)")
-            }
-            (Some((volume, index)), None) => write!(f, "{volume:x}:{index:x}, not a regular file)"),
-        }
+             another file (observed: {})",
+            self.target.display(),
+            self.observed
+        )
     }
 }
 
@@ -824,7 +995,14 @@ mod tests {
                     .downcast_ref::<RenameOutcomeUncertainError>()
                     .ok_or(Error::Injected("type"))?;
                 assert_eq!(typed.ours(), ours.parts());
-                assert_eq!(typed.observed(), Some(replaced.parts()));
+                assert_eq!(
+                    typed.observed(),
+                    &ObservedTarget::File {
+                        id: replaced.parts(),
+                        content: b"someone else".to_vec(),
+                        len: 12,
+                    }
+                );
                 assert_eq!(typed.observed_content(), Some(&b"someone else"[..]));
                 assert_eq!(typed.observed_len(), Some(12));
                 assert!(error.to_string().contains("no longer has our identity"));
@@ -844,12 +1022,241 @@ mod tests {
                 let typed = error
                     .downcast_ref::<RenameOutcomeUncertainError>()
                     .ok_or(Error::Injected("type"))?;
-                assert_eq!(typed.observed(), None);
+                assert_eq!(typed.observed(), &ObservedTarget::Absent);
                 assert_eq!(typed.observed_content(), None);
+                assert!(error.to_string().contains("no entry (not found)"));
             }
             other => panic!("expected an uncertain outcome, got {other:?}"),
         }
         assert!(!target.exists());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// Classification of a failed observation open, independent of the
+    /// filesystem: only `NotFound` is absent; every other error is
+    /// unavailable with its kind and OS code kept, with the separately
+    /// probed identity when there is one; a probe that finds our file is
+    /// "ours", not uncertain.
+    #[test]
+    fn failed_observation_open_is_classified_by_error_kind() -> Result<(), Error> {
+        use std::io::{Error as IoError, ErrorKind};
+        let dir = scratch("lock-classify")?;
+        std::fs::write(dir.join("ours"), b"ours")?;
+        std::fs::write(dir.join("other"), b"other")?;
+        let ours = Identity::of_path(&dir.join("ours"))?;
+        let other = Identity::of_path(&dir.join("other"))?;
+        let probe_fails = || Err(IoError::from(ErrorKind::PermissionDenied));
+
+        assert_eq!(
+            classify_open_failure(IoError::from(ErrorKind::NotFound), || Ok(other), ours),
+            Some(ObservedTarget::Absent)
+        );
+        let denied = classify_open_failure(
+            IoError::new(ErrorKind::PermissionDenied, "denied"),
+            probe_fails,
+            ours,
+        );
+        assert!(
+            matches!(
+                &denied,
+                Some(ObservedTarget::Unavailable {
+                    id: None,
+                    kind: ErrorKind::PermissionDenied,
+                    raw_os_error: None,
+                    message,
+                }) if message == "denied"
+            ),
+            "{denied:?}"
+        );
+        // An OS error (Windows ERROR_SHARING_VIOLATION is 32) keeps its code
+        // and the separately probed identity.
+        let sharing = classify_open_failure(IoError::from_raw_os_error(32), || Ok(other), ours);
+        assert!(
+            matches!(
+                &sharing,
+                Some(ObservedTarget::Unavailable { id: Some(id), raw_os_error: Some(32), .. })
+                    if *id == other.parts()
+            ),
+            "{sharing:?}"
+        );
+        // Our own file behind a sharing conflict is ours, not uncertain.
+        assert_eq!(
+            classify_open_failure(IoError::from_raw_os_error(32), || Ok(ours), ours),
+            None
+        );
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// Each observation variant on the real filesystem, with a truthful
+    /// message: ours, a regular file, not a regular file, absent and (Unix:
+    /// a symlink refused by no-follow) unavailable. Windows sharing denial is
+    /// `windows_sharing_denial_is_unavailable_not_absent`.
+    #[test]
+    fn observation_reports_each_variant() -> Result<(), Error> {
+        let dir = scratch("lock-variants")?;
+        let target = dir.join("HEAD");
+        std::fs::write(dir.join("ours"), b"ours")?;
+        let ours = Identity::of_path(&dir.join("ours"))?;
+        std::fs::rename(dir.join("ours"), &target)?;
+        assert_eq!(observe(&target, ours), None);
+
+        std::fs::write(dir.join("file"), b"file")?;
+        std::fs::rename(dir.join("file"), &target)?;
+        let file = Identity::of_path(&target)?;
+        let observed = observe(&target, ours).ok_or(Error::Injected("file"))?;
+        assert_eq!(
+            observed,
+            ObservedTarget::File {
+                id: file.parts(),
+                content: b"file".to_vec(),
+                len: 4,
+            }
+        );
+        assert!(observed.to_string().ends_with(", 4 bytes"), "{observed}");
+
+        std::fs::remove_file(&target)?;
+        std::fs::create_dir(&target)?;
+        let directory = Identity::of_path(&target)?;
+        let observed = observe(&target, ours).ok_or(Error::Injected("dir"))?;
+        assert_eq!(
+            observed,
+            ObservedTarget::NotRegular {
+                id: directory.parts()
+            }
+        );
+        assert!(
+            observed.to_string().contains("not a regular file"),
+            "{observed}"
+        );
+
+        std::fs::remove_dir(&target)?;
+        let observed = observe(&target, ours).ok_or(Error::Injected("absent"))?;
+        assert_eq!(observed, ObservedTarget::Absent);
+        assert_eq!(observed.to_string(), "no entry (not found)");
+
+        #[cfg(unix)]
+        {
+            // No-follow refuses the symlink (ELOOP): it exists, so it is
+            // unavailable with the separately probed identity, never absent.
+            std::os::unix::fs::symlink("elsewhere", &target)?;
+            let link = Identity::of_path(&target)?;
+            let observed = observe(&target, ours).ok_or(Error::Injected("link"))?;
+            match &observed {
+                ObservedTarget::Unavailable {
+                    id, raw_os_error, ..
+                } => {
+                    assert_eq!(*id, Some(link.parts()));
+                    assert_eq!(*raw_os_error, Some(rustix::io::Errno::LOOP.raw_os_error()));
+                }
+                other => panic!("expected unavailable, got {other:?}"),
+            }
+            assert!(
+                observed.to_string().starts_with("unavailable, "),
+                "{observed}"
+            );
+            assert!(!observed.to_string().contains("not found"), "{observed}");
+        }
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    thread_local! {
+        /// Runs once, between the observation open and its read.
+        static BETWEEN_OPEN_AND_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            std::cell::RefCell::new(None);
+    }
+
+    pub(super) fn between_open_and_read_hook() {
+        if let Some(hook) = BETWEEN_OPEN_AND_READ.with(|cell| cell.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    /// One observation: the target is swapped between the open and the read,
+    /// and the reported identity and bytes still both describe the file that
+    /// was opened, never the opened identity with the newcomer's bytes.
+    #[test]
+    fn observation_takes_identity_and_content_from_one_handle() -> Result<(), Error> {
+        let dir = scratch("lock-one-handle")?;
+        let target = dir.join("HEAD");
+        std::fs::write(dir.join("ours"), b"ours")?;
+        let ours = Identity::of_path(&dir.join("ours"))?;
+        std::fs::write(dir.join("first"), b"first writer")?;
+        std::fs::rename(dir.join("first"), &target)?;
+        let first = Identity::of_path(&target)?;
+        std::fs::write(dir.join("second"), b"second")?;
+        let second = Identity::of_path(&dir.join("second"))?;
+        let (swap_target, swap_dir) = (target.clone(), dir.clone());
+        BETWEEN_OPEN_AND_READ.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(move || {
+                // Move the opened file away (allowed: the observation shares
+                // delete), then put another file at the name.
+                let swapped = std::fs::rename(&swap_target, swap_dir.join("moved"))
+                    .and_then(|()| std::fs::rename(swap_dir.join("second"), &swap_target));
+                assert!(swapped.is_ok(), "{swapped:?}");
+            }));
+        });
+        let observed = observe(&target, ours);
+        assert_eq!(Identity::of_path(&target)?, second, "the hook swapped");
+        assert_eq!(
+            observed,
+            Some(ObservedTarget::File {
+                id: first.parts(),
+                content: b"first writer".to_vec(),
+                len: 12,
+            })
+        );
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// Windows: a target held open without FILE_SHARE_READ cannot be read.
+    /// The observation reports it as unavailable with the sharing-violation
+    /// code (and the identity from the no-data-access probe), never absent
+    /// or not regular; our own file held that way is still accepted.
+    #[cfg(windows)]
+    #[test]
+    fn windows_sharing_denial_is_unavailable_not_absent() -> Result<(), Error> {
+        use std::os::windows::fs::OpenOptionsExt;
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        let dir = scratch("lock-sharing")?;
+        let target = dir.join("HEAD");
+        std::fs::write(dir.join("ours"), b"ours")?;
+        let ours = Identity::of_path(&dir.join("ours"))?;
+        std::fs::write(&target, b"held")?;
+        let held = Identity::of_path(&target)?;
+        let holder = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&target)?;
+        let observed = observe(&target, ours).ok_or(Error::Injected("held"))?;
+        match &observed {
+            ObservedTarget::Unavailable {
+                id, raw_os_error, ..
+            } => {
+                assert_eq!(*raw_os_error, Some(ERROR_SHARING_VIOLATION), "{observed}");
+                assert_eq!(*id, Some(held.parts()), "{observed}");
+            }
+            other => panic!("expected unavailable, got {other:?}"),
+        }
+        assert!(
+            observed.to_string().starts_with("unavailable, "),
+            "{observed}"
+        );
+        drop(holder);
+
+        // Our own published file behind the same denial is accepted.
+        let ours_path = dir.join("ours");
+        let ours_holder = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&ours_path)?;
+        assert_eq!(observe(&ours_path, ours), None);
+        drop(ours_holder);
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

@@ -27,7 +27,8 @@ pub use commit::{CommitOutcome, CommitRequest, Signature};
 pub use index::{AddOutcome, AddRefusal};
 pub use init::{InitOptions, InitPublishedError, ObjectFormat, init};
 pub use lock::{
-    LockPublishedUnreachableError, LockPublishedUnsyncedError, RenameOutcomeUncertainError,
+    LockPublishedUnreachableError, LockPublishedUnsyncedError, ObservedTarget,
+    RenameOutcomeUncertainError,
 };
 pub use refs::{
     RefExpectation, RefLog, RefLoggedNotPublishedError, RefPublishedUnreachableError,

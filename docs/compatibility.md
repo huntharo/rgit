@@ -235,11 +235,14 @@ renames it by path; a safe handle-relative rename is proposed separately
 (PWR-197). The legacy lock compares its file identity with the lock path
 before `MoveFileExW` (a mismatch refuses, nothing published) and with the
 target after it; a mismatch after the rename is reported as an uncertain
-outcome (`RenameOutcomeUncertainError`, with the observed identity and
-content) and is never rolled back. This detects some replacement outcomes
-only and does not close the close-before-rename window. An object that already exists is not re-synced (it is read-only,
-and syncing would need a writable handle), so its durability relies on its
-writer. `init` uses exclusive directory creation because no atomic no-replace
+outcome (`RenameOutcomeUncertainError`) and is never rolled back. Its
+`ObservedTarget` takes the identity and content from one handle, reports
+absence only for a not-found lookup, and reports a sharing, permission or
+read failure as unavailable with its error kind. This detects some
+replacement outcomes only and does not close the close-before-rename window.
+An object that already exists is not re-synced (it is read-only, and syncing
+would need a writable handle), so its durability relies on its writer.
+`init` uses exclusive directory creation because no atomic no-replace
 rename is available.
 
 Recovery after interruption: a fresh process sees each of the index, `HEAD`

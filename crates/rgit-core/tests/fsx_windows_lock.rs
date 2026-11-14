@@ -10,10 +10,12 @@
 mod common;
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 
 use common::{Result, git};
-use rgit_core::write::{RefExpectation, RefLog, RefUpdate, RenameOutcomeUncertainError, Signature};
+use rgit_core::write::{
+    ObservedTarget, RefExpectation, RefLog, RefUpdate, RenameOutcomeUncertainError, Signature,
+};
 use rgit_core::{Error, ObjectId, Repository};
 
 const CHILD: &str = "RGIT_TEST_LOCK_CHILD";
@@ -56,10 +58,12 @@ fn lock_child() -> Result {
         Ok(()) => "ok".to_owned(),
         Err(Error::Other(error)) => match error.downcast_ref::<RenameOutcomeUncertainError>() {
             Some(uncertain) => format!(
-                "uncertain\nobserved={}\nours={:?}\ncontent={}\nmessage={error}",
+                "uncertain\nobserved={}\nfile={}\nours={:?}\ncontent={}\nmessage={error}",
                 uncertain
                     .observed()
+                    .id()
                     .is_some_and(|id| id != uncertain.ours()),
+                matches!(uncertain.observed(), ObservedTarget::File { .. }),
                 uncertain.ours(),
                 String::from_utf8_lossy(uncertain.observed_content().unwrap_or_default()),
             ),
@@ -71,13 +75,20 @@ fn lock_child() -> Result {
     Ok(())
 }
 
-fn wait_for(path: &Path) -> Result {
+/// Wait for the child to reach the failpoint; a child that exits first
+/// (it failed before the rename) is reported with its result at once.
+fn wait_for(path: &Path, child: &mut Child, out: &Path) -> Result {
     for _ in 0..3000 {
         if path.exists() {
             return Ok(());
         }
+        if let Some(status) = child.try_wait()? {
+            let report = std::fs::read_to_string(out).unwrap_or_default();
+            return Err(format!("child exited before the failpoint ({status}): {report}").into());
+        }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    let _ = child.kill();
     Err("failpoint never reached".into())
 }
 
@@ -124,19 +135,23 @@ fn replacement_case(with_log: bool) -> Result {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    wait_for(&sync.join("ready"))?;
+    wait_for(&sync.join("ready"), &mut child, &out)?;
     // The rename has happened: our value is visible. Another writer now
-    // replaces the target with a different file.
+    // replaces the target with a different file, written first and renamed
+    // over it (never delete-then-create, which could reuse the freed file
+    // index or hit a delete-pending target).
     assert_eq!(std::fs::read_to_string(&target)?.trim(), second);
-    std::fs::remove_file(&target)?;
     let replacement = format!("{first}\n");
-    std::fs::write(&target, &replacement)?;
+    let staged = dir.join(".git/refs/heads/replacement.tmp");
+    std::fs::write(&staged, &replacement)?;
+    std::fs::rename(&staged, &target)?;
     std::fs::write(sync.join("release"), b"")?;
     assert!(child.wait()?.success());
 
     let report = std::fs::read_to_string(&out)?;
     assert!(report.starts_with("uncertain\n"), "{report}");
     assert!(report.contains("observed=true"), "{report}");
+    assert!(report.contains("file=true"), "{report}");
     assert!(
         report.contains(&format!("content={replacement}")),
         "{report}"
