@@ -1,4 +1,6 @@
-//! Read-only repository operations. This crate never invokes a Git executable.
+//! Repository operations. This crate never invokes a Git executable, shell,
+//! hook, filter or helper. Mutating operations live in [`write`] and refuse
+//! unsupported repository capabilities before changing any state.
 
 use std::path::Path;
 
@@ -15,6 +17,7 @@ mod inspection;
 pub use inspection::IndexEntry;
 mod status;
 pub use status::{StatusEntry, UntrackedMode};
+pub mod write;
 
 /// Operation errors retain the underlying Gitoxide error as their source.
 #[derive(Debug)]
@@ -38,6 +41,26 @@ pub enum Error {
     UnsupportedHistory(&'static str),
     UnsupportedCapability(&'static str),
     InvalidPath(Vec<u8>),
+    /// Another writer holds this lock file; nothing was changed.
+    Locked(std::path::PathBuf),
+    /// The destination already exists and the operation does not overwrite it.
+    AlreadyExists(std::path::PathBuf),
+    /// Compare-and-swap reference update found a different current value.
+    RefConflict {
+        name: Vec<u8>,
+        expected: Option<ObjectId>,
+        actual: Option<ObjectId>,
+    },
+    /// A referenced object is absent from the object database.
+    MissingObject(ObjectId),
+    InvalidRefName(Vec<u8>),
+    /// The index contains conflict stages, so no tree can be written.
+    UnmergedIndex,
+    NothingToCommit,
+    /// A failure from a Gitoxide sub-crate or another typed source.
+    Other(Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// A test-only failpoint injected this error (feature `failpoints`).
+    Injected(&'static str),
 }
 
 impl std::fmt::Display for Error {
@@ -65,6 +88,36 @@ impl std::fmt::Display for Error {
             Self::UnsupportedHistory(feature) => {
                 write!(f, "unsupported history feature: {feature}")
             }
+            Self::Locked(path) => write!(
+                f,
+                "unable to create '{}': lock file exists; another rgit or git process may be running",
+                path.display()
+            ),
+            Self::AlreadyExists(path) => write!(f, "already exists: {}", path.display()),
+            Self::RefConflict {
+                name,
+                expected,
+                actual,
+            } => {
+                let show = |id: &Option<ObjectId>| {
+                    id.map_or_else(|| "(absent)".to_owned(), |id| id.to_string())
+                };
+                write!(
+                    f,
+                    "reference {:?} changed concurrently: expected {}, found {}",
+                    BStr::new(name),
+                    show(expected),
+                    show(actual)
+                )
+            }
+            Self::MissingObject(id) => write!(f, "object {id} is missing"),
+            Self::InvalidRefName(name) => {
+                write!(f, "invalid reference name: {:?}", BStr::new(name))
+            }
+            Self::UnmergedIndex => write!(f, "index contains unmerged entries"),
+            Self::NothingToCommit => write!(f, "nothing to commit"),
+            Self::Other(error) => write!(f, "{error}"),
+            Self::Injected(name) => write!(f, "injected failure at {name}"),
         }
     }
 }
@@ -74,6 +127,7 @@ impl std::error::Error for Error {
         match self {
             Self::Git(error) => Some(error),
             Self::Io(error) => Some(error),
+            Self::Other(error) => Some(error.as_ref()),
             _ => None,
         }
     }
@@ -133,6 +187,14 @@ impl Repository {
 
     pub fn work_dir(&self) -> Option<&Path> {
         self.inner.workdir()
+    }
+
+    /// A repository-local configuration value as raw bytes, if set.
+    pub fn config_bytes(&self, key: &str) -> Option<Vec<u8>> {
+        self.inner
+            .config_snapshot()
+            .string(key)
+            .map(|value| value.to_vec())
     }
 
     pub fn is_bare(&self) -> bool {

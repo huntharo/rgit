@@ -6,9 +6,21 @@ rust-version.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Test-only fault injection (see src/write/failpoint.rs). Never enable in releases.
+failpoints = []
+
 [dependencies]
 gix.workspace = true
 similar.workspace = true
+
+# Safe atomic no-replace rename and no-follow/non-blocking opens (already in
+# the dependency tree through gix; never used with `unsafe` in this crate).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs"] }
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

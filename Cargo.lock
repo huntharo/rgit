@@ -1500,7 +1500,9 @@ name = "rgit-core"
 version = "0.1.0"
 dependencies = [
  "gix",
+ "rustix",
  "similar",
+ "tempfile",
 ]
 
 [[package]]

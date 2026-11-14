@@ -23,6 +23,8 @@ jobs:
       - run: rustup show
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Failpoints must stay inert in optimized builds even with the feature on.
+      - run: cargo test --release -p rgit-core --features failpoints --lib --locked release_build_ignores_failpoint_environment
   test:
     name: Test (${{ matrix.os }}, Rust ${{ matrix.rust }})
     runs-on: ${{ matrix.os }}
@@ -40,4 +42,4 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install ${{ matrix.rust }} --profile minimal
       - run: git --version
-      - run: cargo +${{ matrix.rust }} test --workspace --locked -- --nocapture
+      - run: cargo +${{ matrix.rust }} test --workspace --locked --no-fail-fast -- --nocapture
