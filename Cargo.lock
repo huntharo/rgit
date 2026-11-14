@@ -1503,6 +1503,7 @@ dependencies = [
  "rustix",
  "similar",
  "tempfile",
+ "winapi-util",
 ]
 
 [[package]]

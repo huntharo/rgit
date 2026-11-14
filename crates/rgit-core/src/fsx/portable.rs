@@ -51,17 +51,17 @@ fn kind_of(metadata: &fs::Metadata) -> Kind {
     }
 }
 
-fn meta_of(metadata: &fs::Metadata) -> Result<Meta, Error> {
+/// Metadata plus identity. On Unix the identity comes from the metadata; on
+/// Windows from the handle (`GetFileInformationByHandle` via winapi-util:
+/// volume serial number and file index), never from size or timestamps.
+fn meta_of(metadata: &fs::Metadata, id: FileId) -> Meta {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        Ok(Meta {
+        Meta {
             kind: kind_of(metadata),
             len: metadata.len(),
-            id: FileId {
-                volume: metadata.dev(),
-                index: u128::from(metadata.ino()),
-            },
+            id,
             mtime: (
                 metadata.mtime(),
                 metadata.mtime_nsec().clamp(0, 999_999_999) as u32,
@@ -70,14 +70,87 @@ fn meta_of(metadata: &fs::Metadata) -> Result<Meta, Error> {
                 metadata.ctime(),
                 metadata.ctime_nsec().clamp(0, 999_999_999) as u32,
             ),
-        })
+        }
     }
     #[cfg(not(unix))]
     {
-        let _ = metadata;
+        let stamp = |time: std::io::Result<std::time::SystemTime>| {
+            time.ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or((0, 0), |since| {
+                    (
+                        i64::try_from(since.as_secs()).unwrap_or(i64::MAX),
+                        since.subsec_nanos(),
+                    )
+                })
+        };
+        Meta {
+            kind: kind_of(metadata),
+            len: metadata.len(),
+            id,
+            mtime: stamp(metadata.modified()),
+            // Creation time, as the index stat data uses on Windows.
+            ctime: stamp(metadata.created()),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn id_of_metadata(metadata: &fs::Metadata) -> FileId {
+    use std::os::unix::fs::MetadataExt;
+    FileId {
+        volume: metadata.dev(),
+        index: u128::from(metadata.ino()),
+    }
+}
+
+/// Identity of an open handle.
+fn id_of_file(file: &File) -> Result<FileId, Error> {
+    #[cfg(unix)]
+    {
+        Ok(id_of_metadata(&file.metadata()?))
+    }
+    #[cfg(windows)]
+    {
+        let information = winapi_util::file::information(file)?;
+        Ok(FileId {
+            volume: information.volume_serial_number(),
+            index: u128::from(information.file_index()),
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
         Err(Error::UnsupportedCapability(
             "stable file identity on this platform",
         ))
+    }
+}
+
+/// `lstat` with identity, not following a final symlink or junction.
+fn lstat_path(path: &Path) -> std::io::Result<Meta> {
+    let metadata = fs::symlink_metadata(path)?;
+    #[cfg(unix)]
+    {
+        Ok(meta_of(&metadata, id_of_metadata(&metadata)))
+    }
+    #[cfg(not(unix))]
+    {
+        // Open the entry itself (a reparse point is not followed; directories
+        // need backup semantics) with no data access, only to read identity.
+        let mut options = OpenOptions::new();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            options
+                .access_mode(0)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
+        }
+        let handle = options.open(path)?;
+        let id = id_of_file(&handle).map_err(std::io::Error::other)?;
+        Ok(meta_of(&metadata, id))
     }
 }
 
@@ -106,8 +179,8 @@ impl Dir {
     }
 
     pub(crate) fn lstat(&self, rel: &[u8]) -> Result<Option<Meta>, Error> {
-        match fs::symlink_metadata(join(&self.path, rel)?) {
-            Ok(metadata) => meta_of(&metadata).map(Some),
+        match lstat_path(&join(&self.path, rel)?) {
+            Ok(meta) => Ok(Some(meta)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
@@ -115,7 +188,7 @@ impl Dir {
 
     pub(crate) fn open_read(&self, rel: &[u8]) -> Result<(File, Meta), Error> {
         let file = crate::write::open_leaf_nofollow(&join(&self.path, rel)?)?;
-        let meta = meta_of(&file.metadata()?)?;
+        let meta = meta_of(&file.metadata()?, id_of_file(&file)?);
         if !matches!(meta.kind, Kind::File { .. }) {
             return Err(Error::UnsupportedCapability("not a regular file"));
         }
@@ -241,5 +314,5 @@ impl Dir {
 }
 
 pub(crate) fn file_id(file: &File) -> Result<FileId, Error> {
-    meta_of(&file.metadata()?).map(|meta| meta.id)
+    id_of_file(file)
 }

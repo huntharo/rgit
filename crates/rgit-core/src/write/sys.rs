@@ -12,6 +12,8 @@ use crate::Error;
 /// filesystem offers no atomic no-replace rename, this refuses with
 /// [`Error::UnsupportedCapability`] and the caller must use another scheme
 /// (for files, `hard_link`; for directories, exclusive creation).
+// Used by the legacy path backend; the anchored Unix backend does not.
+#[cfg_attr(unix, allow(dead_code))]
 pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> Result<(), Error> {
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     {
@@ -47,6 +49,8 @@ pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> Result<(), Error> {
 /// symlink and without blocking on a FIFO. The caller must still validate the
 /// opened descriptor (`File::metadata`) against its earlier `lstat`; parent
 /// directories are resolved normally (no directory anchoring).
+// Used by the legacy path backend; the anchored Unix backend does not.
+#[cfg_attr(unix, allow(dead_code))]
 pub(crate) fn open_leaf_nofollow(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -70,6 +74,8 @@ pub(crate) fn open_leaf_nofollow(path: &Path) -> std::io::Result<File> {
 /// then its directory. Unix syncs through a read-only descriptor. On Windows
 /// this implementation does not re-sync: `FlushFileBuffers` needs a writable
 /// handle and loose objects are read-only, so durability relies on the writer.
+// Used by the legacy path backend; the anchored Unix backend does not.
+#[cfg_attr(unix, allow(dead_code))]
 pub(crate) fn sync_existing_file(path: &Path) -> Result<(), Error> {
     #[cfg(unix)]
     File::open(path)?.sync_all()?;
