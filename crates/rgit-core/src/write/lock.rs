@@ -40,13 +40,33 @@ enum Location<'a> {
         target: PathBuf,
         lock_path: PathBuf,
     },
-    /// Constructed on Unix only (the anchored backend).
+    /// Constructed on Unix only (the anchored backend). The whole lifecycle
+    /// (create, identity check, rename, remove, directory sync) runs on one
+    /// held parent directory, by leaf name, so a parent swapped after acquire
+    /// cannot split it across directories.
     #[cfg_attr(not(unix), allow(dead_code))]
     Anchored {
-        anchor: &'a Anchor,
+        dir: Held<'a>,
         target: Vec<u8>,
         lock: Vec<u8>,
     },
+}
+
+/// The directory that holds a lock: the caller's anchor when the lock is
+/// directly below it, otherwise an owned anchor on the parent directory.
+#[cfg_attr(not(unix), allow(dead_code))]
+enum Held<'a> {
+    Root(&'a Anchor),
+    Parent(Anchor),
+}
+
+impl Held<'_> {
+    fn get(&self) -> &Anchor {
+        match self {
+            Self::Root(anchor) => anchor,
+            Self::Parent(anchor) => anchor,
+        }
+    }
 }
 
 impl<'a> LockFile<'a> {
@@ -62,23 +82,28 @@ impl<'a> LockFile<'a> {
         }
         #[cfg(unix)]
         {
-            let mut lock = rel.to_vec();
+            // Hold the parent directory for the whole lifecycle.
+            let (dir, leaf) = match rel.iter().rposition(|&byte| byte == b'/') {
+                Some(slash) => (Held::Parent(anchor.sub(&rel[..slash])?), &rel[slash + 1..]),
+                None => (Held::Root(anchor), rel),
+            };
+            let mut lock = leaf.to_vec();
             lock.extend_from_slice(b".lock");
-            let file = match anchor.create_new(&lock, 0o666) {
+            let file = match dir.get().create_new(&lock, 0o666) {
                 Ok(file) => file,
                 Err(Error::AlreadyExists(_)) => {
-                    return Err(Error::Locked(display(anchor, &lock)));
+                    return Err(Error::Locked(display(dir.get(), &lock)));
                 }
                 Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    return Err(Error::Locked(display(anchor, &lock)));
+                    return Err(Error::Locked(display(dir.get(), &lock)));
                 }
                 Err(error) => return Err(error),
             };
             let identity = Identity::of_file(&file)?;
             let lock = Self {
                 location: Location::Anchored {
-                    anchor,
-                    target: rel.to_vec(),
+                    dir,
+                    target: leaf.to_vec(),
                     lock,
                 },
                 file: Some(file),
@@ -166,17 +191,14 @@ impl<'a> LockFile<'a> {
             return Err(Error::Locked(self.lock_display()));
         }
         match &self.location {
-            Location::Anchored {
-                anchor,
-                target,
-                lock,
-            } => {
-                // The descriptor stays open across the rename.
-                anchor.rename_replace(lock, target)?;
+            Location::Anchored { dir, target, lock } => {
+                // The descriptor stays open across the rename; the rename and
+                // the sync act on the held parent directory.
+                dir.get().rename_replace(lock, target)?;
                 self.released = true;
                 drop(self.file.take());
                 super::failpoint("lock.after-rename")?;
-                anchor.sync()
+                dir.get().sync()
             }
             Location::Path { target, lock_path } => {
                 // Windows cannot rename a file this process holds open
@@ -204,7 +226,7 @@ impl<'a> LockFile<'a> {
 
     fn still_ours(&self) -> bool {
         match &self.location {
-            Location::Anchored { anchor, lock, .. } => anchor.lstat(lock).is_ok_and(|meta| {
+            Location::Anchored { dir, lock, .. } => dir.get().lstat(lock).is_ok_and(|meta| {
                 meta.is_some_and(|meta| {
                     matches!(meta.kind, crate::fsx::Kind::File { .. })
                         && Identity::of_id(meta.id) == Some(self.identity)
@@ -218,7 +240,7 @@ impl<'a> LockFile<'a> {
 
     fn lock_display(&self) -> PathBuf {
         match &self.location {
-            Location::Anchored { anchor, lock, .. } => display(anchor, lock),
+            Location::Anchored { dir, lock, .. } => display(dir.get(), lock),
             Location::Path { lock_path, .. } => lock_path.clone(),
         }
     }
@@ -234,7 +256,7 @@ impl Drop for LockFile<'_> {
         drop(self.file.take());
         if ours {
             let _ = match &self.location {
-                Location::Anchored { anchor, lock, .. } => anchor.unlink(lock),
+                Location::Anchored { dir, lock, .. } => dir.get().unlink(lock),
                 Location::Path { lock_path, .. } => {
                     std::fs::remove_file(lock_path).map_err(Error::from)
                 }
@@ -435,6 +457,59 @@ mod tests {
             LockFile::acquire_at(&anchor, b""),
             Err(Error::InvalidPath(_))
         ));
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// The parent directory is held from acquire to release: after the
+    /// parent is swapped for a new directory, commit publishes into the
+    /// ORIGINAL directory or refuses, nothing is published into the new one,
+    /// and dropping a lock never unlinks in the new one (where a foreign lock
+    /// with the same name lives).
+    #[cfg(unix)]
+    #[test]
+    fn anchored_lock_holds_its_parent_directory() -> Result<(), Error> {
+        use crate::fsx::Root;
+        let dir = scratch("lock-parent-swap")?;
+        let heads = dir.join("refs/heads");
+        let moved = dir.join("refs/heads-moved");
+        std::fs::create_dir_all(&heads)?;
+        std::fs::write(heads.join("main"), b"old")?;
+        let anchor = Anchor::open(&dir, Root::GitDir)?;
+
+        // Commit after the swap.
+        let mut lock = LockFile::acquire_at(&anchor, b"refs/heads/main")?;
+        lock.write_all(b"new")?;
+        std::fs::rename(&heads, &moved)?;
+        std::fs::create_dir(&heads)?;
+        let result = lock.commit();
+        assert!(
+            !heads.join("main").exists(),
+            "published into the new directory"
+        );
+        assert!(!heads.join("main.lock").exists());
+        match result {
+            // Published through the held (original) directory.
+            Ok(()) => {
+                assert_eq!(std::fs::read(moved.join("main"))?, b"new");
+                assert!(!moved.join("main.lock").exists());
+            }
+            // Refused: the original is unchanged.
+            Err(Error::Locked(_)) => assert_eq!(std::fs::read(moved.join("main"))?, b"old"),
+            Err(error) => return Err(error),
+        }
+
+        // Drop after the swap, with a foreign lock of the same name in the
+        // new directory: it is never unlinked.
+        std::fs::remove_dir_all(&heads)?;
+        let _ = std::fs::remove_file(moved.join("main.lock"));
+        std::fs::rename(&moved, &heads)?;
+        let lock = LockFile::acquire_at(&anchor, b"refs/heads/main")?;
+        std::fs::rename(&heads, &moved)?;
+        std::fs::create_dir(&heads)?;
+        std::fs::write(heads.join("main.lock"), b"foreign")?;
+        drop(lock);
+        assert_eq!(std::fs::read(heads.join("main.lock"))?, b"foreign");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
