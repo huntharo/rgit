@@ -395,6 +395,117 @@ fn git_dir_swap_during_commit(
     )
 }
 
+/// `refs/heads` swapped AFTER the reflog append (`ref.logged`, or
+/// `lock.before-rename` inside the ref lock's commit), i.e. past the
+/// pre-append lock re-check. The pre-rename parent check must refuse: the
+/// documented logged-not-published state (exit 128, both reflogs hold
+/// exactly the new line, no rollback), the moved-away original `main` keeps
+/// its OLD bytes, no ref file anywhere holds the new commit, the decoy is
+/// untouched and fsck passes. A writer that renames into the moved-away
+/// directory and only then reports an error fails this case.
+fn refs_heads_swap_after_append(hash: Hash, point: &str) -> Result {
+    let mut fx = Fixture::new(hash)?;
+    fx.s.model.write(0, b"top", b"top v2\n")?;
+    fx.s.add(0, &[b"top"])?;
+    let when = fx.s.model.tick();
+    let (new_oid, _) = fx.s.model.predict_commit(0, &["swap"], when);
+    let old_oid =
+        fx.s.model
+            .head_commit(0)
+            .ok_or("fixture branch is unborn")?;
+    let line = format!(
+        "{old_oid} {new_oid} {} <{}> {when} +0000\tcommit: swap\n",
+        lifecycle_support::proc::NAME,
+        lifecycle_support::proc::EMAIL
+    );
+    let git_dir = fx.git_dir();
+    let main_before = fs::read(git_dir.join("refs/heads/main"))?;
+    let logs = [
+        git_dir.join("logs/HEAD"),
+        git_dir.join("logs/refs/heads/main"),
+    ];
+    let logs_before = logs
+        .iter()
+        .map(fs::read)
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let target = fx.decoy_dir("gitdir")?;
+    fx.decoy("gitdir/main", DECOYS[2])?;
+    let outside = record(&fx.outside)?;
+    let paused = Paused::spawn(
+        &mut fx.s.driver.commit_cmd(&fx.repo(), &["swap"], when, &[]),
+        point,
+    )?;
+    let Some(mut swap) = swap_for_link(&git_dir.join("refs/heads"), &target, "git dir swap")?
+    else {
+        drop(paused);
+        return Ok(());
+    };
+    let output = release(paused)?;
+    let context = format!("commit with refs/heads swapped at {point}");
+    // Judged while the original directory is still moved aside.
+    let moved = fs::read(swap.original.join("main"))?;
+    let mut holders = files_holding(&swap.original, &new_oid)?;
+    holders.extend(files_holding(&target, &new_oid)?);
+    swap.restore()?;
+    assert_untouched(&fx.outside, &outside, &context)?;
+    eprintln!(
+        "OUTCOME: {context}: {}",
+        match output.status.code() {
+            Some(0) => "completed".to_owned(),
+            _ => format!(
+                "refused: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        }
+    );
+    if output.status.code() != Some(128) {
+        return Err(format!("{context}: expected a refusal: {}", describe(&output)).into());
+    }
+    if moved != main_before {
+        return Err(format!(
+            "{context}: the moved-away refs/heads/main was changed to {:?}",
+            String::from_utf8_lossy(&moved)
+        )
+        .into());
+    }
+    holders.extend(files_holding(&git_dir.join("refs"), &new_oid)?);
+    let packed = git_dir.join("packed-refs");
+    if fs::read(&packed).is_ok_and(|bytes| contains(&bytes, new_oid.as_bytes())) {
+        holders.push(packed);
+    }
+    if !holders.is_empty() {
+        return Err(format!("{context}: published {new_oid} into {holders:?}").into());
+    }
+    if observe::resolve(&fx.repo(), "refs/heads/main")?.as_deref() != Some(old_oid.as_str()) {
+        return Err(format!("{context}: the branch moved").into());
+    }
+    for (log, before) in logs.iter().zip(&logs_before) {
+        let mut expected = before.clone();
+        expected.extend_from_slice(line.as_bytes());
+        if fs::read(log)? != expected {
+            return Err(format!(
+                "{context}: {} is not exactly before + the new line",
+                log.display()
+            )
+            .into());
+        }
+    }
+    let orphans = observe::locks(&git_dir)?;
+    if !orphans.is_empty() {
+        if fs_hardening_support::anchored() {
+            return Err(
+                format!("{context}: refused writer orphaned its own locks {orphans:?}").into(),
+            );
+        }
+        eprintln!("NOTE: {context}: orphaned own locks {orphans:?} (backend is not Anchored)");
+        for lock in &orphans {
+            fs::remove_file(lock)?;
+        }
+    }
+    observe::fsck(&fx.repo())?;
+    no_decoy_objects(&fx)
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
@@ -1007,6 +1118,14 @@ fn git_dir_parts(_: Driver) -> Result {
                 Box::new(move || {
                     git_dir_swap_during_commit(hash, "refs/heads", &[("main", DECOYS[2])], true)
                 }),
+            ),
+            (
+                format!("A2 {h} commit / swap refs/heads after append (ref.logged)"),
+                Box::new(move || refs_heads_swap_after_append(hash, "ref.logged")),
+            ),
+            (
+                format!("A2 {h} commit / swap refs/heads after append (lock.before-rename)"),
+                Box::new(move || refs_heads_swap_after_append(hash, "lock.before-rename")),
             ),
             (
                 format!("A2 {h} commit / swap logs/refs/heads"),
