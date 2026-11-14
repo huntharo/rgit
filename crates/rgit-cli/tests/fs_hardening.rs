@@ -332,7 +332,46 @@ fn git_dir_swap_during_commit(
         return Ok(());
     };
     let output = release(paused)?;
+    // A refusal must not have published anywhere: with the original
+    // refs/heads still moved aside, its `main` keeps the OLD bytes and no ref
+    // file (moved original, decoy, packed-refs, restored refs/) holds the new
+    // commit. This catches a writer that renames into the moved-away
+    // directory through a stale parent and only then reports an error.
+    let refused = output.status.code() == Some(128);
+    if refused && rel == "refs/heads" {
+        let key = Path::new(".git/refs/heads/main");
+        let old = match before.get(key) {
+            Some(Snap::File { bytes, .. }) => bytes.clone(),
+            other => return Err(format!("fixture refs/heads/main was {other:?}").into()),
+        };
+        let moved = fs::read(swap.original.join("main"))?;
+        if moved != old {
+            return Err(format!(
+                "refused commit changed the moved-away refs/heads/main: {:?} -> {:?}",
+                String::from_utf8_lossy(&old),
+                String::from_utf8_lossy(&moved)
+            )
+            .into());
+        }
+        let new_oid = expected.head_commit(0).ok_or("model has no new commit")?;
+        let mut holders = files_holding(&swap.original, &new_oid)?;
+        holders.extend(files_holding(&target, &new_oid)?);
+        if !holders.is_empty() {
+            return Err(format!("refused commit published {new_oid} into {holders:?}").into());
+        }
+    }
     swap.restore()?;
+    if refused && rel == "refs/heads" {
+        let new_oid = expected.head_commit(0).ok_or("model has no new commit")?;
+        let mut holders = files_holding(&fx.git_dir().join("refs"), &new_oid)?;
+        let packed = fx.git_dir().join("packed-refs");
+        if fs::read(&packed).is_ok_and(|bytes| contains(&bytes, new_oid.as_bytes())) {
+            holders.push(packed);
+        }
+        if !holders.is_empty() {
+            return Err(format!("refused commit published {new_oid} into {holders:?}").into());
+        }
+    }
     // The writer's own locks must not survive a handled refusal. A
     // path-based unlink goes through the swapped link and orphans them in
     // the ORIGINAL directory (strict variant, gated on anchoring).
@@ -354,6 +393,25 @@ fn git_dir_swap_during_commit(
         &expected,
         &format!("commit with .git/{rel} swapped"),
     )
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// Published ref files beneath `dir` (regular files other than `*.lock`;
+/// symlinks not followed, FIFOs never opened) whose bytes contain `text`. A
+/// lock holding the new value is not a published ref; orphaned locks are
+/// judged separately.
+fn files_holding(dir: &Path, text: &str) -> Result<Vec<PathBuf>> {
+    Ok(snapshot(dir)?
+        .into_iter()
+        .filter(|(rel, _)| rel.extension().is_none_or(|e| e != "lock"))
+        .filter(|(_, snap)| matches!(snap, Snap::File { bytes, .. } if contains(bytes, text.as_bytes())))
+        .map(|(rel, _)| dir.join(rel))
+        .collect())
 }
 
 /// `.git/info` swapped for a decoy whose exclude would ignore the new file.
