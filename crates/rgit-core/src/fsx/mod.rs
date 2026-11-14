@@ -8,14 +8,16 @@
 //! anchor was opened cannot redirect I/O outside its root.
 //!
 //! Ownership (decision 0004):
-//! - this file and `portable.rs`: integration owner (frozen API, baseline);
-//! - `unix.rs`: WP1 (descriptor-relative implementation via rustix);
-//! - `windows.rs`: WP2 (handle-based identity and publication).
+//! - this file and `portable.rs`: integration owner (frozen API, legacy);
+//! - `unix.rs`: WP1 (descriptor-relative implementation via rustix).
 //!
-//! The baseline `portable` backend is path-based and NOT anchored; it exists
-//! so integration can proceed and is replaced per platform. A backend that
-//! cannot provide an operation's guarantee returns
-//! [`Error::UnsupportedCapability`] rather than a weaker fallback.
+//! Backend selection is a compile-time platform choice, never a runtime
+//! fallback: Unix uses the anchored backend ([`Hardening::Anchored`]); every
+//! other platform, including Windows, uses the legacy path-based backend
+//! ([`Hardening::LegacyPath`]), which preserves the pre-hardening behaviour
+//! and makes NO anchoring claim. An anchored operation that fails never retries
+//! through the legacy backend; it returns its error (refusing with
+//! [`Error::UnsupportedCapability`] where a safe primitive is missing).
 
 #![allow(dead_code)] // Removed once call sites adopt the API in this batch.
 
@@ -25,7 +27,23 @@ use std::path::Path;
 use crate::Error;
 
 mod portable;
+// WP1 replaces this line with `#[cfg(unix)] mod unix; #[cfg(unix)] use unix as backend;`
+// plus `#[cfg(not(unix))] use portable as backend;`.
 use portable as backend;
+
+/// Which guarantee the compiled backend provides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Hardening {
+    /// Every component below a root is resolved through held directory
+    /// descriptors without following symlinks (descriptor-root identity).
+    Anchored,
+    /// Legacy path-based I/O, selected deliberately for this platform: no
+    /// protection against concurrent ancestor or leaf swaps.
+    LegacyPath,
+}
+
+/// The guarantee of the compiled backend.
+pub(crate) const HARDENING: Hardening = backend::HARDENING;
 
 /// Which policy root an anchor represents (for diagnostics and policy).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

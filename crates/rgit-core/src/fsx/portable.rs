@@ -1,12 +1,14 @@
-//! Baseline backend: path-based and NOT anchored. It defines the reference
-//! behaviour of each operation for the platform backends that replace it, and
-//! is the documented behaviour on platforms without one.
+//! Legacy backend: path-based and NOT anchored. Selected at compile time on
+//! platforms without an anchored backend (Windows today); it preserves the
+//! pre-hardening behaviour exactly and makes no anchoring claim.
 
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use super::{FileId, Kind, Meta};
 use crate::Error;
+
+pub(crate) const HARDENING: super::Hardening = super::Hardening::LegacyPath;
 
 pub(crate) struct Dir {
     path: PathBuf,

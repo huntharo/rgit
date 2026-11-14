@@ -20,6 +20,19 @@ as C Git does); hostile ownership or permissions; kernel/filesystem bugs;
 power loss; read-only commands. No claim of a general hostile-filesystem
 sandbox is made beyond what the tests below demonstrate.
 
+## Platform selection
+
+Backend selection is a compile-time platform choice, exposed as
+`fsx::HARDENING`. Unix builds use the anchored backend (`Anchored`). Windows
+and any other platform use the legacy path-based backend (`LegacyPath`),
+which keeps the write behaviour shipped before this decision and claims no
+anchoring. There is no runtime fallback: an anchored operation that cannot be
+performed safely returns an error. Windows anchoring needs a safe
+handle-relative rename/link primitive (`SetFileInformationByHandle` /
+`NtSetInformationFile` rename and link classes with a root directory handle),
+which no dependency in the tree provides; a wrapper proposal is tracked
+separately and Windows write support is not withdrawn meanwhile.
+
 ## Policy roots
 
 `crate::fsx::Anchor` holds an open directory handle for one of three roots:
@@ -47,7 +60,7 @@ weaker fallback. Signature changes go through the integration owner.
 | --- | --- |
 | Integration | `fsx/mod.rs`, `fsx/portable.rs` (baseline, path-based, not anchored), `lib.rs`, `write/mod.rs`, Cargo manifests/lockfile, CLI, docs, CI |
 | WP1 Unix anchoring | `fsx/unix.rs` (rustix `openat`/`statat`/`mkdirat`/`renameat_with`/`linkat`/`unlinkat`/`readlinkat`/`Dir`, `O_NOFOLLOW|O_DIRECTORY|O_CLOEXEC|O_NONBLOCK`); call-site adoption in `write/index.rs`, `write/init.rs`, `write/object.rs`, `write/refs.rs`, `write/commit.rs`; `.git/info/{exclude,attributes}` captured through anchored reads into memory-backed Gitoxide sources; tests `crates/rgit-core/tests/fsx_unix*.rs` |
-| WP2 Windows identity | `fsx/windows.rs` (handle-based identity, e.g. `winapi-util::file::information`, already in the dependency tree; publication strategy for the close-before-rename window); `write/lock.rs` (including `acquire_at` and Windows identity/publication); tests `crates/rgit-core/tests/fsx_windows*.rs` |
+| WP2 Windows | `write/lock.rs` (`acquire_at` on Unix through anchored operations); a separately reviewed, behaviour-preserving Windows file-identity change; and a written safe-wrapper proposal for handle-relative rename/link on Windows |
 | WP3 oracle | `crates/rgit-cli/tests/fs_hardening*.rs`, `crates/rgit-cli/tests/fs_hardening_support/**` (tests only) |
 
 New failpoints are proposed by their owner and recorded here by the
