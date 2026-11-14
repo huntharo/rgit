@@ -201,8 +201,11 @@ The guarantee is descriptor-root identity, not a sandbox:
 - Each root path is resolved by name once, following symbolic links, as C Git
   does. Replacing a root before rgit opens it is not detected. Repository
   discovery (Gitoxide) also reads `objects/info/alternates` by path.
-- Pack files, multi-pack indexes and alternates are opened by Gitoxide by path
-  after an anchored kind check; a swap after that check is not covered.
+- Pack files, multi-pack indexes and the `objects/info/alternates` file are
+  opened by Gitoxide by path after an anchored kind check; a swap after that
+  check is not covered. The object directories that `alternates` names are
+  read by Gitoxide by path with no check at all: alternate object stores are
+  outside this guarantee.
 - A lock is checked and then renamed or removed by name. A replacement in the
   instant between the check and the operation is not detected, as in C Git;
   the held descriptor only rules out reuse of the lock's inode.
@@ -219,8 +222,14 @@ The guarantee is descriptor-root identity, not a sandbox:
 Windows uses the legacy path-based backend, selected at compile time
 (`LegacyPath`), and makes no anchoring claim. Its `init`, `add`, `commit` and
 reference updates keep their previous behaviour. File identity there is
-(volume serial number, file index); the index stat `ctime` field holds the
-creation time, which an in-place edit does not change. A held lock cannot be
+(volume serial number, file index), read from a handle opened on the entry
+itself; `add` and the lock checks now compare it, where earlier releases used
+size and modification time (files) or presence (locks). On NTFS this is
+equivalent or stronger. On volumes whose file index is unstable or zero (some
+network or FAT volumes) or wider than 64 bits (ReFS), it can report a file as
+changed while being added, or a lock as not ours, where earlier releases
+proceeded. The index stat `ctime` field holds the creation time, which an
+in-place edit does not change. A held lock cannot be
 deleted while it is open, but it is closed immediately before `MoveFileExW`
 renames it by path; a safe handle-relative rename is proposed separately
 (PWR-197). An object that already exists is not re-synced (it is read-only,
