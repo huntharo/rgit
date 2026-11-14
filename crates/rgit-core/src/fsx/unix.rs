@@ -371,6 +371,12 @@ impl Dir {
     pub(crate) fn sync(&self) -> Result<(), Error> {
         rustix::fs::fsync(&self.fd).map_err(io)
     }
+
+    /// Identity of the directory this descriptor holds, read with `fstat` so
+    /// it does not depend on any path still naming it.
+    pub(crate) fn id(&self) -> Result<FileId, Error> {
+        Ok(meta_of(&rustix::fs::fstat(&self.fd).map_err(io)?).id)
+    }
 }
 
 pub(crate) fn file_id(file: &File) -> Result<FileId, Error> {
@@ -449,6 +455,25 @@ mod tests {
         assert!(std::fs::read_dir(&outside)?.next().is_none());
         std::fs::remove_dir_all(&root)?;
         std::fs::remove_dir_all(&outside)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_held_directory_id_follows_the_descriptor_not_the_name() -> Result<(), Error> {
+        let root = scratch("held-id")?;
+        std::fs::create_dir(root.join("sub"))?;
+        let dir = Dir::open(&root)?;
+        let sub = dir.sub(b"sub")?;
+        let before = sub.id()?;
+        assert_eq!(dir.lstat(b"sub")?.map(|meta| meta.id), Some(before));
+        std::fs::rename(root.join("sub"), root.join("moved"))?;
+        std::fs::create_dir(root.join("sub"))?;
+        assert_eq!(sub.id()?, before);
+        assert_eq!(dir.lstat(b"moved")?.map(|meta| meta.id), Some(before));
+        let replacement = dir.sub(b"sub")?.id()?;
+        assert_ne!(replacement, before);
+        assert_eq!(dir.lstat(b"sub")?.map(|meta| meta.id), Some(replacement));
+        std::fs::remove_dir_all(&root)?;
         Ok(())
     }
 
