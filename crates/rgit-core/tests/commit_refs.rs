@@ -1062,6 +1062,7 @@ fn head_reflog_follows_the_current_head_target() -> Result {
 }
 
 /// Each reflog line's old value equals the previous line's new value.
+#[cfg_attr(not(all(feature = "failpoints", debug_assertions)), allow(dead_code))]
 fn assert_reflog_chain(path: &Path) -> Result {
     let text = String::from_utf8(read(path)?)?;
     let mut previous: Option<String> = None;

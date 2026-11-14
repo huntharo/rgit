@@ -26,12 +26,12 @@ pub fn anchored() -> bool {
 /// THE integration switch for acceptance 6 on Unix. While false, the
 /// selection test prints an explicit SKIP if Unix is not yet Anchored; flip
 /// to true at integration and the test FAILS unless Unix selects Anchored.
-pub const REQUIRE_ANCHORED_ON_UNIX: bool = false;
+pub const REQUIRE_ANCHORED_ON_UNIX: bool = true;
 
 /// THE failpoint switch for pause points WP1 may add (`add.before-descend`,
 /// `object.before-fanout`, `refs.before-dir`). While false, those cases print
 /// an explicit SKIP; flip to true once the names exist in the binary.
-pub const WP1_FS_FAILPOINTS: bool = false;
+pub const WP1_FS_FAILPOINTS: bool = true;
 
 /// What a case may currently be held to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

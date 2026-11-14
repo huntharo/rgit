@@ -19,8 +19,6 @@
 //! through the legacy backend; it returns its error (refusing with
 //! [`Error::UnsupportedCapability`] where a safe primitive is missing).
 
-#![allow(dead_code)] // Removed once call sites adopt the API in this batch.
-
 use std::fs::File;
 use std::path::Path;
 
@@ -111,6 +109,7 @@ impl Anchor {
         })
     }
 
+    #[allow(dead_code)] // Frozen API (decision 0004); no caller needs the policy root yet.
     pub(crate) fn root(&self) -> Root {
         self.root
     }
@@ -210,6 +209,7 @@ impl Anchor {
     /// reads it from the held descriptor (`fstat`), so it names the opened
     /// directory even if a path to it has since been replaced. The legacy
     /// backend reads it by path.
+    #[cfg_attr(not(unix), allow(dead_code))] // Used by the anchored lock (Unix).
     pub(crate) fn id(&self) -> Result<FileId, Error> {
         self.inner.id()
     }

@@ -180,21 +180,53 @@ directory are published by `hard_link` or an atomic no-replace rename
 (`renameat` with `RENAME_EXCL`/`RENAME_NOREPLACE` on macOS and Linux). Where
 neither is available the operation is refused or, for `init` on Windows, uses
 exclusive directory creation; there is no check-then-rename fallback.
-Worktree files are opened without following a final symlink and without
-blocking on a FIFO (`O_NOFOLLOW|O_NONBLOCK`), and the opened descriptor is
-validated before its bytes are used. `.gitignore` and `.gitattributes` files
-in the worktree are pre-read the same way and handed to Gitoxide from memory;
-`.git/info/exclude` and `.git/info/attributes` are still opened by Gitoxide
-after an `lstat` check. An already-present loose object is accepted only after
-its content is inflated and its hash verified. Parent directories are still
-resolved by path: an ancestor directory swapped for a symlink concurrently is
-not detected. On Windows an object that already exists is not re-synced by this
-implementation (it is read-only, and syncing would need a writable handle), so
-its durability there relies on whoever wrote it; the leaf
-fingerprint is size and modification time
-only, and the exclusive-creation fallback for `init` is used because no
-atomic no-replace rename is available. Preflight is therefore not a filesystem sandbox against an actively
-hostile concurrent writer.
+Filesystem access for these writes follows decision 0004. On Unix (the
+anchored backend, reported by `rgit_core::write::filesystem_hardening()`), the
+worktree, the per-worktree Git directory and the common Git directory are each
+opened once as a directory descriptor. Every path below them is resolved one
+component at a time without following symbolic links, and each operation
+(`open`, `lstat`, create, rename, link, unlink, `mkdir`) is performed relative
+to the descriptor of its parent directory. Files are opened without following
+a final symlink and without blocking on a FIFO, and the opened descriptor is
+validated before its bytes are used. Locks hold their parent directory's
+descriptor from creation to rename or removal. A lock is published or removed
+only while the entry at its name is still the file this process created, and
+the published name must still be reachable from the repository root.
+`.gitignore`, `.gitattributes`, `info/exclude` and `info/attributes` (from the
+common directory only), the index, and loose objects are read through these
+descriptors into memory before Gitoxide uses them.
+
+The guarantee is descriptor-root identity, not a sandbox:
+
+- Each root path is resolved by name once, following symbolic links, as C Git
+  does. Replacing a root before rgit opens it is not detected. Repository
+  discovery (Gitoxide) also reads `objects/info/alternates` by path.
+- Pack files, multi-pack indexes and alternates are opened by Gitoxide by path
+  after an anchored kind check; a swap after that check is not covered.
+- A lock is checked and then renamed or removed by name. A replacement in the
+  instant between the check and the operation is not detected, as in C Git;
+  the held descriptor only rules out reuse of the lock's inode.
+- A directory moved elsewhere while rgit holds its descriptor is still that
+  directory: operations stay inside the opened root's identity. Where a
+  published name is no longer reachable from the root, the error reports
+  publication as uncertain; it is never reported as "unchanged".
+- Concurrent swaps are tested at deterministic pause points derived from the
+  source. Those tests show behaviour at those points; they do not prove that
+  no other interleaving between system calls exists.
+- Read-only commands (`status`, `diff`, inspection) keep their preflight model
+  (PWR-196).
+
+Windows uses the legacy path-based backend, selected at compile time
+(`LegacyPath`), and makes no anchoring claim. Its `init`, `add`, `commit` and
+reference updates keep their previous behaviour. File identity there is
+(volume serial number, file index); the index stat `ctime` field holds the
+creation time, which an in-place edit does not change. A held lock cannot be
+deleted while it is open, but it is closed immediately before `MoveFileExW`
+renames it by path; a safe handle-relative rename is proposed separately
+(PWR-197). An object that already exists is not re-synced (it is read-only,
+and syncing would need a writable handle), so its durability relies on its
+writer. `init` uses exclusive directory creation because no atomic no-replace
+rename is available.
 
 Recovery after interruption: a fresh process sees each of the index, `HEAD`
 and the branch ref either completely old or completely new. Abrupt termination
@@ -214,7 +246,12 @@ deletes a lock or temporary directory it did not create in the same process:
 remove one manually only after confirming that no rgit or Git process is still
 running against the repository. Errors handled without a crash clean up their
 own locks and temporary directories. A write error is not proof that nothing
-changed: errors after a rename mean the new value is already visible.
+changed: errors after a rename mean the new value is already visible. On
+Unix such errors are typed: `RefPublishedUnsyncedError` and
+`LockPublishedUnsyncedError` (published, durability unknown) and
+`RefPublishedUnreachableError` and `LockPublishedUnreachableError` (renamed
+inside the original directory, which its name no longer reaches; the state is
+uncertain). None of them reports the update as not made.
 
 Native macOS APFS tests extend the live and final-unmap shared-mapping gates to
 the write path: bytes written through a closed-descriptor `MAP_SHARED` mapping,

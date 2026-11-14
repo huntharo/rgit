@@ -1,8 +1,10 @@
 # 0004: Anchored filesystem access for write operations (PWR-194 contract)
 
-Status: proposed for the PWR-194 hardening batch. Applies to the experimental
-write slice (`init`, `add`, `commit`, reference publication) only; read-only
-status/diff/inspection keep their documented preflight model.
+Status: accepted for the PWR-194 hardening batch. Unix builds use the anchored
+backend; Windows uses the legacy path backend (see Platform selection).
+Applies to the experimental write slice (`init`, `add`, `commit`, reference
+publication) only; read-only status/diff/inspection keep their documented
+preflight model (PWR-196).
 
 ## Threat model
 
@@ -55,10 +57,11 @@ refused; every component is resolved without following symlinks.
 
 `Anchor::{open, sub, lstat, open_read, read_link, read_dir, create_new, mkdir,
 rename_noreplace, rename_replace, hard_link, unlink, open_append, rmdir,
-symlink, sync, display_path}`,
+symlink, sync, id, display_path}`,
 `fsx::file_id(&File) -> FileId`, types `Root`, `Kind`, `Meta`, `FileId`
 (`(dev, ino)` on Unix, `(volume serial, file index)` on Windows; never size or
-timestamps), and `LockFile::acquire_at(&Anchor, rel)`. A backend that cannot
+timestamps), `LockFile::acquire_at(&Anchor, rel)`, `LockFile::held_id()` and
+`write::filesystem_hardening()`. A backend that cannot
 provide an operation's guarantee returns `UnsupportedCapability`; there is no
 weaker fallback. Signature changes go through the integration owner.
 

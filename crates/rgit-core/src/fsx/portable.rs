@@ -316,6 +316,7 @@ impl Dir {
     }
 
     /// Legacy backend: identity of whatever the path names now.
+    #[cfg_attr(not(unix), allow(dead_code))] // Used by the anchored lock (Unix).
     pub(crate) fn id(&self) -> Result<FileId, Error> {
         Ok(lstat_path(&self.path)?.id)
     }
