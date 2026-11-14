@@ -83,6 +83,7 @@ integration owner:
 | `object.before-fanout` | before `objects/xx` is opened or created |
 | `refs.before-dir` | before a ref or reflog parent directory is opened or created |
 | `object.before-read` | a loose object was `lstat`ed through the anchor as a regular file, not yet opened |
+| `lock.renamed-unverified` | Windows legacy path lock only: `MoveFileExW` returned success, the target's identity not yet observed |
 
 `display_path()` is for diagnostics only; hardened call sites never join it
 back into a path for I/O. `.git/info/{exclude,attributes}` are read from the

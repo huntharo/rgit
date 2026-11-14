@@ -272,9 +272,16 @@ impl<'a> LockFile<'a> {
                 std::fs::rename(lock_path, target)?;
                 self.released = true;
                 drop(self.file.take());
-                // The path form keeps its pre-hardening error behaviour (the
-                // legacy Windows implementation); only the anchored form
-                // types its post-rename errors.
+                // The path form keeps its pre-hardening errors except for
+                // this Windows check: the handle was closed before the
+                // rename, so check what the rename published (detects some
+                // replacement outcomes only; see
+                // `RenameOutcomeUncertainError`).
+                #[cfg(windows)]
+                {
+                    super::failpoint("lock.renamed-unverified")?;
+                    observe_after_rename(target, self.identity)?;
+                }
                 super::failpoint("lock.after-rename")?;
                 sync_parent(target)
             }
@@ -356,7 +363,8 @@ fn unsynced(target: PathBuf, source: Error) -> Error {
 pub(crate) fn after_publication(error: &Error) -> bool {
     matches!(error, Error::Other(error)
         if error.is::<LockPublishedUnsyncedError>()
-            || error.is::<LockPublishedUnreachableError>())
+            || error.is::<LockPublishedUnreachableError>()
+            || error.is::<RenameOutcomeUncertainError>())
 }
 
 /// The lock was renamed over its target, but a later step failed (the
@@ -440,13 +448,16 @@ fn display(anchor: &Anchor, rel: &[u8]) -> PathBuf {
         .join(String::from_utf8_lossy(rel).as_ref())
 }
 
-/// File identity used to confirm the lock path still names our lock.
+/// File identity used to confirm the lock path still names our lock: never
+/// size or timestamps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Identity {
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(not(unix))]
+    id: crate::fsx::FileId,
 }
 
 impl Identity {
@@ -479,31 +490,158 @@ impl Identity {
         })
     }
 
-    // Windows: `acquire` opens the lock without FILE_SHARE_DELETE, so no other
-    // process can delete or replace it while the handle is open; std exposes
-    // no stable file index, so presence of a regular file is the check. The
-    // handle is closed immediately before the rename (Windows requires it),
-    // leaving a short window that this check cannot cover.
+    #[cfg(unix)]
+    fn parts(self) -> (u64, u128) {
+        (self.device, u128::from(self.inode))
+    }
+
+    // Windows (legacy path backend): `(volume serial, file index)` of the
+    // handle, through `fsx::file_id`. `acquire` opens the lock without
+    // FILE_SHARE_DELETE, so no other process can delete or rename it while
+    // our handle is open, and the pre-rename check compares real identities.
+    // The handle must be closed before `MoveFileExW` (it needs DELETE access
+    // to the source), so a replacement in that window is NOT prevented; the
+    // post-rename observation only detects some of its outcomes.
     #[cfg(not(unix))]
-    fn of_file(_file: &File) -> Result<Self, Error> {
-        Ok(Self {})
+    fn of_file(file: &File) -> Result<Self, Error> {
+        Ok(Self {
+            id: crate::fsx::file_id(file)?,
+        })
     }
 
     #[cfg(not(unix))]
-    fn of_id(_id: crate::fsx::FileId) -> Option<Self> {
-        None
+    fn of_id(id: crate::fsx::FileId) -> Option<Self> {
+        Some(Self { id })
     }
 
+    /// Identity of the entry at `path` itself: opened with no data access
+    /// (exempt from share-mode conflicts, so it coexists with our deny-delete
+    /// lock handle), without following a reparse point.
     #[cfg(not(unix))]
     fn of_path(path: &Path) -> std::io::Result<Self> {
-        let metadata = std::fs::symlink_metadata(path)?;
-        if metadata.is_file() {
-            Ok(Self {})
-        } else {
-            Err(std::io::ErrorKind::NotFound.into())
+        let mut options = OpenOptions::new();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            options
+                .access_mode(0)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
+        }
+        let probe = options.open(path)?;
+        Ok(Self {
+            id: crate::fsx::file_id(&probe).map_err(std::io::Error::other)?,
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn parts(self) -> (u64, u128) {
+        (self.id.volume, self.id.index)
+    }
+}
+
+/// Upper bound on the target bytes captured for a report.
+const OBSERVED_CONTENT_LIMIT: u64 = 64 * 1024;
+
+/// After a path rename that returned success, check that `target` is the file
+/// we created. A mismatch is reported as [`RenameOutcomeUncertainError`] with
+/// the independently observed target state; the target is never rolled back
+/// or rewritten.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn observe_after_rename(target: &Path, ours: Identity) -> Result<(), Error> {
+    let observed = Identity::of_path(target).ok();
+    if observed == Some(ours) {
+        return Ok(());
+    }
+    let content = (|| -> std::io::Result<Option<(Vec<u8>, u64)>> {
+        use std::io::Read;
+        let file = super::open_leaf_nofollow(target)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Ok(None);
+        }
+        let mut bytes = Vec::new();
+        file.take(OBSERVED_CONTENT_LIMIT).read_to_end(&mut bytes)?;
+        Ok(Some((bytes, metadata.len())))
+    })()
+    .ok()
+    .flatten();
+    Err(Error::Other(Box::new(RenameOutcomeUncertainError {
+        target: target.to_owned(),
+        ours: ours.parts(),
+        observed: observed.map(Identity::parts),
+        content,
+    })))
+}
+
+/// A path-form lock rename returned success, but the target no longer has the
+/// identity of the lock file this writer created. The outcome is UNCERTAIN:
+/// the value may have been published by us and then replaced by another
+/// (possibly legitimate) writer, or the rename may have published a file
+/// that replaced our lock in the close-before-rename window. It does not mean
+/// "unchanged" and does not prove foreign publication. The observed target
+/// state is reported; nothing is rolled back. This detects some replacement
+/// outcomes only; it does not close the window (see the Windows handle-rename
+/// proposal, PWR-197). Returned inside [`Error::Other`].
+#[derive(Debug)]
+pub struct RenameOutcomeUncertainError {
+    target: PathBuf,
+    /// `(volume, index)` of the lock file we created.
+    ours: (u64, u128),
+    /// `(volume, index)` of the target when observed, if it could be opened.
+    observed: Option<(u64, u128)>,
+    /// Up to 64 KiB of the observed target and its full length, if it was a
+    /// regular file.
+    content: Option<(Vec<u8>, u64)>,
+}
+
+impl RenameOutcomeUncertainError {
+    pub fn target(&self) -> &Path {
+        &self.target
+    }
+
+    /// Identity `(volume, index)` of the lock file this writer created.
+    pub fn ours(&self) -> (u64, u128) {
+        self.ours
+    }
+
+    /// Identity of the target as observed after the rename, if any.
+    pub fn observed(&self) -> Option<(u64, u128)> {
+        self.observed
+    }
+
+    /// Up to 64 KiB of the observed target content, if it was a regular file.
+    pub fn observed_content(&self) -> Option<&[u8]> {
+        self.content.as_ref().map(|(bytes, _)| bytes.as_slice())
+    }
+
+    /// Full length of the observed target, if it was a regular file.
+    pub fn observed_len(&self) -> Option<u64> {
+        self.content.as_ref().map(|(_, len)| *len)
+    }
+}
+
+impl std::fmt::Display for RenameOutcomeUncertainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "rename to {} returned success, but the target no longer has our identity; \
+             it may have been published by us and then replaced, or the rename published \
+             another file (observed: ",
+            self.target.display()
+        )?;
+        match (&self.observed, &self.content) {
+            (None, _) => write!(f, "no entry)"),
+            (Some((volume, index)), Some((_, len))) => {
+                write!(f, "file {volume:x}:{index:x}, {len} bytes)")
+            }
+            (Some((volume, index)), None) => write!(f, "{volume:x}:{index:x}, not a regular file)"),
         }
     }
 }
+
+impl std::error::Error for RenameOutcomeUncertainError {}
 
 /// Make a completed rename durable (Unix). Windows has no directory handle
 /// sync through std; renames there are visibility-only until the OS flushes.
@@ -637,6 +775,105 @@ mod tests {
             LockFile::acquire_at(&anchor, b""),
             Err(Error::InvalidPath(_))
         ));
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// Pre-rename mismatch: if the lock path does not name the file we hold,
+    /// commit refuses with Locked and publishes nothing (on Windows the
+    /// deny-delete handle prevents setting this up by replacement, so the
+    /// held identity is substituted instead).
+    #[test]
+    fn mismatched_identity_refuses_before_rename() -> Result<(), Error> {
+        let dir = scratch("lock-mismatch")?;
+        let target = dir.join("HEAD");
+        std::fs::write(&target, b"old")?;
+        let mut lock = LockFile::acquire(&target)?;
+        lock.write_all(b"new")?;
+        lock.identity = Identity::of_path(&target)?;
+        assert!(matches!(lock.commit(), Err(Error::Locked(_))));
+        assert_eq!(std::fs::read(&target)?, b"old");
+        assert_eq!(std::fs::read(dir.join("HEAD.lock"))?, b"new");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// Post-rename observation: our file is accepted; any other outcome is
+    /// reported as uncertain with the observed state, and never rolled back.
+    #[test]
+    fn post_rename_observation_reports_uncertain_outcomes() -> Result<(), Error> {
+        let dir = scratch("lock-observe")?;
+        let ours_path = dir.join("ours");
+        std::fs::write(&ours_path, b"ours")?;
+        let ours = Identity::of_path(&ours_path)?;
+        let target = dir.join("HEAD");
+
+        std::fs::copy(&ours_path, dir.join("copy"))?;
+        std::fs::rename(&ours_path, &target)?;
+        observe_after_rename(&target, ours)?;
+
+        // Replaced after publication (or published in place of ours).
+        std::fs::remove_file(&target)?;
+        std::fs::write(&target, b"someone else")?;
+        let replaced = Identity::of_path(&target)?;
+        match observe_after_rename(&target, ours) {
+            Err(Error::Other(error)) => {
+                let typed = error
+                    .downcast_ref::<RenameOutcomeUncertainError>()
+                    .ok_or(Error::Injected("type"))?;
+                assert_eq!(typed.ours(), ours.parts());
+                assert_eq!(typed.observed(), Some(replaced.parts()));
+                assert_eq!(typed.observed_content(), Some(&b"someone else"[..]));
+                assert_eq!(typed.observed_len(), Some(12));
+                assert!(error.to_string().contains("no longer has our identity"));
+            }
+            other => panic!("expected an uncertain outcome, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&target)?,
+            b"someone else",
+            "never rolled back"
+        );
+
+        // Nothing at the target.
+        std::fs::remove_file(&target)?;
+        match observe_after_rename(&target, ours) {
+            Err(Error::Other(error)) => {
+                let typed = error
+                    .downcast_ref::<RenameOutcomeUncertainError>()
+                    .ok_or(Error::Injected("type"))?;
+                assert_eq!(typed.observed(), None);
+                assert_eq!(typed.observed_content(), None);
+            }
+            other => panic!("expected an uncertain outcome, got {other:?}"),
+        }
+        assert!(!target.exists());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// Windows legacy lock: while held, no process (including us) can delete
+    /// or rename it; its identity is the real (volume serial, file index);
+    /// publication observes our file at the target.
+    #[cfg(windows)]
+    #[test]
+    fn windows_held_lock_cannot_be_deleted_or_renamed() -> Result<(), Error> {
+        let dir = scratch("lock-windows")?;
+        let target = dir.join("HEAD");
+        std::fs::write(&target, b"old")?;
+        let lock_path = dir.join("HEAD.lock");
+        let mut lock = LockFile::acquire(&target)?;
+        assert!(std::fs::remove_file(&lock_path).is_err());
+        assert!(std::fs::rename(&lock_path, dir.join("moved")).is_err());
+        assert!(lock_path.exists());
+        let held = lock.identity;
+        assert_eq!(Identity::of_path(&lock_path)?, held);
+        assert_ne!(Identity::of_path(&target)?, held);
+        lock.write_all(b"new")?;
+        lock.commit()?;
+        assert_eq!(std::fs::read(&target)?, b"new");
+        assert_eq!(Identity::of_path(&target)?, held);
+        assert!(!lock_path.exists());
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
