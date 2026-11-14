@@ -193,6 +193,15 @@ impl<'a> LockFile<'a> {
         }
     }
 
+    /// Identity of the lock file this writer created, read (`fstat`) from its
+    /// held descriptor. Used to re-validate a guard lock that is never renamed
+    /// (`HEAD.lock` while a branch is updated) against an anchored `lstat`.
+    // Used by the anchored reference writer (PWR-194).
+    #[allow(dead_code)]
+    pub(crate) fn held_id(&self) -> Result<crate::fsx::FileId, Error> {
+        crate::fsx::file_id(self.file.as_ref().ok_or(Error::Injected("lock reused"))?)
+    }
+
     fn still_ours(&self) -> bool {
         match &self.location {
             Location::Anchored { anchor, lock, .. } => anchor.lstat(lock).is_ok_and(|meta| {
