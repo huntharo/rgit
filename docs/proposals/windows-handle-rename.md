@@ -9,7 +9,14 @@ Neither own-crate `unsafe` nor a new package published by this project is
 approved. The lack of an existing wrapper is a blocker, not evidence that one
 cannot be built.
 
-Primary sources are cited inline as [n]; the list is at the end.
+Primary sources are cited inline as [n]; the list is at the end. Every
+Microsoft Learn citation was read by the author from learn.microsoft.com on
+2026-11-13; statements the pages do not make (notably specific NTSTATUS
+codes) are marked "confirm in CI" rather than asserted.
+
+This proposal names candidates only. It does not select a dependency, and it
+does not approve upstream pull requests or contact with other projects,
+separately published packages, or own-crate `unsafe` exceptions.
 
 ## What is needed and why
 
@@ -175,7 +182,7 @@ CI tests below must pin them before the mapping is frozen.
 
 | Candidate | License, MSRV | What it offers | Gap |
 | --- | --- | --- | --- |
-| `fs_at` 0.2.1 (rbtcollins) | Apache-2.0, 1.71 | Safe `open_at`, `open_dir_at`, `mkdir_at`, `unlink_at`, `rmdir_at`, `symlink_at`, `read_dir`: `NtCreateFile` with `RootDirectory`, `FILE_OPEN_REPARSE_POINT`, delete by handle | No rename and no link. The closest fit: an upstream contribution of `rename_at`/`link_at` (and handle rename) would cover everything |
+| `fs_at` 0.2.1 (rbtcollins) | Apache-2.0, 1.71 | Safe `open_at`, `open_dir_at`, `mkdir_at`, `unlink_at`, `rmdir_at`, `symlink_at`, `read_dir`: `NtCreateFile` with `RootDirectory`, `FILE_OPEN_REPARSE_POINT`, delete by handle | No rename and no link. Its existing `NtCreateFile` and alignment code is the closest match to the surface below |
 | `cap-primitives` / `cap-std` 4.0.3 (Bytecode Alliance) | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT; no declared MSRV | Handle-relative open and stat (`CreateFileAtW` → `NtCreateFile`) | `rename`, `hard_link`, `create_dir` and `remove_*` resolve the directory handle back to a path (`GetFinalPathNameByHandleW`) and call std path functions; no no-replace rename; about 10 extra crates |
 | `winx` 0.36.4 | Apache-2.0 WITH LLVM-exception, 1.63 | Handle path, access and mode queries, reopen | No rename or link |
 | `winapi-util` 0.1.11 | Unlicense OR MIT | Safe `GetFileInformationByHandle` (in use) | Identity only |
@@ -203,10 +210,10 @@ fn open_relative(dir: &File, leaf: &OsStr, options: &RelativeOpen) -> io::Result
 The wrapper must validate `leaf` (non-empty, no `\` or `/`, not `.` or `..`).
 It must build the variable-length structure with correct size and 4-byte
 alignment [6], and map NTSTATUS through `RtlNtStatusToDosError` into
-`io::Error`. `fs_at` already has the `NtCreateFile` and alignment machinery,
-so an upstream PR there is the smallest path. Its acceptance would be an
-integration-owner dependency decision (license Apache-2.0, MSRV 1.71, adds
-`aligned`, `cvt` and `windows-sys` 0.52 on Windows).
+`io::Error`. Which audited dependency, if any, provides this surface is an
+integration-owner decision outside this proposal; for reference, `fs_at`
+0.2.1 (Apache-2.0, MSRV 1.71) would add `aligned`, `cvt` and `windows-sys`
+0.52 on Windows.
 
 ## Native Windows CI tests and mutation checks
 
@@ -225,27 +232,56 @@ where the runner allows, to pin the refusal paths.
    - the lock path is gone.
    Mutation: close the handle and rename by path; a concurrent replacement
    test (step 3) must then catch the published foreign file.
-3. Replacement window (5): a second process loops trying to delete and
-   recreate the lock path while the first commits. With handle rename, the
-   target is always our file (FileId) and the second process's file is never
-   published. Mutation: path rename; the loop must eventually publish a
-   foreign file within a bounded number of iterations, so the test is
-   meaningful.
-4. Anchored parents: after the anchor is opened, replace an intermediate
-   directory with a junction to an outside directory. Rename, link, create
-   and delete must operate on the original directory (by handle) or refuse;
-   nothing outside changes. Mutation: path-based fallback; the outside
-   directory gains an entry.
+3. Replacement window (5), deterministic: the writer pauses at a test-only
+   failpoint immediately before publication, as the existing failpoints do.
+   During the pause the test tries to delete the lock and create a foreign
+   file at the lock path, then releases the writer.
+   - With handle rename the delete fails (deny-delete handle), the target is
+     our file (FileId) and the foreign file is never published.
+   - Mutation: the path form (close the handle, then rename by path) with
+     the pause placed between the close and the rename. The replacement then
+     succeeds and the foreign file is published every time, so the test
+     fails on every run, not "eventually".
+4. Anchored parents: no behaviour is claimed here until the measurements in
+   "To be measured in CI" below exist. Once they do: an intermediate
+   directory replaced (if Windows permits it at all) by another directory or
+   a junction to an outside directory, after the anchor is opened. Rename,
+   link, create and delete operate on the original directory (by handle) or
+   refuse, and nothing outside changes. Mutation: path-based resolution; the
+   outside directory gains an entry.
 5. Hard link (4): no-replace refusal; the link's FileId equals the source's;
    FAT refusal surfaces as `UnsupportedCapability` before any temporary file
    is created.
-6. Delete by handle (6): replace the abandoned lock path with another file
-   after our handle is open but before abandon. Our file is deleted and the
-   other file survives.
+6. Delete by handle (6). While we hold the deny-delete handle, nobody can
+   replace the lock path, so a replacement cannot be set up directly.
+   Instead:
+   - assert that the replacement attempt itself fails (`DeleteFileW` and
+     `MoveFileExW` of the held lock are refused) and the lock is unchanged;
+   - assert that abandoning by handle removes exactly our file: its FileId is
+     gone, and a different file at another name in the same directory is
+     untouched.
+   - Separately, for the current path form (close, then `DeleteFileW` by
+     path), show that the window exists: pause between the close and the
+     delete, replace the lock path with a foreign file, release; the path
+     form deletes the foreign file. This mutation demonstrates what handle
+     deletion removes.
 7. Error mapping: each row of the table above is asserted with the observed
    NTSTATUS/Win32 code, recorded in the decision before the mapping is frozen.
 8. Existing Windows write suites (`init_add*`, `commit_refs*`, `lifecycle*`)
    pass unchanged with `fsx::HARDENING == Anchored` on Windows.
+
+## To be measured in CI (no claim made)
+
+- Whether a directory that contains a file with an open handle (with and
+  without `FILE_SHARE_DELETE`) can be renamed, deleted, or replaced by a
+  junction while the handle is open, on NTFS and on ReFS.
+- How a held `RootDirectory` handle behaves after its directory has been
+  renamed or replaced: whether a rename or link relative to it still lands in
+  the original directory, and which status is returned if it cannot.
+- The NTSTATUS and Win32 codes for each row of the error-mapping table.
+
+The design above must not rely on any of these until they are measured and
+recorded.
 
 ## Sources
 
