@@ -30,8 +30,16 @@ anchoring. There is no runtime fallback: an anchored operation that cannot be
 performed safely returns an error. Windows anchoring needs a safe
 handle-relative rename/link primitive (`SetFileInformationByHandle` /
 `NtSetInformationFile` rename and link classes with a root directory handle),
-which no dependency in the tree provides; a wrapper proposal is tracked
-separately and Windows write support is not withdrawn meanwhile.
+which no dependency in the tree provides. Two separate decisions follow:
+
+1. Scope (this ADR, PWR-194): Unix hardening proceeds; shipped Windows
+   `init`/`add`/`commit`/reference updates keep their pre-hardening
+   behaviour through the deliberately selected legacy backend. Windows
+   support is not withdrawn.
+2. Windows anchoring (PWR-197): a safe handle-relative rename/link wrapper is
+   proposed and reviewed on its own; until then Windows claims no anchored
+   guarantee. A missing wrapper in today's dependency tree is a blocker, not
+   evidence that one cannot be built.
 
 ## Policy roots
 
