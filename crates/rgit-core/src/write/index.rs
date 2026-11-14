@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 
 use gix::index::entry::{Flags, Mode, Stat};
 
+use crate::fsx::{Anchor, Kind, Meta};
 use crate::{BStr, Error, ObjectId, ObjectKind, Repository};
 
 /// Paths are worktree-relative native bytes, sorted in index order.
@@ -183,12 +184,18 @@ impl Repository {
     /// an untracked ignored path is refused. Tracked paths missing from the
     /// worktree are removed from the index. Unsupported capabilities are
     /// refused before any object or index write.
+    ///
+    /// An error after `index.lock` was renamed into place is returned as
+    /// [`LockPublishedUnsyncedError`](super::LockPublishedUnsyncedError) (the
+    /// new index was written; its durability is unknown) or
+    /// [`LockPublishedUnreachableError`](super::LockPublishedUnreachableError)
+    /// (the new index was written inside the original `.git` directory, which
+    /// may no longer be reachable at that name). Neither means "unchanged",
+    /// and neither is retried.
     pub fn add(&self, paths: &[&BStr]) -> Result<AddOutcome, Error> {
-        let root = self
-            .inner
-            .workdir()
-            .ok_or(Error::UnsupportedCapability("add in a bare repository"))?
-            .to_owned();
+        if self.inner.workdir().is_none() {
+            return Err(Error::UnsupportedCapability("add in a bare repository"));
+        }
         let config = self.add_preflight_config()?;
         let mut pathspecs = Vec::with_capacity(paths.len());
         for path in paths {
@@ -197,8 +204,32 @@ impl Repository {
         if pathspecs.is_empty() {
             return Ok(AddOutcome::default());
         }
+        // Every root is opened before the first mutation; all worktree, Git
+        // directory and object access below is relative to these handles.
+        let anchors = AddAnchors {
+            worktree: self.worktree_anchor()?,
+            git: self.git_dir_anchor()?,
+            common: self.common_anchor()?,
+        };
+        super::object::check_object_store(&anchors.common)?;
+        // The in-progress markers Gitoxide's `Repository::state` looks for,
+        // checked through the Git directory anchor (no path lookups).
+        for marker in [
+            &b"rebase-apply"[..],
+            b"rebase-merge",
+            b"CHERRY_PICK_HEAD",
+            b"MERGE_HEAD",
+            b"BISECT_LOG",
+            b"REVERT_HEAD",
+        ] {
+            if anchors.git.lstat(marker)?.is_some() {
+                return Err(Error::UnsupportedCapability(
+                    "add during an in-progress merge, rebase, cherry-pick or similar operation",
+                ));
+            }
+        }
         for _ in 0..2 {
-            if let Some(outcome) = self.add_attempt(&root, &pathspecs, config)? {
+            if let Some(outcome) = self.add_attempt(&anchors, &pathspecs, config)? {
                 return Ok(outcome);
             }
         }
@@ -207,11 +238,6 @@ impl Repository {
 
     fn add_preflight_config(&self) -> Result<AddConfig, Error> {
         self.inspection_execution_policy()?;
-        if self.inner.state().is_some() {
-            return Err(Error::UnsupportedCapability(
-                "add during an in-progress merge, rebase, cherry-pick or similar operation",
-            ));
-        }
         let snapshot = self.inner.config_snapshot();
         let config = snapshot.plumbing();
         let flag = |key: &str, default: bool| -> Result<bool, Error> {
@@ -258,27 +284,27 @@ impl Repository {
     /// preflight snapshot and taking the lock.
     fn add_attempt(
         &self,
-        root: &Path,
+        anchors: &AddAnchors,
         pathspecs: &[Vec<u8>],
         config: AddConfig,
     ) -> Result<Option<AddOutcome>, Error> {
         let index_path = self.inner.index_path();
-        let Some(prepared) = self.prepare_add(root, &index_path, pathspecs, config)? else {
+        let Some(prepared) = self.prepare_add(anchors, pathspecs, config)? else {
             return Ok(None);
         };
         for (path, id, symlink) in &prepared.blobs {
-            if self.object_is_durable(id)? {
+            if self.object_is_durable(&anchors.common, id)? {
                 continue;
             }
-            let (data, _) = read_worktree(root, path, *symlink)?;
-            let written = self.write_loose_object(ObjectKind::Blob, &data)?;
+            let (data, _, _) = read_worktree(&anchors.worktree, path, *symlink)?;
+            let written = self.write_loose_object_at(&anchors.common, ObjectKind::Blob, &data)?;
             if written != *id {
                 return Err(refuse(AddRefusal::ChangedWhileReading(path.clone())));
             }
         }
         super::failpoint("add.objects-written")?;
-        let mut lock = super::LockFile::acquire(&index_path)?;
-        if read_index_bytes(&index_path)? != prepared.snapshot {
+        let mut lock = super::LockFile::acquire_at(&anchors.git, b"index")?;
+        if read_index_bytes(&anchors.git)?.map(|(bytes, _)| bytes) != prepared.snapshot {
             return Ok(None);
         }
         if !prepared.changed {
@@ -298,34 +324,46 @@ impl Repository {
         )?;
         lock.write_all(&bytes)?;
         super::failpoint("add.index-locked")?;
+        // Post-publication errors (`lock::after_publication`) pass through
+        // unchanged: their text says the index was written, and `?` ends the
+        // operation instead of retrying. Any other error is pre-rename.
         lock.commit()?;
         Ok(Some(prepared.outcome))
     }
 
     fn prepare_add(
         &self,
-        root: &Path,
-        index_path: &Path,
+        anchors: &AddAnchors,
         pathspecs: &[Vec<u8>],
         config: AddConfig,
     ) -> Result<Option<Prepared>, Error> {
-        let snapshot = read_index_bytes(index_path)?;
-        let file = self.read_index()?;
-        if read_index_bytes(index_path)? != snapshot {
-            return Ok(None);
-        }
+        let wt = &anchors.worktree;
+        // Decode exactly the bytes read through the Git directory anchor;
+        // the index is never opened by path (a FIFO swapped in cannot block).
+        let read = read_index_bytes(&anchors.git)?;
+        let file = self.decode_read_index(read.as_ref())?;
+        let snapshot = read.map(|(bytes, _)| bytes);
         if file.version() == gix::index::Version::V4 {
             return Err(Error::UnsupportedCapability(
                 "writing a version 4 (path-compressed) index",
             ));
         }
         let mut state: gix::index::State = file.into();
-        check_metadata_files(&[
-            self.git_dir().join("info/exclude"),
-            self.git_dir().join("info/attributes"),
-            self.inner.common_dir().join("info/exclude"),
-            self.inner.common_dir().join("info/attributes"),
-        ])?;
+        // Like C Git, info/ is read from the common directory only. A
+        // symlinked or special info/ is refused rather than read through
+        // (or silently treated as absent).
+        let (info_exclude, info_attributes) = match anchors.common.lstat(b"info")? {
+            None => (None, None),
+            Some(meta) if meta.kind == Kind::Dir => (
+                read_metadata_leaf(&anchors.common, b"info/exclude")?,
+                read_metadata_leaf(&anchors.common, b"info/attributes")?,
+            ),
+            Some(_) => {
+                return Err(Error::UnsupportedCapability(
+                    "symlink or special .git/info directory",
+                ));
+            }
+        };
 
         let mut tracked: BTreeMap<Vec<u8>, Tracked> = BTreeMap::new();
         for (position, entry) in state.entries().iter().enumerate() {
@@ -340,17 +378,24 @@ impl Repository {
         // Every .gitignore/.gitattributes a lookup can consult is read now,
         // without following symlinks or blocking on FIFOs, and served to
         // Gitoxide from memory: it never opens worktree metadata files itself.
-        let mut metadata = MetadataSnapshot::new(root, state.object_hash());
-        metadata.prescan(pathspecs, &tracked)?;
-        let mut stack = self
+        let mut metadata = MetadataSnapshot::new(state.object_hash());
+        metadata.prescan(wt, pathspecs, &tracked)?;
+        if let Some(bytes) = info_attributes {
+            metadata.add_info_attributes(&bytes)?;
+        }
+        let precious = self
             .inner
-            .attributes(
-                &metadata.index(),
-                gix::worktree::stack::state::attributes::Source::IdMapping,
-                gix::worktree::stack::state::ignore::Source::IdMapping,
-                None,
-            )?
-            .detach();
+            .config_snapshot()
+            .plumbing()
+            .boolean("gitoxide.parsePrecious")?
+            .unwrap_or(false);
+        let mut stack = metadata.stack(
+            self.work_dir()
+                .ok_or(Error::UnsupportedCapability("worktree required"))?,
+            config.ignorecase,
+            info_exclude.as_deref(),
+            precious,
+        )?;
         let mut attributes = stack.selected_attribute_matches([
             "text",
             "eol",
@@ -365,7 +410,7 @@ impl Repository {
         let mut fresh: BTreeSet<Vec<u8>> = BTreeSet::new();
         let mut expander = Expander {
             snapshot: &metadata,
-            root,
+            wt,
             state: &state,
             tracked: &tracked,
             stack: &mut stack,
@@ -381,7 +426,7 @@ impl Repository {
         let mut changes: BTreeMap<Vec<u8>, Change> = BTreeMap::new();
         for path in selected.iter().chain(fresh.iter()) {
             let is_tracked = selected.contains(path);
-            let probe = probe_path(root, path, is_tracked)?;
+            let probe = probe_path(wt, path, is_tracked)?;
             let Some(kind) = probe else {
                 changes.insert(path.clone(), Change::Remove);
                 continue;
@@ -398,11 +443,11 @@ impl Repository {
                     "core.symlinks=false for a path that is or was a symbolic link",
                 ));
             }
-            let (data, stat) = read_worktree(root, path, symlink)?;
+            let (data, stat, executable) = read_worktree(wt, path, symlink)?;
             let mode = if symlink {
                 Mode::SYMLINK
             } else {
-                file_mode(root, path, config, existing)?
+                file_mode(config, existing, executable)
             };
             if !symlink {
                 metadata.check(path, false)?;
@@ -517,31 +562,19 @@ impl Repository {
     /// True if `id` is already stored durably: an existing loose object is
     /// verified (inflated and hashed) and synced first; packed/alternate
     /// objects are assumed durable.
-    fn object_is_durable(&self, id: &ObjectId) -> Result<bool, Error> {
-        let hex = id.to_string();
-        let loose = self
-            .inner
-            .common_dir()
-            .join("objects")
-            .join(&hex[..2])
-            .join(&hex[2..]);
-        match fs::symlink_metadata(&loose) {
-            Ok(metadata) if metadata.is_file() => {
-                // Trust an existing loose file only once it holds this object.
-                super::object::verify_loose_object(&loose, id)?;
-                super::sync_existing_file(&loose)?;
-                return Ok(true);
-            }
-            Ok(_) => {
-                return Err(Error::UnsupportedCapability(
-                    "symlink or special loose object file",
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+    fn object_is_durable(&self, common: &Anchor, id: &ObjectId) -> Result<bool, Error> {
+        if super::object::existing_loose(&common.sub(b"objects")?, id)? {
+            return Ok(true);
         }
         Ok(!id.is_empty_tree() && self.inner.has_object(id))
     }
+}
+
+/// The policy roots of one `add`, opened before its first mutation.
+struct AddAnchors {
+    worktree: Anchor,
+    git: Anchor,
+    common: Anchor,
 }
 
 fn check_replaceable(state: &gix::index::State, path: &[u8], slot: Tracked) -> Result<(), Error> {
@@ -752,7 +785,7 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 struct Expander<'a> {
     snapshot: &'a MetadataSnapshot,
-    root: &'a Path,
+    wt: &'a Anchor,
     state: &'a gix::index::State,
     tracked: &'a BTreeMap<Vec<u8>, Tracked>,
     stack: &'a mut gix::worktree::Stack,
@@ -810,7 +843,7 @@ impl Expander<'_> {
                 }
             }
             Located::Entry(DiskKind::Directory) => {
-                if !spec.is_empty() && has_git_marker(&native(self.root, spec)?)? {
+                if !spec.is_empty() && has_git_marker(self.wt, spec)? {
                     return Err(refuse(AddRefusal::NestedRepository(spec.to_vec())));
                 }
                 self.walk(spec)?;
@@ -819,55 +852,48 @@ impl Expander<'_> {
         Ok(())
     }
 
-    /// Walk leading components without following symlinks.
+    /// Walk leading components through the worktree anchor, never following
+    /// a symlink.
     fn locate(&mut self, spec: &[u8]) -> Result<Located, Error> {
-        let mut path = self.root.to_owned();
         if spec.is_empty() {
             return Ok(Located::Entry(DiskKind::Directory));
         }
         let parts: Vec<&[u8]> = spec.split(|byte| *byte == b'/').collect();
         let check_spelling = self.config.ignorecase || self.config.precompose;
         for (position, part) in parts.iter().enumerate() {
-            let parent = path.clone();
-            path.push(native_component(part)?);
-            let metadata = match fs::symlink_metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                    ) =>
-                {
-                    return Ok(Located::Missing);
-                }
-                Err(error) => return Err(error.into()),
+            let prefix = parts[..=position].join(&b'/');
+            let Some(meta) = lstat_absent(self.wt, &prefix)? else {
+                return Ok(Located::Missing);
             };
-            if check_spelling && !directory_has_exact_name(&parent, part)? {
-                return Err(refuse(AddRefusal::Spelling(spec.to_vec())));
+            if check_spelling {
+                let parent = if position == 0 {
+                    Vec::new()
+                } else {
+                    parts[..position].join(&b'/')
+                };
+                if !directory_has_exact_name(self.wt, &parent, part)? {
+                    return Err(refuse(AddRefusal::Spelling(spec.to_vec())));
+                }
             }
-            let leaf = position + 1 == parts.len();
-            if leaf {
-                return Ok(match kind_of(&metadata) {
+            if position + 1 == parts.len() {
+                return Ok(match disk_kind(meta.kind) {
                     Some(kind) => Located::Entry(kind),
                     None => Located::Special,
                 });
             }
-            let prefix = parts[..=position].join(&b'/');
-            let prefix = prefix.as_slice();
-            if metadata.file_type().is_symlink() {
-                return Err(refuse(AddRefusal::BeyondSymlink(spec.to_vec())));
+            match meta.kind {
+                Kind::Symlink => return Err(refuse(AddRefusal::BeyondSymlink(spec.to_vec()))),
+                Kind::Dir => {}
+                _ => return Ok(Located::Missing),
             }
-            if !metadata.is_dir() {
-                return Ok(Located::Missing);
-            }
-            if let Some(slot) = self.tracked.get(prefix)
+            if let Some(slot) = self.tracked.get(&prefix)
                 && let Some(position) = slot.stage0
                 && self.state.entries()[position].mode == Mode::COMMIT
             {
-                return Err(refuse(AddRefusal::Submodule(prefix.to_vec())));
+                return Err(refuse(AddRefusal::Submodule(prefix)));
             }
-            if has_git_marker(&path)? {
-                return Err(refuse(AddRefusal::NestedRepository(prefix.to_vec())));
+            if has_git_marker(self.wt, &prefix)? {
+                return Err(refuse(AddRefusal::NestedRepository(prefix)));
             }
         }
         Ok(Located::Missing)
@@ -899,11 +925,8 @@ impl Expander<'_> {
     fn walk(&mut self, spec: &[u8]) -> Result<(), Error> {
         let mut pending = vec![spec.to_vec()];
         while let Some(directory) = pending.pop() {
-            let absolute = native(self.root, &directory)?;
             self.snapshot.check(&directory, true)?;
-            for child in fs::read_dir(&absolute)? {
-                let child = child?;
-                let name = name_bytes(&child.file_name())?;
+            for (name, kind) in self.wt.read_dir(&directory)? {
                 if directory.is_empty() && name == b".git" {
                     continue;
                 }
@@ -912,31 +935,34 @@ impl Expander<'_> {
                     path.push(b'/');
                 }
                 path.extend_from_slice(&name);
-                let file_type = child.file_type()?;
-                if file_type.is_dir() {
-                    if let Some(slot) = self.tracked.get(&path)
-                        && let Some(position) = slot.stage0
-                        && self.state.entries()[position].mode == Mode::COMMIT
-                    {
-                        // Gitlinks below a pathspec were refused already.
-                        continue;
+                match kind {
+                    Kind::Dir => {
+                        if let Some(slot) = self.tracked.get(&path)
+                            && let Some(position) = slot.stage0
+                            && self.state.entries()[position].mode == Mode::COMMIT
+                        {
+                            // Gitlinks below a pathspec were refused already.
+                            continue;
+                        }
+                        // A tracked file replaced by a directory is removed by
+                        // the tracked pass; its new contents are candidates.
+                        if self.excluded(&path, true)? {
+                            continue;
+                        }
+                        crate::inspection::validate_path(&path)?;
+                        if has_git_marker(self.wt, &path)? {
+                            return Err(refuse(AddRefusal::NestedRepository(path)));
+                        }
+                        pending.push(path);
                     }
-                    // A tracked file replaced by a directory is removed by the
-                    // tracked pass; its new contents are untracked candidates.
-                    if self.excluded(&path, true)? {
-                        continue;
+                    Kind::File { .. } | Kind::Symlink => {
+                        if self.tracked.contains_key(&path) || self.excluded(&path, false)? {
+                            continue;
+                        }
+                        crate::inspection::validate_path(&path)?;
+                        self.fresh.insert(path);
                     }
-                    crate::inspection::validate_path(&path)?;
-                    if has_git_marker(&child.path())? {
-                        return Err(refuse(AddRefusal::NestedRepository(path)));
-                    }
-                    pending.push(path);
-                } else if file_type.is_file() || file_type.is_symlink() {
-                    if self.tracked.contains_key(&path) || self.excluded(&path, false)? {
-                        continue;
-                    }
-                    crate::inspection::validate_path(&path)?;
-                    self.fresh.insert(path);
+                    Kind::Other => {}
                 }
             }
         }
@@ -958,25 +984,30 @@ enum DiskKind {
     Directory,
 }
 
-fn kind_of(metadata: &fs::Metadata) -> Option<DiskKind> {
-    let file_type = metadata.file_type();
-    if file_type.is_symlink() {
-        Some(DiskKind::Symlink)
-    } else if file_type.is_file() {
-        Some(DiskKind::File)
-    } else if file_type.is_dir() {
-        Some(DiskKind::Directory)
-    } else {
-        None
+fn disk_kind(kind: Kind) -> Option<DiskKind> {
+    match kind {
+        Kind::File { .. } => Some(DiskKind::File),
+        Kind::Symlink => Some(DiskKind::Symlink),
+        Kind::Dir => Some(DiskKind::Directory),
+        Kind::Other => None,
+    }
+}
+
+/// `lstat` through the anchor, where a missing entry or one below a
+/// non-directory is absent. A symlinked ancestor is an error (refusal).
+fn lstat_absent(wt: &Anchor, rel: &[u8]) -> Result<Option<Meta>, Error> {
+    match wt.lstat(rel) {
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotADirectory => Ok(None),
+        other => other,
     }
 }
 
 /// Inspect a path to stage. `None` means it no longer exists as a file or
 /// symlink (missing, a directory now, or below a non-directory), which for a
 /// tracked path stages its removal.
-fn probe_path(root: &Path, path: &[u8], tracked: bool) -> Result<Option<DiskKind>, Error> {
+fn probe_path(wt: &Anchor, path: &[u8], tracked: bool) -> Result<Option<DiskKind>, Error> {
+    super::failpoint("add.before-descend")?;
     let parts: Vec<&[u8]> = path.split(|byte| *byte == b'/').collect();
-    let mut absolute = root.to_owned();
     let vanished = || -> Result<Option<DiskKind>, Error> {
         if tracked {
             Ok(None)
@@ -984,30 +1015,19 @@ fn probe_path(root: &Path, path: &[u8], tracked: bool) -> Result<Option<DiskKind
             Err(refuse(AddRefusal::ChangedWhileReading(path.to_vec())))
         }
     };
-    for (position, part) in parts.iter().enumerate() {
-        absolute.push(native_component(part)?);
-        let metadata = match fs::symlink_metadata(&absolute) {
-            Ok(metadata) => metadata,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                ) =>
-            {
-                return vanished();
-            }
-            Err(error) => return Err(error.into()),
+    for position in 0..parts.len() {
+        let prefix = parts[..=position].join(&b'/');
+        let Some(meta) = lstat_absent(wt, &prefix)? else {
+            return vanished();
         };
         if position + 1 < parts.len() {
-            if metadata.file_type().is_symlink() {
-                return Err(refuse(AddRefusal::BeyondSymlink(path.to_vec())));
+            match meta.kind {
+                Kind::Symlink => return Err(refuse(AddRefusal::BeyondSymlink(path.to_vec()))),
+                Kind::Dir => continue,
+                _ => return vanished(),
             }
-            if !metadata.is_dir() {
-                return vanished();
-            }
-            continue;
         }
-        return match kind_of(&metadata) {
+        return match disk_kind(meta.kind) {
             Some(DiskKind::Directory) => vanished(),
             Some(kind) => Ok(Some(kind)),
             None => Err(refuse(AddRefusal::SpecialFile(path.to_vec()))),
@@ -1016,77 +1036,70 @@ fn probe_path(root: &Path, path: &[u8], tracked: bool) -> Result<Option<DiskKind
     vanished()
 }
 
-/// Read a regular file's bytes or a symlink's target, returning stat data
-/// that describes exactly the bytes read. The file identity and timestamps
-/// must be unchanged across the read; otherwise the path is refused.
-fn read_worktree(root: &Path, path: &[u8], symlink: bool) -> Result<(Vec<u8>, Stat), Error> {
-    let absolute = native(root, path)?;
+/// Read a regular file's bytes or a symlink's target through the worktree
+/// anchor, returning stat data that describes exactly the bytes read and,
+/// for a file, its executable bit as seen on the descriptor that was read.
+/// The identity and timestamps must be unchanged across the read; otherwise
+/// the path is refused.
+fn read_worktree(wt: &Anchor, path: &[u8], symlink: bool) -> Result<(Vec<u8>, Stat, bool), Error> {
     let changed = || refuse(AddRefusal::ChangedWhileReading(path.to_vec()));
-    let before = fs::symlink_metadata(&absolute)?;
+    let before = lstat_absent(wt, path)?.ok_or_else(changed)?;
     if symlink {
-        if !before.file_type().is_symlink() {
+        if before.kind != Kind::Symlink {
             return Err(changed());
         }
-        let target = fs::read_link(&absolute)?;
-        let after = fs::symlink_metadata(&absolute)?;
-        if fingerprint(&before)? != fingerprint(&after)? {
+        let target = wt.read_link(path)?;
+        if lstat_absent(wt, path)? != Some(before) {
             return Err(changed());
         }
-        let data = path_bytes(&target)?;
-        return Ok((data, stat_of(&before)?));
+        return Ok((target, stat_of_link(&before), false));
     }
-    if !before.file_type().is_file() {
+    if !matches!(before.kind, Kind::File { .. }) {
         return Err(changed());
     }
     super::failpoint("add.before-leaf-open")?;
     // Never follow a symlink or wait on a FIFO swapped in after the lstat:
-    // the open fails (symlink) or returns at once, and the descriptor must
-    // then be the same regular file the lstat saw.
-    let mut file = match super::open_leaf_nofollow(&absolute) {
-        Ok(file) => file,
+    // the open fails (symlink) or returns at once and is refused, and the
+    // descriptor must then be the same regular file the lstat saw.
+    let (mut file, opened) = match wt.open_read(path) {
+        Ok(opened) => opened,
         Err(error) => {
-            return Err(match fs::symlink_metadata(&absolute) {
-                Ok(metadata) if !metadata.is_file() => changed(),
-                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => changed(),
-                _ => error.into(),
+            return Err(match lstat_absent(wt, path) {
+                Ok(Some(meta)) if !matches!(meta.kind, Kind::File { .. }) => changed(),
+                Ok(None) => changed(),
+                _ => error,
             });
         }
     };
-    let opened = file.metadata()?;
-    if !opened.is_file() || fingerprint(&before)? != fingerprint(&opened)? {
+    if opened != before {
         return Err(changed());
     }
-    let mut data = Vec::with_capacity(usize::try_from(opened.len()).unwrap_or(0));
+    let mut data = Vec::with_capacity(usize::try_from(opened.len).unwrap_or(0));
     file.read_to_end(&mut data)?;
     let after = file.metadata()?;
-    if fingerprint(&opened)? != fingerprint(&after)? || data.len() as u64 != after.len() {
+    if !unchanged_since(&opened, &after) || data.len() as u64 != after.len() {
         return Err(changed());
     }
-    Ok((data, stat_of(&opened)?))
+    Ok((data, stat_of(&after)?, executable(&after)))
 }
 
-fn file_mode(
-    root: &Path,
-    path: &[u8],
-    config: AddConfig,
-    existing: Option<Mode>,
-) -> Result<Mode, Error> {
+/// Like Git without a trusted executable bit, keep a regular entry's mode
+/// (otherwise 100644); with one, use the bit seen on the read descriptor.
+fn file_mode(config: AddConfig, existing: Option<Mode>, executable: bool) -> Mode {
     if !config.filemode {
-        // Like Git without a trusted executable bit: keep a regular entry's
-        // mode, otherwise 100644.
-        return Ok(match existing {
+        return match existing {
             Some(mode) if mode == Mode::FILE_EXECUTABLE => Mode::FILE_EXECUTABLE,
             _ => Mode::FILE,
-        });
+        };
     }
-    let metadata = fs::symlink_metadata(native(root, path)?)?;
-    Ok(if executable(&metadata) {
+    if executable {
         Mode::FILE_EXECUTABLE
     } else {
         Mode::FILE
-    })
+    }
 }
 
+/// Git's executable test (`S_IXUSR`) on the descriptor's own metadata.
 #[cfg(unix)]
 fn executable(metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -1098,39 +1111,43 @@ fn executable(_metadata: &fs::Metadata) -> bool {
     false
 }
 
+/// The descriptor's metadata after the read still matches the [`Meta`] of
+/// the open (identity, size and both timestamps).
 #[cfg(unix)]
-fn fingerprint(metadata: &fs::Metadata) -> Result<[i64; 7], Error> {
+fn unchanged_since(opened: &Meta, after: &fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
-    Ok([
-        metadata.dev() as i64,
-        metadata.ino() as i64,
-        metadata.len() as i64,
-        metadata.mtime(),
-        metadata.mtime_nsec(),
-        metadata.ctime(),
-        metadata.ctime_nsec(),
-    ])
+    opened.id
+        == (crate::fsx::FileId {
+            volume: after.dev(),
+            index: u128::from(after.ino()),
+        })
+        && opened.len == after.len()
+        && opened.mtime
+            == (
+                after.mtime(),
+                after.mtime_nsec().clamp(0, 999_999_999) as u32,
+            )
+        && opened.ctime
+            == (
+                after.ctime(),
+                after.ctime_nsec().clamp(0, 999_999_999) as u32,
+            )
 }
 
-/// Without an inode identity, size and modification time must both be
-/// available; an unreadable timestamp is an error, never a size-only check.
+/// Legacy backend (no inode identity): size and modification time must
+/// match; an unreadable timestamp counts as changed, never a size-only check.
 #[cfg(not(unix))]
-fn fingerprint(metadata: &fs::Metadata) -> Result<[i64; 7], Error> {
-    let modified = since_epoch(metadata.modified()?)?;
-    Ok([
-        0,
-        0,
-        metadata.len() as i64,
-        modified.as_secs() as i64,
-        i64::from(modified.subsec_nanos()),
-        0,
-        0,
-    ])
+fn unchanged_since(opened: &Meta, after: &fs::Metadata) -> bool {
+    since_epoch(after.modified()).is_ok_and(|modified| {
+        opened.len == after.len()
+            && opened.mtime == (modified.as_secs() as i64, modified.subsec_nanos())
+    })
 }
 
 #[cfg(not(unix))]
-fn since_epoch(time: std::time::SystemTime) -> Result<std::time::Duration, Error> {
-    time.duration_since(std::time::UNIX_EPOCH)
+fn since_epoch(time: std::io::Result<std::time::SystemTime>) -> Result<std::time::Duration, Error> {
+    time?
+        .duration_since(std::time::UNIX_EPOCH)
         .map_err(|error| Error::Other(Box::new(error)))
 }
 
@@ -1161,7 +1178,7 @@ fn stat_of(metadata: &fs::Metadata) -> Result<Stat, Error> {
 fn stat_of(metadata: &fs::Metadata) -> Result<Stat, Error> {
     use gix::index::entry::stat::Time;
     let time = |time: std::io::Result<std::time::SystemTime>| -> Result<Time, Error> {
-        let duration = since_epoch(time?)?;
+        let duration = since_epoch(time)?;
         Ok(Time {
             secs: duration.as_secs() as u32,
             nsecs: duration.subsec_nanos(),
@@ -1173,6 +1190,29 @@ fn stat_of(metadata: &fs::Metadata) -> Result<Stat, Error> {
         size: metadata.len() as u32,
         ..Stat::default()
     })
+}
+
+/// Stat data for a symlink entry from its no-follow `lstat` through the
+/// anchor. Ownership is not part of [`Meta`]; it is recorded as 0, which only
+/// makes C Git re-check the link's content.
+fn stat_of_link(meta: &Meta) -> Stat {
+    use gix::index::entry::stat::Time;
+    // Truncation to 32 bits matches Git's on-disk index fields.
+    Stat {
+        mtime: Time {
+            secs: meta.mtime.0 as u32,
+            nsecs: meta.mtime.1,
+        },
+        ctime: Time {
+            secs: meta.ctime.0 as u32,
+            nsecs: meta.ctime.1,
+        },
+        dev: meta.id.volume as u32,
+        ino: meta.id.index as u32,
+        uid: 0,
+        gid: 0,
+        size: meta.len as u32,
+    }
 }
 
 /// Literal worktree-relative pathspec to a normalized index path; `.` (the
@@ -1207,69 +1247,39 @@ fn normalize_pathspec(raw: &BStr) -> Result<Vec<u8>, Error> {
     Ok(path)
 }
 
-fn native_component(part: &[u8]) -> Result<PathBuf, Error> {
-    Ok(gix::path::from_bstr(BStr::new(part))
-        .map_err(|_| Error::InvalidPath(part.to_vec()))?
-        .into_owned())
-}
-
-fn native(root: &Path, path: &[u8]) -> Result<PathBuf, Error> {
-    let mut result = root.to_owned();
-    if !path.is_empty() {
-        for part in path.split(|byte| *byte == b'/') {
-            result.push(native_component(part)?);
-        }
+fn join(directory: &[u8], name: &[u8]) -> Vec<u8> {
+    if directory.is_empty() {
+        name.to_vec()
+    } else {
+        [directory, b"/", name].concat()
     }
-    Ok(result)
 }
 
-fn name_bytes(name: &std::ffi::OsStr) -> Result<Vec<u8>, Error> {
-    gix::path::os_str_into_bstr(name)
-        .map(|name| name.to_vec())
-        .map_err(|_| Error::InvalidPath(name.as_encoded_bytes().to_vec()))
+fn directory_has_exact_name(wt: &Anchor, directory: &[u8], name: &[u8]) -> Result<bool, Error> {
+    Ok(wt
+        .read_dir(directory)?
+        .iter()
+        .any(|(entry, _)| entry.as_slice() == name))
 }
 
-fn path_bytes(path: &Path) -> Result<Vec<u8>, Error> {
-    name_bytes(path.as_os_str())
-}
-
-fn directory_has_exact_name(directory: &Path, name: &[u8]) -> Result<bool, Error> {
-    for child in fs::read_dir(directory)? {
-        if name_bytes(&child?.file_name())? == name {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn has_git_marker(directory: &Path) -> Result<bool, Error> {
-    match fs::symlink_metadata(directory.join(".git")) {
-        Ok(_) => Ok(true),
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) =>
-        {
-            Ok(false)
-        }
-        Err(error) => Err(error.into()),
-    }
+/// A `.git` entry of any kind inside `directory` marks a nested repository.
+fn has_git_marker(wt: &Anchor, directory: &[u8]) -> Result<bool, Error> {
+    Ok(lstat_absent(wt, &join(directory, b".git"))?.is_some())
 }
 
 /// Largest `.gitignore`/`.gitattributes` file accepted (as for status).
 const METADATA_LIMIT: u64 = 8 * 1024 * 1024;
 
 /// The `.gitignore`/`.gitattributes` content of every directory an ignore or
-/// attribute lookup of this `add` can consult, read before any lookup through
-/// [`super::open_leaf_nofollow`] and validated on the opened descriptor:
+/// attribute lookup of this `add` can consult, read before any lookup with
+/// `Anchor::open_read` through the worktree anchor (no-follow, non-blocking)
+/// and validated on the opened descriptor:
 /// a symlink, FIFO, special or oversized file is refused, never followed or
 /// waited on. Gitoxide receives the bytes through id mappings and this
 /// in-memory object source, so a later swap of a metadata file cannot affect
 /// or block the lookup. A lookup in a directory that was not pre-read is an
 /// error rather than a silent "no patterns".
 struct MetadataSnapshot {
-    root: PathBuf,
     hash: gix::hash::Kind,
     scanned: HashSet<Vec<u8>>,
     files: BTreeMap<Vec<u8>, ObjectId>,
@@ -1277,9 +1287,8 @@ struct MetadataSnapshot {
 }
 
 impl MetadataSnapshot {
-    fn new(root: &Path, hash: gix::hash::Kind) -> Self {
+    fn new(hash: gix::hash::Kind) -> Self {
         Self {
-            root: root.to_owned(),
             hash,
             scanned: HashSet::new(),
             files: BTreeMap::new(),
@@ -1292,13 +1301,14 @@ impl MetadataSnapshot {
     /// nested repository's own files, but not below it).
     fn prescan(
         &mut self,
+        wt: &Anchor,
         pathspecs: &[Vec<u8>],
         tracked: &BTreeMap<Vec<u8>, Tracked>,
     ) -> Result<(), Error> {
-        self.read_directory(b"")?;
+        self.read_directory(wt, b"")?;
         let mut seen = 0usize;
         for spec in pathspecs {
-            if !self.read_ancestors(spec, true)? {
+            if !self.read_ancestors(wt, spec, true)? {
                 continue;
             }
             let mut prefix = spec.clone();
@@ -1311,36 +1321,28 @@ impl MetadataSnapshot {
                 .map(|(path, _)| path.clone())
                 .collect();
             for path in under {
-                self.read_ancestors(&path, false)?;
+                self.read_ancestors(wt, &path, false)?;
             }
-            match fs::symlink_metadata(native(&self.root, spec)?) {
-                Ok(metadata) if metadata.is_dir() => {}
-                _ => continue,
+            if !spec.is_empty()
+                && !matches!(lstat_absent(wt, spec)?, Some(meta) if meta.kind == Kind::Dir)
+            {
+                continue;
             }
             let mut pending = vec![spec.clone()];
             while let Some(directory) = pending.pop() {
-                for child in fs::read_dir(native(&self.root, &directory)?)? {
-                    let child = child?;
+                for (name, kind) in wt.read_dir(&directory)? {
                     seen += 1;
                     if seen > 1_000_000 {
                         return Err(Error::UnsupportedCapability(
                             "worktree metadata preflight entry limit",
                         ));
                     }
-                    let name = name_bytes(&child.file_name())?;
-                    if directory.is_empty() && name == b".git" {
+                    if (directory.is_empty() && name == b".git") || kind != Kind::Dir {
                         continue;
                     }
-                    if !child.file_type()?.is_dir() {
-                        continue;
-                    }
-                    let mut path = directory.clone();
-                    if !path.is_empty() {
-                        path.push(b'/');
-                    }
-                    path.extend_from_slice(&name);
-                    self.read_directory(&path)?;
-                    if !has_git_marker(&child.path())? {
+                    let path = join(&directory, &name);
+                    self.read_directory(wt, &path)?;
+                    if !has_git_marker(wt, &path)? {
                         pending.push(path);
                     }
                 }
@@ -1353,7 +1355,12 @@ impl MetadataSnapshot {
     /// `include_self`). A component that is missing, not a directory or a
     /// symlink is recorded as having no metadata, and nothing below it is
     /// read; returns whether every component was a real directory.
-    fn read_ancestors(&mut self, path: &[u8], include_self: bool) -> Result<bool, Error> {
+    fn read_ancestors(
+        &mut self,
+        wt: &Anchor,
+        path: &[u8],
+        include_self: bool,
+    ) -> Result<bool, Error> {
         if path.is_empty() {
             return Ok(true);
         }
@@ -1365,12 +1372,10 @@ impl MetadataSnapshot {
         };
         for position in 0..count {
             let directory = parts[..=position].join(&b'/');
-            let real = matches!(
-                fs::symlink_metadata(native(&self.root, &directory)?),
-                Ok(metadata) if metadata.is_dir()
-            );
+            let real =
+                matches!(lstat_absent(wt, &directory)?, Some(meta) if meta.kind == Kind::Dir);
             if real {
-                self.read_directory(&directory)?;
+                self.read_directory(wt, &directory)?;
             } else {
                 // Lookups may still name it; it holds no metadata files.
                 for rest in position..parts.len() {
@@ -1382,24 +1387,91 @@ impl MetadataSnapshot {
         Ok(true)
     }
 
-    fn read_directory(&mut self, directory: &[u8]) -> Result<(), Error> {
+    fn read_directory(&mut self, wt: &Anchor, directory: &[u8]) -> Result<(), Error> {
         if !self.scanned.insert(directory.to_vec()) {
             return Ok(());
         }
         for name in [&b".gitignore"[..], b".gitattributes"] {
-            let mut relative = directory.to_vec();
-            if !relative.is_empty() {
-                relative.push(b'/');
-            }
-            relative.extend_from_slice(name);
-            let Some(bytes) = read_metadata_leaf(&native(&self.root, &relative)?)? else {
+            let relative = join(directory, name);
+            let Some(bytes) = read_metadata_leaf(wt, &relative)? else {
                 continue;
             };
-            let id = gix::objs::compute_hash(self.hash, ObjectKind::Blob, &bytes)?;
-            self.files.insert(relative, id);
-            self.blobs.insert(id, bytes);
+            self.insert(relative, bytes)?;
         }
         Ok(())
+    }
+
+    fn insert(&mut self, relative: Vec<u8>, bytes: Vec<u8>) -> Result<(), Error> {
+        let id = gix::objs::compute_hash(self.hash, ObjectKind::Blob, &bytes)?;
+        self.files.insert(relative, id);
+        self.blobs.insert(id, bytes);
+        Ok(())
+    }
+
+    /// Gitoxide loads `info/attributes` right after the root `.gitattributes`
+    /// as a never-popped list. Appending it to the root list reproduces that
+    /// precedence exactly while serving it from memory.
+    fn add_info_attributes(&mut self, info: &[u8]) -> Result<(), Error> {
+        let mut root = self
+            .files
+            .get(&b".gitattributes"[..])
+            .and_then(|id| self.blobs.get(id))
+            .cloned()
+            .unwrap_or_default();
+        if !root.is_empty() && !root.ends_with(b"\n") {
+            root.push(b'\n');
+        }
+        root.extend_from_slice(info);
+        self.insert(b".gitattributes".to_vec(), root)
+    }
+
+    /// The attribute and ignore stack over this snapshot: per-directory files
+    /// through id mappings, `info/exclude` as an in-memory global list. No
+    /// file is opened by Gitoxide; `root` only labels the virtual stack.
+    fn stack(
+        &self,
+        root: &Path,
+        ignorecase: bool,
+        info_exclude: Option<&[u8]>,
+        precious: bool,
+    ) -> Result<gix::worktree::Stack, Error> {
+        use gix::worktree::stack::state;
+        let case = if ignorecase {
+            gix::glob::pattern::Case::Fold
+        } else {
+            gix::glob::pattern::Case::Sensitive
+        };
+        let parse = gix::ignore::search::Ignore {
+            support_precious: precious,
+        };
+        let mut buf = Vec::new();
+        let mut collection = gix::attrs::search::MetadataCollection::default();
+        let globals = gix::attrs::Search::new_globals(
+            std::iter::empty::<PathBuf>(),
+            &mut buf,
+            &mut collection,
+        )?;
+        let attributes = state::Attributes::new(
+            globals,
+            None,
+            state::attributes::Source::IdMapping,
+            collection,
+        );
+        let mut excludes = gix::ignore::Search::default();
+        if let Some(bytes) = info_exclude {
+            excludes.add_patterns_buffer(bytes, "info/exclude", None, parse)?;
+        }
+        let ignore = state::Ignore::new(
+            gix::ignore::Search::default(),
+            excludes,
+            None,
+            state::ignore::Source::IdMapping,
+            parse,
+        );
+        let state = gix::worktree::stack::State::AttributesAndIgnoreStack { attributes, ignore };
+        let index = self.index();
+        let mappings = state.id_mappings_from_index(&index, index.path_backing(), case);
+        Ok(gix::worktree::Stack::new(root, state, case, buf, mappings))
     }
 
     /// Every directory a lookup of `path` consults must have been pre-read.
@@ -1462,32 +1534,24 @@ impl gix::objs::Find for MetadataSnapshot {
     }
 }
 
-/// Read one metadata file without following a symlink or blocking on a FIFO.
-/// Absent is `None`; anything but a regular file within the size limit, as
-/// seen on the opened descriptor, is refused.
-fn read_metadata_leaf(path: &Path) -> Result<Option<Vec<u8>>, Error> {
+/// Read one metadata file through `anchor` without following a symlink
+/// (final or ancestor) or blocking on a FIFO. Absent is `None`; anything but
+/// a regular file within the size limit, as seen on the opened handle, is
+/// refused.
+fn read_metadata_leaf(anchor: &Anchor, rel: &[u8]) -> Result<Option<Vec<u8>>, Error> {
     let refused =
         || Error::UnsupportedCapability("symlink, special or oversized attribute/ignore file");
-    let file = match super::open_leaf_nofollow(path) {
-        Ok(file) => file,
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) =>
-        {
-            return Ok(None);
-        }
+    let (file, meta) = match anchor.open_read(rel) {
+        Ok(opened) => opened,
         Err(error) => {
-            // O_NOFOLLOW reports a symlink as an error (ELOOP).
-            return Err(match fs::symlink_metadata(path) {
-                Ok(metadata) if !metadata.is_file() => refused(),
-                _ => error.into(),
-            });
+            return match lstat_absent(anchor, rel)? {
+                None => Ok(None),
+                Some(meta) if !matches!(meta.kind, Kind::File { .. }) => Err(refused()),
+                Some(_) => Err(error),
+            };
         }
     };
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > METADATA_LIMIT {
+    if meta.len > METADATA_LIMIT {
         return Err(refused());
     }
     let mut bytes = Vec::new();
@@ -1498,40 +1562,53 @@ fn read_metadata_leaf(path: &Path) -> Result<Option<Vec<u8>>, Error> {
     Ok(Some(bytes))
 }
 
-/// Ignore/attribute sources must be regular files of bounded size; never
-/// follow a symlink or open a FIFO while loading them.
-fn check_metadata_files(paths: &[PathBuf]) -> Result<(), Error> {
-    for path in paths {
-        match fs::symlink_metadata(path) {
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                ) => {}
-            Err(error) => return Err(error.into()),
-            Ok(metadata) if metadata.is_file() && metadata.len() <= 8 * 1024 * 1024 => {}
-            Ok(_) => {
-                return Err(Error::UnsupportedCapability(
-                    "symlink, special or oversized attribute/ignore file",
-                ));
-            }
+/// Raw index bytes and modification time, read through the Git directory
+/// anchor (no-follow, non-blocking, regular files only); `None` if there is
+/// no index.
+fn read_index_bytes(git: &Anchor) -> Result<Option<(Vec<u8>, std::time::SystemTime)>, Error> {
+    match git.lstat(b"index")? {
+        None => return Ok(None),
+        Some(meta) if !matches!(meta.kind, Kind::File { .. }) => {
+            return Err(Error::UnsupportedCapability(
+                "symlink or special index file",
+            ));
         }
+        Some(_) => {}
     }
-    Ok(())
+    let (mut file, _) = match git.open_read(b"index") {
+        Ok(opened) => opened,
+        Err(_) if git.lstat(b"index")?.is_none() => return Ok(None),
+        Err(Error::UnsupportedCapability(_)) => {
+            return Err(Error::UnsupportedCapability(
+                "symlink or special index file",
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    let modified = file.metadata()?.modified()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some((bytes, modified)))
 }
 
-/// Raw index bytes for snapshot comparison; `None` if there is no index.
-fn read_index_bytes(path: &Path) -> Result<Option<Vec<u8>>, Error> {
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-        Ok(metadata) if !metadata.is_file() => Err(Error::UnsupportedCapability(
-            "symlink or special index file",
-        )),
-        Ok(_) => match fs::read(path) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error.into()),
-        },
+impl Repository {
+    /// The index as read through the Git directory anchor (an absent index
+    /// is empty); never opened by path.
+    pub(super) fn read_index_anchored(&self, git: &Anchor) -> Result<gix::index::File, Error> {
+        let read = read_index_bytes(git)?;
+        self.decode_read_index(read.as_ref())
+    }
+
+    fn decode_read_index(
+        &self,
+        read: Option<&(Vec<u8>, std::time::SystemTime)>,
+    ) -> Result<gix::index::File, Error> {
+        match read {
+            Some((bytes, modified)) => self.decode_index(bytes, *modified),
+            None => Ok(gix::index::File::from_state(
+                gix::index::State::new(self.inner.object_hash()),
+                self.inner.index_path(),
+            )),
+        }
     }
 }

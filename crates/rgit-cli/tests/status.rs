@@ -337,8 +337,12 @@ fn executable_modes_and_symlink_type_and_target_changes() -> Result {
     fs::set_permissions(root.path().join("mode"), fs::Permissions::from_mode(0o755))?;
     fs::remove_file(root.path().join("type"))?;
     symlink("target", root.path().join("type"))?;
-    fs::remove_file(root.path().join("link"))?;
-    symlink("new-target", root.path().join("link"))?;
+    // Create the retargeted link before replacing the old one, so it never
+    // reuses the old inode (ext4 can hand a freed inode straight back, and
+    // with the same size and second C Git's stat cache would then miss the
+    // change while rgit reports it, making the comparison nondeterministic).
+    symlink("new-target", root.path().join("link.new"))?;
+    fs::rename(root.path().join("link.new"), root.path().join("link"))?;
     matrix(root.path())?;
     git(root.path(), &["add", "."])?;
     matrix(root.path())?;

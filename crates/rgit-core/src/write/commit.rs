@@ -12,8 +12,9 @@ use std::collections::HashSet;
 
 use crate::{Error, ObjectId, ObjectKind, Repository};
 
-use super::refs::{Loose, PublishOptions, format_signature, read_loose};
+use super::refs::{Loose, PublishOptions, RefAnchors, format_signature, read_loose};
 use super::{RefExpectation, RefLog, RefUpdate};
+use crate::fsx::Anchor;
 
 /// A Git identity line: `name <email> seconds ±HHMM`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,15 +67,17 @@ impl Repository {
     /// ([`Error::UnmergedIndex`]), intent-to-add entries and gitlinks are
     /// refused, and each blob must be present ([`Error::MissingObject`]).
     pub fn write_tree_from_index(&self) -> Result<ObjectId, Error> {
-        let plan = self.plan_tree_from_index()?;
-        self.write_planned_trees(&plan)?;
+        let anchors = RefAnchors::open(self)?;
+        super::object::check_object_store(&anchors.common)?;
+        let plan = self.plan_tree_from_index(&anchors)?;
+        self.write_planned_trees(&anchors.common, &plan)?;
         Ok(plan.root)
     }
 
     /// Validate the index and compute every tree object in memory, without
     /// writing anything.
-    fn plan_tree_from_index(&self) -> Result<TreePlan, Error> {
-        let index = self.read_index()?;
+    fn plan_tree_from_index(&self, anchors: &RefAnchors) -> Result<TreePlan, Error> {
+        let index = self.read_index_anchored(&anchors.git)?;
         let hash = self.inner.object_hash();
         if index.entries().iter().any(|entry| entry.stage_raw() != 0) {
             return Err(Error::UnmergedIndex);
@@ -82,7 +85,7 @@ impl Repository {
         let mut files = Vec::with_capacity(index.entries().len());
         for entry in index.entries() {
             check_index_entry(entry, hash)?;
-            self.require_kind(entry.id, ObjectKind::Blob)?;
+            self.require_kind(anchors, entry.id, ObjectKind::Blob)?;
             files.push((entry.path(&index), entry.mode.bits(), entry.id));
         }
         self.plan_trees(&files)
@@ -90,9 +93,9 @@ impl Repository {
 
     /// Store planned trees bottom-up; each is synced (an existing loose copy
     /// too) by `write_loose_object`.
-    fn write_planned_trees(&self, plan: &TreePlan) -> Result<(), Error> {
+    fn write_planned_trees(&self, common: &Anchor, plan: &TreePlan) -> Result<(), Error> {
         for (expected, data) in &plan.objects {
-            let id = self.write_loose_object(ObjectKind::Tree, data)?;
+            let id = self.write_loose_object_at(common, ObjectKind::Tree, data)?;
             if id != *expected {
                 return Err(super::refs::corrupt("tree object hash mismatch"));
             }
@@ -112,15 +115,18 @@ impl Repository {
         if request.message.contains(&0) {
             return Err(invalid_input("commit message contains a NUL byte"));
         }
-        self.refuse_in_progress()?;
+        // Both Git directory roots are opened before any read that decides
+        // the commit and before the first object write.
+        let anchors = RefAnchors::open(self)?;
+        super::object::check_object_store(&anchors.common)?;
+        self.refuse_in_progress(&anchors.git)?;
         self.refuse_unsupported_commit_config()?;
 
         let hash = self.inner.object_hash();
-        let head_path = self.inner.git_dir().join("HEAD");
-        let (reference, parent) = match read_loose(&head_path, hash)? {
+        let (reference, parent) = match read_loose(&anchors.git, b"HEAD", hash)? {
             None => return Err(super::refs::corrupt("HEAD is missing")),
             Some(Loose::Direct(id)) => {
-                self.preflight_ref(b"HEAD", true)?;
+                self.preflight_ref(&anchors, b"HEAD", true)?;
                 (b"HEAD".to_vec(), Some(id))
             }
             Some(Loose::Symbolic(branch)) => {
@@ -131,8 +137,8 @@ impl Repository {
                 }
                 // D/F conflicts, symlinked or symbolic refs and unusable
                 // reflog paths are refused before any object is written.
-                self.preflight_ref(&branch, true)?;
-                match self.read_ref(&branch)? {
+                self.preflight_ref(&anchors, &branch, true)?;
+                match self.read_ref(&anchors, &branch)? {
                     None => (branch, None),
                     Some(Loose::Direct(id)) => (branch, Some(id)),
                     Some(Loose::Symbolic(_)) => {
@@ -144,15 +150,12 @@ impl Repository {
             }
         };
         let parent_tree = match parent {
-            Some(id) => {
-                self.require_kind(id, ObjectKind::Commit)?;
-                Some(self.inner.find_object(id)?.try_to_commit_ref()?.tree())
-            }
+            Some(id) => Some(self.parent_tree(&anchors, id)?),
             None => None,
         };
 
         // Decide on an in-memory tree so a refusal writes nothing.
-        let plan = self.plan_tree_from_index()?;
+        let plan = self.plan_tree_from_index(&anchors)?;
         let tree = plan.root;
         if !request.allow_empty && parent_tree.unwrap_or_else(|| ObjectId::empty_tree(hash)) == tree
         {
@@ -168,12 +171,12 @@ impl Repository {
         data.extend_from_slice(&format_signature(&request.committer));
         data.extend_from_slice(b"\n\n");
         data.extend_from_slice(&request.message);
-        self.write_planned_trees(&plan)?;
-        let id = self.write_loose_object(ObjectKind::Commit, &data)?;
+        self.write_planned_trees(&anchors.common, &plan)?;
+        let id = self.write_loose_object_at(&anchors.common, ObjectKind::Commit, &data)?;
         // The parent was not written by this operation; sync its loose copy
         // (packed objects are durable already) before a ref names the child.
         if let Some(parent) = parent {
-            self.sync_loose_object(parent)?;
+            self.sync_loose_object(&anchors, parent)?;
         }
         super::failpoint("commit.objects-written")?;
 
@@ -201,6 +204,7 @@ impl Repository {
         // requires HEAD to still name the branch, so HEAD cannot be re-pointed
         // (for example by a branch switch) in between; HEAD is not touched.
         self.publish_ref(
+            &anchors,
             &update,
             PublishOptions {
                 locked: "commit.ref-locked",
@@ -215,13 +219,30 @@ impl Repository {
         })
     }
 
-    fn refuse_in_progress(&self) -> Result<(), Error> {
-        let git_dir = self.inner.git_dir();
+    /// The tree of commit `id`: a loose commit is read and verified only
+    /// through the objects anchor; a packed one through Gitoxide after the
+    /// anchored pack check.
+    fn parent_tree(&self, anchors: &RefAnchors, id: ObjectId) -> Result<ObjectId, Error> {
+        let objects = anchors.common.sub(b"objects")?;
+        match super::object::read_loose(&objects, &id)? {
+            Some((ObjectKind::Commit, data)) => {
+                Ok(gix::objs::CommitRef::from_bytes(&data, self.inner.object_hash())?.tree())
+            }
+            Some((actual, _)) => Err(Error::UnexpectedKind {
+                expected: ObjectKind::Commit,
+                actual,
+            }),
+            None => {
+                self.require_kind(anchors, id, ObjectKind::Commit)?;
+                Ok(self.inner.find_object(id)?.try_to_commit_ref()?.tree())
+            }
+        }
+    }
+
+    fn refuse_in_progress(&self, git: &Anchor) -> Result<(), Error> {
         for (name, what) in IN_PROGRESS {
-            match std::fs::symlink_metadata(git_dir.join(name)) {
-                Ok(_) => return Err(Error::UnsupportedCapability(what)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+            if git.lstat(name.as_bytes())?.is_some() {
+                return Err(Error::UnsupportedCapability(what));
             }
         }
         Ok(())

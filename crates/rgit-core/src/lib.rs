@@ -17,6 +17,7 @@ mod inspection;
 pub use inspection::IndexEntry;
 mod status;
 pub use status::{StatusEntry, UntrackedMode};
+mod fsx;
 pub mod write;
 
 /// Operation errors retain the underlying Gitoxide error as their source.

@@ -22,14 +22,25 @@ mod object;
 mod refs;
 mod sys;
 
+pub use crate::fsx::Hardening as FilesystemHardening;
 pub use commit::{CommitOutcome, CommitRequest, Signature};
 pub use index::{AddOutcome, AddRefusal};
 pub use init::{InitOptions, InitPublishedError, ObjectFormat, init};
+pub use lock::{LockPublishedUnreachableError, LockPublishedUnsyncedError};
 pub use refs::{
-    RefExpectation, RefLog, RefLoggedNotPublishedError, RefPublishedUnsyncedError, RefUpdate,
-    ReflogAppendError,
+    RefExpectation, RefLog, RefLoggedNotPublishedError, RefPublishedUnreachableError,
+    RefPublishedUnsyncedError, RefUpdate, ReflogAppendError,
 };
 
 pub(crate) use failpoint::hit as failpoint;
-pub(crate) use lock::{LockFile, sync_parent};
-pub(crate) use sys::{open_leaf_nofollow, rename_noreplace, sync_existing_file};
+pub(crate) use lock::LockFile;
+#[cfg_attr(unix, allow(unused_imports))]
+pub(crate) use sys::{open_leaf_nofollow, rename_noreplace};
+
+/// The filesystem guarantee this build's write operations use, selected at
+/// compile time: [`FilesystemHardening::Anchored`] on Unix (descriptor-root
+/// identity), [`FilesystemHardening::LegacyPath`] elsewhere. There is no
+/// runtime fallback between them.
+pub fn filesystem_hardening() -> FilesystemHardening {
+    crate::fsx::HARDENING
+}
