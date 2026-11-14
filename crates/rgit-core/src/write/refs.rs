@@ -217,6 +217,16 @@ impl Repository {
 
         let result = match lock.commit() {
             Ok(()) => Ok(()),
+            // Uncertain post-rename outcome (Windows legacy lock): the rename
+            // returned success but the target is no longer our file. Passed
+            // through as is, whether or not a reflog was appended; it is
+            // neither "updated" nor "not updated".
+            Err(source @ Error::Other(_))
+                if matches!(&source, Error::Other(error)
+                    if error.is::<super::RenameOutcomeUncertainError>()) =>
+            {
+                Err(source)
+            }
             // Renamed: visible, durability unknown; reflogs already appended.
             Err(source) if lock_identity.renamed(&location.path, content.as_bytes()) => {
                 Err(Error::Other(Box::new(RefPublishedUnsyncedError {

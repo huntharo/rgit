@@ -13,7 +13,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use common::{Result, git};
-use rgit_core::write::{RefExpectation, RefUpdate, RenameOutcomeUncertainError};
+use rgit_core::write::{RefExpectation, RefLog, RefUpdate, RenameOutcomeUncertainError, Signature};
 use rgit_core::{Error, ObjectId, Repository};
 
 const CHILD: &str = "RGIT_TEST_LOCK_CHILD";
@@ -22,25 +22,35 @@ fn text(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
-/// Child: update `refs/heads/other` from `<old>` to `<new>` without a reflog
-/// and write a classification of the result.
+/// Child: update `refs/heads/other` from `<old>` to `<new>`, with a reflog
+/// when asked, and write a classification of the result.
 #[test]
 fn lock_child() -> Result {
     let Ok(spec) = std::env::var(CHILD) else {
         return Ok(());
     };
     let mut fields = spec.split('|');
-    let (repo, old, new, out) = (
+    let (repo, old, new, out, with_log) = (
         fields.next().ok_or("repo")?,
         fields.next().ok_or("old")?,
         fields.next().ok_or("new")?,
         fields.next().ok_or("out")?,
+        fields.next().ok_or("log")? == "log",
     );
+    let log = with_log.then(|| RefLog {
+        committer: Signature {
+            name: b"Test".to_vec(),
+            email: b"test@example.invalid".to_vec(),
+            seconds: 1_767_225_600,
+            offset_minutes: 0,
+        },
+        message: b"child update".to_vec(),
+    });
     let result = Repository::discover(repo)?.update_ref(&RefUpdate {
         name: b"refs/heads/other".to_vec(),
         new: ObjectId::from_hex(new.as_bytes())?,
         expected: RefExpectation::MustEqual(ObjectId::from_hex(old.as_bytes())?),
-        log: None,
+        log,
     });
     let report = match &result {
         Ok(()) => "ok".to_owned(),
@@ -71,8 +81,18 @@ fn wait_for(path: &Path) -> Result {
     Err("failpoint never reached".into())
 }
 
+/// With and without a reflog: the uncertain outcome passes through
+/// unchanged (never "not updated"), and with a reflog the line our update
+/// appended before the rename stays.
 #[test]
 fn replacement_after_rename_is_reported_as_uncertain_and_kept() -> Result {
+    for with_log in [false, true] {
+        replacement_case(with_log)?;
+    }
+    Ok(())
+}
+
+fn replacement_case(with_log: bool) -> Result {
     let temp = tempfile::tempdir()?;
     let dir = temp.path().join("repo");
     std::fs::create_dir(&dir)?;
@@ -91,7 +111,12 @@ fn replacement_after_rename_is_reported_as_uncertain_and_kept() -> Result {
         .args(["--exact", "lock_child", "--test-threads=1"])
         .env(
             CHILD,
-            format!("{}|{first}|{second}|{}", dir.display(), out.display()),
+            format!(
+                "{}|{first}|{second}|{}|{}",
+                dir.display(),
+                out.display(),
+                if with_log { "log" } else { "nolog" }
+            ),
         )
         .env("RGIT_FAILPOINT", "lock.renamed-unverified:pause")
         .env("RGIT_FAILPOINT_READY", sync.join("ready"))
@@ -117,8 +142,12 @@ fn replacement_after_rename_is_reported_as_uncertain_and_kept() -> Result {
         "{report}"
     );
     assert!(report.contains("no longer has our identity"), "{report}");
+    assert!(!report.contains("was not updated"), "{report}");
     // Never rolled back or rewritten; no lock left behind.
     assert_eq!(std::fs::read_to_string(&target)?, replacement);
     assert!(!dir.join(".git/refs/heads/other.lock").exists());
+    assert!(!dir.join(".git/HEAD.lock").exists());
+    let reflog = std::fs::read_to_string(dir.join(".git/logs/refs/heads/other"))?;
+    assert_eq!(reflog.contains("child update"), with_log, "{reflog}");
     Ok(())
 }
