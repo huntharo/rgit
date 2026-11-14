@@ -314,6 +314,11 @@ impl Dir {
         File::open(&self.path)?.sync_all()?;
         Ok(())
     }
+
+    /// Legacy backend: identity of whatever the path names now.
+    pub(crate) fn id(&self) -> Result<FileId, Error> {
+        Ok(lstat_path(&self.path)?.id)
+    }
 }
 
 pub(crate) fn file_id(file: &File) -> Result<FileId, Error> {

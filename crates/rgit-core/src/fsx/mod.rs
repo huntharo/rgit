@@ -201,6 +201,14 @@ impl Anchor {
     pub(crate) fn sync(&self) -> Result<(), Error> {
         self.inner.sync()
     }
+
+    /// Identity of the directory this anchor holds. The anchored backend
+    /// reads it from the held descriptor (`fstat`), so it names the opened
+    /// directory even if a path to it has since been replaced. The legacy
+    /// backend reads it by path.
+    pub(crate) fn id(&self) -> Result<FileId, Error> {
+        self.inner.id()
+    }
 }
 
 /// Identity of an open file handle.
