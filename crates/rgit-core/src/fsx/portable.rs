@@ -361,7 +361,9 @@ mod windows_identity {
         // Identity survives a rename and is shared by a hard link; a
         // replacement under the old name is a different entry.
         drop(file);
-        dir.rename_noreplace(b"a", b"renamed")?;
+        // The legacy backend refuses no-replace renames on Windows; the
+        // test only needs the entry moved.
+        fs::rename(root.path().join("a"), root.path().join("renamed"))?;
         assert_eq!(dir.lstat(b"renamed")?.ok_or("renamed missing")?.id, a.id);
         dir.hard_link(b"renamed", b"linked")?;
         assert_eq!(dir.lstat(b"linked")?.ok_or("linked missing")?.id, a.id);

@@ -1008,8 +1008,14 @@ fn oracle_detects_outside_writes_decoy_objects_and_unconfined_completion() -> Re
     );
     // An outside entry replaced by a different inode with the same bytes
     // (Unix: std exposes no stable file index on Windows).
-    fs::remove_file(fx.outside.join("wt/file"))?;
-    fs::write(fx.outside.join("wt/file"), DECOYS[0])?;
+    // Write the replacement first and rename it over the original, so the
+    // old inode is still allocated when the new one is created (ext4 may
+    // otherwise hand the freed inode number straight back).
+    fs::write(fx.outside.join("wt/file.replacement"), DECOYS[0])?;
+    fs::rename(
+        fx.outside.join("wt/file.replacement"),
+        fx.outside.join("wt/file"),
+    )?;
     #[cfg(unix)]
     assert!(
         assert_untouched(&fx.outside, &outside, "self").is_err(),
