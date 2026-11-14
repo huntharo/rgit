@@ -232,7 +232,12 @@ proceeded. The index stat `ctime` field holds the creation time, which an
 in-place edit does not change. A held lock cannot be
 deleted while it is open, but it is closed immediately before `MoveFileExW`
 renames it by path; a safe handle-relative rename is proposed separately
-(PWR-197). An object that already exists is not re-synced (it is read-only,
+(PWR-197). The legacy lock compares its file identity with the lock path
+before `MoveFileExW` (a mismatch refuses, nothing published) and with the
+target after it; a mismatch after the rename is reported as an uncertain
+outcome (`RenameOutcomeUncertainError`, with the observed identity and
+content) and is never rolled back. This detects some replacement outcomes
+only and does not close the close-before-rename window. An object that already exists is not re-synced (it is read-only,
 and syncing would need a writable handle), so its durability relies on its
 writer. `init` uses exclusive directory creation because no atomic no-replace
 rename is available.

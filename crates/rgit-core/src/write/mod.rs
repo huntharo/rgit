@@ -26,7 +26,9 @@ pub use crate::fsx::Hardening as FilesystemHardening;
 pub use commit::{CommitOutcome, CommitRequest, Signature};
 pub use index::{AddOutcome, AddRefusal};
 pub use init::{InitOptions, InitPublishedError, ObjectFormat, init};
-pub use lock::{LockPublishedUnreachableError, LockPublishedUnsyncedError};
+pub use lock::{
+    LockPublishedUnreachableError, LockPublishedUnsyncedError, RenameOutcomeUncertainError,
+};
 pub use refs::{
     RefExpectation, RefLog, RefLoggedNotPublishedError, RefPublishedUnreachableError,
     RefPublishedUnsyncedError, RefUpdate, ReflogAppendError,

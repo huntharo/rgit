@@ -274,6 +274,17 @@ impl Repository {
 
         let result = match lock.commit() {
             Ok(()) => Ok(()),
+            // Uncertain post-rename outcome (Windows legacy lock): the rename
+            // returned success but the target no longer has our identity.
+            // Returned as is, whether or not a reflog was appended, before
+            // any other classification: it is neither "updated" nor "not
+            // updated".
+            Err(source @ Error::Other(_))
+                if matches!(&source, Error::Other(error)
+                    if error.is::<super::RenameOutcomeUncertainError>()) =>
+            {
+                Err(source)
+            }
             // After the rename (LockFile's post-publication errors): the new
             // value was published, so never report it as not updated.
             Err(source) if super::lock::after_publication(&source) => {
