@@ -32,4 +32,5 @@ pub use refs::{
 
 pub(crate) use failpoint::hit as failpoint;
 pub(crate) use lock::{LockFile, sync_parent};
+#[cfg_attr(unix, allow(unused_imports))]
 pub(crate) use sys::{open_leaf_nofollow, rename_noreplace, sync_existing_file};
