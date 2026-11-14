@@ -1271,8 +1271,9 @@ fn has_git_marker(wt: &Anchor, directory: &[u8]) -> Result<bool, Error> {
 const METADATA_LIMIT: u64 = 8 * 1024 * 1024;
 
 /// The `.gitignore`/`.gitattributes` content of every directory an ignore or
-/// attribute lookup of this `add` can consult, read before any lookup through
-/// [`super::open_leaf_nofollow`] and validated on the opened descriptor:
+/// attribute lookup of this `add` can consult, read before any lookup with
+/// `Anchor::open_read` through the worktree anchor (no-follow, non-blocking)
+/// and validated on the opened descriptor:
 /// a symlink, FIFO, special or oversized file is refused, never followed or
 /// waited on. Gitoxide receives the bytes through id mappings and this
 /// in-memory object source, so a later swap of a metadata file cannot affect
