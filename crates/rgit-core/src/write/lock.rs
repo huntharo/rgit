@@ -13,6 +13,19 @@
 //!   is exactly the path form below; it makes no anchoring claim.
 //! - [`LockFile::acquire`]: the path form, kept while non-anchored callers
 //!   remain and as the Windows implementation.
+//!
+//! The ownership check before the rename (and before the unlink in `Drop`)
+//! and the rename/unlink itself are check-then-act by name: a replacement in
+//! that instant is not detected. That is inherent to rename and unlink by
+//! name, as in C Git; the held descriptor only rules out the inode-reuse
+//! variant (a replacement reusing our freed inode number).
+//!
+//! Errors from an anchored [`LockFile::commit`] are typed so callers can
+//! tell them apart without string matching: an error after the rename is
+//! always one of the post-publication types ([`LockPublishedUnsyncedError`],
+//! [`LockPublishedUnreachableError`]) inside [`Error::Other`], and
+//! [`after_publication`] says so; every other error happened before the
+//! rename and published nothing.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -36,19 +49,30 @@ pub(crate) struct LockFile<'a> {
 }
 
 enum Location<'a> {
-    Path {
-        target: PathBuf,
-        lock_path: PathBuf,
-    },
+    /// The path form. On Unix it is unused once every caller is anchored.
+    #[cfg_attr(unix, allow(dead_code))]
+    Path { target: PathBuf, lock_path: PathBuf },
     /// Constructed on Unix only (the anchored backend). The whole lifecycle
     /// (create, identity check, rename, remove, directory sync) runs on one
     /// held parent directory, by leaf name, so a parent swapped after acquire
     /// cannot split it across directories.
+    ///
+    /// `root` and the full names are kept to verify that the held parent is
+    /// still the directory reached from the root anchor (descriptor-root
+    /// identity) before and after the rename.
     #[cfg_attr(not(unix), allow(dead_code))]
     Anchored {
+        root: &'a Anchor,
         dir: Held<'a>,
+        /// Leaf names inside `dir`.
         target: Vec<u8>,
         lock: Vec<u8>,
+        /// Full names below `root`.
+        target_rel: Vec<u8>,
+        lock_rel: Vec<u8>,
+        /// Parent directory below `root` and its identity when acquired,
+        /// for a nested lock.
+        parent: Option<(Vec<u8>, crate::fsx::FileId)>,
     },
 }
 
@@ -74,8 +98,6 @@ impl<'a> LockFile<'a> {
     /// `<rel>.lock` inside `anchor` without following symlinks (an existing
     /// entry of any kind yields [`Error::Locked`]); commit renames it over
     /// `rel` through the anchor. Elsewhere: the path form, unchanged.
-    // Adopted by WP1's call sites in this batch.
-    #[allow(dead_code)]
     pub(crate) fn acquire_at(anchor: &'a Anchor, rel: &[u8]) -> Result<Self, Error> {
         if rel.is_empty() || rel.ends_with(b"/") {
             return Err(Error::InvalidPath(rel.to_vec()));
@@ -100,16 +122,38 @@ impl<'a> LockFile<'a> {
                 Err(error) => return Err(error),
             };
             let identity = Identity::of_file(&file)?;
-            let lock = Self {
+            let mut lock_rel = rel.to_vec();
+            lock_rel.extend_from_slice(b".lock");
+            let mut lock = Self {
                 location: Location::Anchored {
+                    root: anchor,
                     dir,
                     target: leaf.to_vec(),
                     lock,
+                    target_rel: rel.to_vec(),
+                    lock_rel,
+                    parent: None,
                 },
                 file: Some(file),
                 identity,
                 released: false,
             };
+            // Record the parent's identity as reached from the root, and
+            // confirm that it is the held directory: our new lock is visible
+            // through it. Otherwise refuse (Drop removes our lock by handle).
+            if let Some(slash) = rel.iter().rposition(|&byte| byte == b'/') {
+                let parent_rel = rel[..slash].to_vec();
+                let parent_id = match anchor.lstat(&parent_rel)? {
+                    Some(meta) if meta.kind == crate::fsx::Kind::Dir => meta.id,
+                    _ => return Err(Error::Locked(lock.lock_display())),
+                };
+                if !lock.lock_reachable_from_root() {
+                    return Err(Error::Locked(lock.lock_display()));
+                }
+                if let Location::Anchored { parent, .. } = &mut lock.location {
+                    *parent = Some((parent_rel, parent_id));
+                }
+            }
             super::failpoint("lock.acquired")?;
             Ok(lock)
         }
@@ -124,7 +168,8 @@ impl<'a> LockFile<'a> {
 
     /// Path form: create `<target>.lock` with `O_CREAT|O_EXCL`; an existing
     /// lock (or any entry, including a symlink, at that path) yields
-    /// [`Error::Locked`].
+    /// [`Error::Locked`]. On Unix it is unused once every caller is anchored.
+    #[cfg_attr(unix, allow(dead_code))]
     pub(crate) fn acquire(target: &Path) -> Result<Self, Error> {
         let mut lock_name = target
             .file_name()
@@ -174,9 +219,15 @@ impl<'a> LockFile<'a> {
     /// Flush and sync the lock content, rename it over the target, then sync
     /// the containing directory where the platform supports it.
     ///
-    /// An error returned after the rename (directory sync) means the new
-    /// content is already visible but its durability is unknown; callers must
-    /// not report that as "unchanged".
+    /// Errors (anchored form): before the rename, any error (including
+    /// [`Error::Locked`] when the lock or its parent is no longer the one
+    /// reached from the root) means nothing was published. After the rename,
+    /// the error is a post-publication type (see [`after_publication`]):
+    /// [`LockPublishedUnsyncedError`] (visible, durability unknown) or
+    /// [`LockPublishedUnreachableError`] (renamed inside the held directory,
+    /// which the root no longer reaches at that name; state uncertain).
+    /// Nothing is ever rolled back. The path form keeps its pre-hardening
+    /// errors: an error after its rename is returned as is.
     pub(crate) fn commit(mut self) -> Result<(), Error> {
         let file = self.file.as_mut().ok_or(Error::Injected("lock reused"))?;
         file.flush()?;
@@ -190,15 +241,40 @@ impl<'a> LockFile<'a> {
             drop(self.file.take());
             return Err(Error::Locked(self.lock_display()));
         }
+        // Descriptor-root identity: the held parent must still be the
+        // directory a reader reaches from the root. Refused before the rename
+        // (not released, so Drop removes our lock from the held directory).
+        if !self.parent_reachable_from_root() {
+            return Err(Error::Locked(self.lock_display()));
+        }
         match &self.location {
-            Location::Anchored { dir, target, lock } => {
+            Location::Anchored {
+                root,
+                dir,
+                target,
+                lock,
+                target_rel,
+                ..
+            } => {
                 // The descriptor stays open across the rename; the rename and
                 // the sync act on the held parent directory.
+                let target_display = display(root, target_rel);
                 dir.get().rename_replace(lock, target)?;
                 self.released = true;
                 drop(self.file.take());
-                super::failpoint("lock.after-rename")?;
-                dir.get().sync()
+                #[cfg(test)]
+                tests::after_rename_hook();
+                // Published inside the held directory; is it reachable at the
+                // name from the root?
+                let observed = root.lstat(target_rel).ok().flatten();
+                if observed.and_then(|meta| Identity::of_id(meta.id)) != Some(self.identity) {
+                    return Err(Error::Other(Box::new(LockPublishedUnreachableError {
+                        target: target_display,
+                        observed: observed.map(|meta| (meta.id.volume, meta.id.index)),
+                    })));
+                }
+                let synced = super::failpoint("lock.after-rename").and_then(|()| dir.get().sync());
+                synced.map_err(|source| unsynced(target_display, source))
             }
             Location::Path { target, lock_path } => {
                 // Windows cannot rename a file this process holds open
@@ -209,9 +285,11 @@ impl<'a> LockFile<'a> {
                 std::fs::rename(lock_path, target)?;
                 self.released = true;
                 drop(self.file.take());
-                // The handle was closed before the rename, so check what the
-                // rename published (detects some replacement outcomes only;
-                // see `RenameOutcomeUncertainError`).
+                // The path form keeps its pre-hardening errors except for
+                // this Windows check: the handle was closed before the
+                // rename, so check what the rename published (detects some
+                // replacement outcomes only; see
+                // `RenameOutcomeUncertainError`).
                 #[cfg(windows)]
                 {
                     super::failpoint("lock.renamed-unverified")?;
@@ -223,11 +301,39 @@ impl<'a> LockFile<'a> {
         }
     }
 
+    /// Whether our lock is visible at its full name from the root anchor
+    /// (anchored form; always true for a lock directly below the root).
+    fn lock_reachable_from_root(&self) -> bool {
+        match &self.location {
+            Location::Anchored { root, lock_rel, .. } => root.lstat(lock_rel).is_ok_and(|meta| {
+                meta.is_some_and(|meta| Identity::of_id(meta.id) == Some(self.identity))
+            }),
+            Location::Path { .. } => true,
+        }
+    }
+
+    /// Whether the root still reaches the held parent: the parent entry is
+    /// the directory recorded at acquire, and our lock is visible through it.
+    fn parent_reachable_from_root(&self) -> bool {
+        match &self.location {
+            Location::Anchored {
+                root,
+                parent: Some((parent_rel, parent_id)),
+                ..
+            } => {
+                root.lstat(parent_rel).is_ok_and(|meta| {
+                    meta.is_some_and(|meta| {
+                        meta.kind == crate::fsx::Kind::Dir && meta.id == *parent_id
+                    })
+                }) && self.lock_reachable_from_root()
+            }
+            _ => true,
+        }
+    }
+
     /// Identity of the lock file this writer created, read (`fstat`) from its
     /// held descriptor. Used to re-validate a guard lock that is never renamed
     /// (`HEAD.lock` while a branch is updated) against an anchored `lstat`.
-    // Used by the anchored reference writer (PWR-194).
-    #[allow(dead_code)]
     pub(crate) fn held_id(&self) -> Result<crate::fsx::FileId, Error> {
         crate::fsx::file_id(self.file.as_ref().ok_or(Error::Injected("lock reused"))?)
     }
@@ -272,6 +378,95 @@ impl Drop for LockFile<'_> {
         }
     }
 }
+
+fn unsynced(target: PathBuf, source: Error) -> Error {
+    Error::Other(Box::new(LockPublishedUnsyncedError { target, source }))
+}
+
+/// Whether an error from [`LockFile::commit`] happened after the rename, so
+/// the new content may be visible (never report it as "unchanged").
+// Mapped by the anchored reference writer (WP1, refs.rs).
+#[allow(dead_code)]
+pub(crate) fn after_publication(error: &Error) -> bool {
+    matches!(error, Error::Other(error)
+        if error.is::<LockPublishedUnsyncedError>()
+            || error.is::<LockPublishedUnreachableError>()
+            || error.is::<RenameOutcomeUncertainError>())
+}
+
+/// The lock was renamed over its target, but a later step failed (the
+/// directory sync, or an injected failure at `lock.after-rename`): the new
+/// content is visible and its durability is unknown. Returned inside
+/// [`Error::Other`].
+#[derive(Debug)]
+pub struct LockPublishedUnsyncedError {
+    target: PathBuf,
+    source: Error,
+}
+
+impl LockPublishedUnsyncedError {
+    /// The target that now holds the new content (diagnostic path).
+    pub fn target(&self) -> &Path {
+        &self.target
+    }
+}
+
+impl std::fmt::Display for LockPublishedUnsyncedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} was published, but a step after the rename failed ({}); its durability is unknown",
+            self.target.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for LockPublishedUnsyncedError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// The lock was renamed over its target inside the held parent directory,
+/// but afterwards the root anchor does not reach our file at the target's
+/// name: the parent was moved or replaced, or another writer replaced the
+/// target after us. The content was published inside the original directory,
+/// which may no longer be reachable at that name; the outcome is uncertain,
+/// not "unchanged", and nothing is rolled back. Returned inside
+/// [`Error::Other`].
+#[derive(Debug)]
+pub struct LockPublishedUnreachableError {
+    target: PathBuf,
+    /// `(volume, index)` of what the root reaches at the target's name.
+    observed: Option<(u64, u128)>,
+}
+
+impl LockPublishedUnreachableError {
+    /// The target's name below the root anchor (diagnostic path).
+    pub fn target(&self) -> &Path {
+        &self.target
+    }
+
+    /// Identity of the entry the root reaches at the target's name, if any.
+    pub fn observed(&self) -> Option<(u64, u128)> {
+        self.observed
+    }
+}
+
+impl std::fmt::Display for LockPublishedUnreachableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "renamed the lock over {} inside its original directory, but that name no \
+             longer reaches the published file (the directory was moved or replaced, or \
+             another writer replaced the target); the outcome is uncertain",
+            self.target.display()
+        )
+    }
+}
+
+impl std::error::Error for LockPublishedUnreachableError {}
 
 /// Diagnostic path of `rel` below `anchor`; never used for I/O.
 fn display(anchor: &Anchor, rel: &[u8]) -> PathBuf {
@@ -490,6 +685,18 @@ pub(crate) fn sync_parent(path: &Path) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Runs once, between the anchored rename and the reachability check.
+        static AFTER_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            std::cell::RefCell::new(None);
+    }
+
+    pub(super) fn after_rename_hook() {
+        if let Some(hook) = AFTER_RENAME.with(|cell| cell.borrow_mut().take()) {
+            hook();
+        }
+    }
 
     fn scratch(name: &str) -> Result<PathBuf, Error> {
         let dir = std::env::temp_dir().join(format!("rgit-{name}-{}", std::process::id()));
@@ -716,14 +923,15 @@ mod tests {
         Ok(entries)
     }
 
-    /// Retained parent anchor: after acquire, the lock's parent `refs/heads`
-    /// is renamed away and a decoy `refs/heads` (holding a foreign
-    /// `main.lock`) takes its place. The decoy and the foreign lock are never
-    /// touched. With the anchored backend every operation runs on the held
-    /// (original) parent, so commit publishes there and drop removes our lock
-    /// there; the legacy path backend re-resolves by name, sees the foreign
-    /// lock and refuses. Re-traversing the parent by name under the anchored
-    /// backend fails this test (it refuses instead of publishing).
+    /// Retained parent anchor and descriptor-root identity: after acquire,
+    /// the lock's parent `refs/heads` is renamed away and a decoy
+    /// `refs/heads` (holding a foreign `main.lock`) takes its place. The decoy
+    /// and the foreign lock are never touched and nothing is published. With
+    /// the anchored backend, commit refuses because the root no longer
+    /// reaches the held parent, and our lock is removed from the held
+    /// (original) directory, so the writer leaves nothing of its own behind;
+    /// drop also removes it there. The legacy path backend re-resolves by
+    /// name, sees the foreign lock and refuses without touching it.
     #[cfg(unix)]
     #[test]
     fn anchored_lock_retains_its_parent_directory() -> Result<(), Error> {
@@ -754,14 +962,10 @@ mod tests {
         let decoy = swap()?;
         let result = lock.commit();
         assert_eq!(tree(&heads)?, decoy, "decoy parent touched by commit");
-        if anchored {
-            result?;
-            assert_eq!(std::fs::read(original.join("main"))?, b"new");
-            assert!(!original.join("main.lock").exists());
-        } else {
-            assert!(matches!(result, Err(Error::Locked(_))), "{result:?}");
-            assert_eq!(std::fs::read(original.join("main"))?, b"old");
-        }
+        assert!(matches!(result, Err(Error::Locked(_))), "{result:?}");
+        assert_eq!(std::fs::read(original.join("main"))?, b"old");
+        // The anchored writer removes its own lock from the held directory.
+        assert_eq!(original.join("main.lock").exists(), !anchored);
         restore()?;
 
         // Drop after the swap.
@@ -772,5 +976,69 @@ mod tests {
         assert_eq!(original.join("main.lock").exists(), !anchored);
         std::fs::remove_dir_all(&dir)?;
         Ok(())
+    }
+
+    /// Post-rename descriptor-root check: the parent is swapped exactly
+    /// between the rename and the check (test hook). The content was renamed
+    /// inside the original directory; the root no longer reaches it at the
+    /// name, so commit reports `LockPublishedUnreachableError` (uncertain,
+    /// post-publication), the decoy is untouched and nothing is rolled back.
+    #[cfg(unix)]
+    #[test]
+    fn anchored_lock_reports_publication_the_root_cannot_reach() -> Result<(), Error> {
+        use crate::fsx::Root;
+        let dir = scratch("lock-unreachable")?;
+        let heads = dir.join("refs/heads");
+        let original = dir.join("refs/heads-original");
+        std::fs::create_dir_all(&heads)?;
+        std::fs::write(heads.join("main"), b"old")?;
+        let anchor = Anchor::open(&dir, Root::GitDir)?;
+
+        let mut lock = LockFile::acquire_at(&anchor, b"refs/heads/main")?;
+        lock.write_all(b"new")?;
+        let (swap_heads, swap_original) = (heads.clone(), original.clone());
+        AFTER_RENAME.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(move || {
+                let swapped = std::fs::rename(&swap_heads, &swap_original)
+                    .and_then(|()| std::fs::create_dir(&swap_heads))
+                    .and_then(|()| std::fs::write(swap_heads.join("main"), b"decoy"));
+                assert!(swapped.is_ok(), "{swapped:?}");
+            }));
+        });
+        let decoy_before = || tree(&heads);
+        let result = lock.commit();
+        let error = match result {
+            Err(error) => error,
+            Ok(()) => panic!("an unreachable publication was reported as success"),
+        };
+        assert!(after_publication(&error), "{error:?}");
+        match &error {
+            Error::Other(inner) => {
+                let typed = inner
+                    .downcast_ref::<LockPublishedUnreachableError>()
+                    .ok_or(Error::Injected("type"))?;
+                assert!(typed.observed().is_some());
+                assert!(inner.to_string().contains("uncertain"));
+            }
+            other => panic!("expected a typed post-publication error, got {other:?}"),
+        }
+        // Published in the original directory; the decoy keeps its content.
+        assert_eq!(std::fs::read(original.join("main"))?, b"new");
+        assert!(!original.join("main.lock").exists());
+        assert_eq!(std::fs::read(heads.join("main"))?, b"decoy");
+        assert_eq!(decoy_before()?.len(), 1);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// Pre-rename errors are never classified as post-publication.
+    #[test]
+    fn only_post_rename_errors_are_after_publication() {
+        assert!(!after_publication(&Error::Locked(PathBuf::from("x.lock"))));
+        assert!(!after_publication(&Error::Injected("lock.before-rename")));
+        assert!(after_publication(&unsynced(
+            PathBuf::from("x"),
+            Error::Injected("lock.after-rename")
+        )));
     }
 }
