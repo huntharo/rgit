@@ -213,7 +213,10 @@ impl<'a> LockFile<'a> {
                 // rename published (detects some replacement outcomes only;
                 // see `RenameOutcomeUncertainError`).
                 #[cfg(windows)]
-                observe_after_rename(target, self.identity)?;
+                {
+                    super::failpoint("lock.renamed-unverified")?;
+                    observe_after_rename(target, self.identity)?;
+                }
                 super::failpoint("lock.after-rename")?;
                 sync_parent(target)
             }
@@ -425,8 +428,6 @@ pub struct RenameOutcomeUncertainError {
     content: Option<(Vec<u8>, u64)>,
 }
 
-// Reachable once write/mod.rs re-exports this type (integration owner).
-#[allow(dead_code)]
 impl RenameOutcomeUncertainError {
     pub fn target(&self) -> &Path {
         &self.target
