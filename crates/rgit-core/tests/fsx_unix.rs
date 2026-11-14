@@ -78,13 +78,24 @@ fn child_action() -> Result {
         return Ok(());
     };
     let scenario = scenario.to_string_lossy().into_owned();
-    let repo = Repository::discover(PathBuf::from(path))?;
+    let repo = match Repository::discover(PathBuf::from(path)) {
+        Ok(repo) => repo,
+        Err(error) => {
+            println!("RESULT error {error}");
+            return Ok(());
+        }
+    };
     let result = if let Some(spec) = scenario.strip_prefix("add:") {
         repo.add(&[BStr::new(spec)]).map(drop)
     } else if scenario == "write-blob" {
         repo.write_blob(BLOB).map(drop)
     } else if scenario == "update-ref" {
-        let head = repo.resolve(BStr::new("HEAD"))?;
+        // The commit to publish is passed in by the test (resolving it here
+        // could itself read the object store under test).
+        let head = std::env::var("RGIT_TEST_NEW")
+            .ok()
+            .and_then(|hex| rgit_core::ObjectId::from_hex(hex.as_bytes()).ok())
+            .ok_or("RGIT_TEST_NEW unset")?;
         repo.update_ref(&RefUpdate {
             name: b"refs/heads/topic".to_vec(),
             new: head,
@@ -127,6 +138,12 @@ fn start(pause: Option<&str>, scenario: &str, repo: &Path) -> Result<Child> {
         .args(["--exact", "child_action", "--nocapture", "--test-threads=1"])
         .env("RGIT_TEST_SCENARIO", scenario)
         .env("RGIT_TEST_PATH", repo)
+        .env(
+            "RGIT_TEST_NEW",
+            fs::read_to_string(repo.join(".git/refs/heads/master"))
+                .unwrap_or_default()
+                .trim(),
+        )
         .env_remove("RGIT_FAILPOINT")
         .stdout(std::process::Stdio::piped());
     if let Some(point) = pause {
@@ -535,6 +552,153 @@ fn an_index_swapped_for_a_fifo_never_blocks() -> Result {
         }
         assert!(!repo.join(".git/index.lock").exists());
         assert!(!repo.join(".git/refs/heads/master").exists());
+    }
+    Ok(())
+}
+
+fn rev_parse(repo: &Path, revision: &str) -> Result<String> {
+    Ok(
+        String::from_utf8(git(repo, &["rev-parse", revision])?.stdout)?
+            .trim()
+            .to_owned(),
+    )
+}
+
+fn swap_for_fifo(path: &Path) -> Result {
+    let mut permissions = fs::metadata(path)?.permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    fs::remove_file(path)?;
+    mkfifo(path)
+}
+
+fn loose_path(repo: &Path, id: &str) -> PathBuf {
+    repo.join(".git/objects").join(&id[..2]).join(&id[2..])
+}
+
+/// A loose object a write path reads (an index blob for a root commit, the
+/// parent commit, the commit an update_ref publishes) is swapped for a FIFO
+/// after rgit's anchored existence check and before its read: the read is
+/// refused within a bounded wait and nothing is published.
+#[test]
+fn loose_objects_swapped_for_fifos_are_refused_without_blocking() -> Result {
+    for format in FORMATS {
+        // (a) Root commit: the staged blob.
+        let temp = tempfile::tempdir()?;
+        let repo = temp.path().join("repo");
+        init(&repo, &options(format))?;
+        fs::write(repo.join("file"), b"content\n")?;
+        Repository::discover(&repo)?.add(&[BStr::new("file")])?;
+        let blob = hash(&repo, b"content\n", temp.path())?;
+        let child = start(Some("object.before-read"), "commit", &repo)?;
+        swap_for_fifo(&loose_path(&repo, &blob))?;
+        let result = child.finish()?;
+        assert!(
+            result.contains("special loose object file"),
+            "{format:?} blob: {result}"
+        );
+        assert!(!repo.join(".git/refs/heads/master").exists());
+
+        // (b) Commit on a branch: the parent commit; (c) update_ref: the new
+        // commit it names.
+        for (scenario, reference) in [("commit", "master"), ("update-ref", "topic")] {
+            let temp = tempfile::tempdir()?;
+            let repo = temp.path().join("repo");
+            init(&repo, &options(format))?;
+            git(&repo, &["config", "maintenance.auto", "false"])?;
+            fs::write(repo.join("base"), b"base\n")?;
+            git(&repo, &["add", "base"])?;
+            git(&repo, &["commit", "-q", "-m", "base"])?;
+            let head = rev_parse(&repo, "HEAD")?;
+            let child = start(Some("object.before-read"), scenario, &repo)?;
+            swap_for_fifo(&loose_path(&repo, &head))?;
+            let result = child.finish()?;
+            assert!(
+                result.contains("special loose object file"),
+                "{format:?} {scenario}: {result}"
+            );
+            let published = fs::read(repo.join(".git/refs/heads").join(reference)).ok();
+            if reference == "master" {
+                assert_eq!(published, Some(format!("{head}\n").into_bytes()));
+            } else {
+                assert_eq!(published, None);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A pack index replaced by a FIFO, or a symlinked alternates file, is
+/// refused by the anchored object-store check before Gitoxide opens anything
+/// by path: add, commit and update_ref refuse instead of blocking.
+#[test]
+fn special_pack_files_and_alternates_are_refused_before_use() -> Result {
+    for format in FORMATS {
+        for broken in ["idx", "alternates"] {
+            let temp = tempfile::tempdir()?;
+            let repo = temp.path().join("repo");
+            init(&repo, &options(format))?;
+            git(&repo, &["config", "maintenance.auto", "false"])?;
+            fs::write(repo.join("base"), b"base\n")?;
+            git(&repo, &["add", "base"])?;
+            git(&repo, &["commit", "-q", "-m", "base"])?;
+            git(&repo, &["repack", "-a", "-d", "-q"])?;
+            fs::write(repo.join("next"), b"next\n")?;
+            if broken == "idx" {
+                let pack = repo.join(".git/objects/pack");
+                let idx = fs::read_dir(&pack)?
+                    .map(|entry| entry.map(|entry| entry.path()))
+                    .collect::<std::io::Result<Vec<_>>>()?
+                    .into_iter()
+                    .find(|path| path.extension().is_some_and(|ext| ext == "idx"))
+                    .ok_or("no pack index")?;
+                swap_for_fifo(&idx)?;
+            } else {
+                let outside = temp.path().join("alternates");
+                fs::write(&outside, b"/nonexistent\n")?;
+                fs::create_dir_all(repo.join(".git/objects/info"))?;
+                symlink(&outside, repo.join(".git/objects/info/alternates"))?;
+            }
+            for scenario in ["add:next", "commit", "update-ref"] {
+                let result = start(None, scenario, &repo)?.finish()?;
+                assert!(
+                    result.contains("special pack or alternates file"),
+                    "{format:?} {broken} {scenario}: {result}"
+                );
+            }
+            assert!(!repo.join(".git/refs/heads/topic").exists());
+        }
+    }
+    Ok(())
+}
+
+/// A staged blob's loose file is swapped, after rgit's anchored existence
+/// check, for a symlink to an outside copy of the very same object: the
+/// object is never read through the link, so the commit is refused.
+#[test]
+fn loose_objects_swapped_for_symlinks_are_never_read_through() -> Result {
+    for format in FORMATS {
+        let temp = tempfile::tempdir()?;
+        let repo = temp.path().join("repo");
+        init(&repo, &options(format))?;
+        fs::write(repo.join("file"), b"content\n")?;
+        Repository::discover(&repo)?.add(&[BStr::new("file")])?;
+        let blob = hash(&repo, b"content\n", temp.path())?;
+        let object = loose_path(&repo, &blob);
+        let outside = temp.path().join("outside-object");
+        fs::copy(&object, &outside)?;
+        let before = (fs::read(&outside)?, fs::metadata(&outside)?.ino());
+        let child = start(Some("object.before-read"), "commit", &repo)?;
+        swap_for_fifo(&object)?;
+        fs::remove_file(&object)?;
+        symlink(&outside, &object)?;
+        let result = child.finish()?;
+        assert!(
+            result.contains("special loose object file"),
+            "{format:?}: {result}"
+        );
+        assert!(!repo.join(".git/refs/heads/master").exists());
+        assert_eq!((fs::read(&outside)?, fs::metadata(&outside)?.ino()), before);
     }
     Ok(())
 }

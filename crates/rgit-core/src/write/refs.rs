@@ -82,6 +82,7 @@ impl Repository {
     /// [`RefPublishedUnsyncedError`] for failures around publication.
     pub fn update_ref(&self, update: &RefUpdate) -> Result<(), Error> {
         let anchors = RefAnchors::open(self)?;
+        super::object::check_object_store(&anchors.common)?;
         self.publish_ref(
             &anchors,
             update,
@@ -119,9 +120,9 @@ impl Repository {
         self.check_object_id(update.new)?;
         // Objects before names: refuse before taking any lock.
         if update.name == b"HEAD" || update.name.starts_with(b"refs/heads/") {
-            self.require_kind(update.new, ObjectKind::Commit)?;
+            self.require_kind(anchors, update.new, ObjectKind::Commit)?;
         } else {
-            self.require_present(update.new)?;
+            self.require_present(anchors, update.new)?;
         }
         // The object may have been written by someone who did not sync it.
         self.sync_loose_object(anchors, update.new)?;
@@ -393,8 +394,19 @@ impl Repository {
         Ok(())
     }
 
-    pub(super) fn require_present(&self, id: ObjectId) -> Result<(), Error> {
+    /// `id` exists: a loose copy is found through the objects anchor (no
+    /// path lookup); otherwise the packed store is asked, after the anchored
+    /// pack check.
+    pub(super) fn require_present(&self, anchors: &RefAnchors, id: ObjectId) -> Result<(), Error> {
         use gix::objs::Exists;
+        let objects = anchors.common.sub(b"objects")?;
+        let hex = id.to_hex().to_string();
+        let loose = format!("{}/{}", &hex[..2], &hex[2..]);
+        if matches!(objects.lstat(loose.as_bytes())?, Some(meta) if matches!(meta.kind, Kind::File { .. }))
+        {
+            return Ok(());
+        }
+        super::object::check_object_store(&anchors.common)?;
         // Ask the object store directly: `Repository::has_object` reports the
         // empty tree as present even when it is not stored.
         if self.inner.objects.exists(&id) {
@@ -404,9 +416,23 @@ impl Repository {
         }
     }
 
-    pub(super) fn require_kind(&self, id: ObjectId, expected: ObjectKind) -> Result<(), Error> {
-        self.require_present(id)?;
-        let actual = self.inner.find_header(id)?.kind();
+    /// The kind of `id` is `expected`. A loose object's header is read only
+    /// through the objects anchor (no-follow, non-blocking); a packed one is
+    /// read by Gitoxide after the anchored pack check.
+    pub(super) fn require_kind(
+        &self,
+        anchors: &RefAnchors,
+        id: ObjectId,
+        expected: ObjectKind,
+    ) -> Result<(), Error> {
+        let objects = anchors.common.sub(b"objects")?;
+        let actual = match super::object::loose_header(&objects, &id)? {
+            Some((kind, _)) => kind,
+            None => {
+                self.require_present(anchors, id)?;
+                self.inner.find_header(id)?.kind()
+            }
+        };
         if actual != expected {
             return Err(Error::UnexpectedKind { expected, actual });
         }

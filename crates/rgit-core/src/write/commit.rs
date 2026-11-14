@@ -68,15 +68,16 @@ impl Repository {
     /// refused, and each blob must be present ([`Error::MissingObject`]).
     pub fn write_tree_from_index(&self) -> Result<ObjectId, Error> {
         let anchors = RefAnchors::open(self)?;
-        let plan = self.plan_tree_from_index(&anchors.git)?;
+        super::object::check_object_store(&anchors.common)?;
+        let plan = self.plan_tree_from_index(&anchors)?;
         self.write_planned_trees(&anchors.common, &plan)?;
         Ok(plan.root)
     }
 
     /// Validate the index and compute every tree object in memory, without
     /// writing anything.
-    fn plan_tree_from_index(&self, git: &Anchor) -> Result<TreePlan, Error> {
-        let index = self.read_index_anchored(git)?;
+    fn plan_tree_from_index(&self, anchors: &RefAnchors) -> Result<TreePlan, Error> {
+        let index = self.read_index_anchored(&anchors.git)?;
         let hash = self.inner.object_hash();
         if index.entries().iter().any(|entry| entry.stage_raw() != 0) {
             return Err(Error::UnmergedIndex);
@@ -84,7 +85,7 @@ impl Repository {
         let mut files = Vec::with_capacity(index.entries().len());
         for entry in index.entries() {
             check_index_entry(entry, hash)?;
-            self.require_kind(entry.id, ObjectKind::Blob)?;
+            self.require_kind(anchors, entry.id, ObjectKind::Blob)?;
             files.push((entry.path(&index), entry.mode.bits(), entry.id));
         }
         self.plan_trees(&files)
@@ -117,6 +118,7 @@ impl Repository {
         // Both Git directory roots are opened before any read that decides
         // the commit and before the first object write.
         let anchors = RefAnchors::open(self)?;
+        super::object::check_object_store(&anchors.common)?;
         self.refuse_in_progress(&anchors.git)?;
         self.refuse_unsupported_commit_config()?;
 
@@ -148,15 +150,12 @@ impl Repository {
             }
         };
         let parent_tree = match parent {
-            Some(id) => {
-                self.require_kind(id, ObjectKind::Commit)?;
-                Some(self.inner.find_object(id)?.try_to_commit_ref()?.tree())
-            }
+            Some(id) => Some(self.parent_tree(&anchors, id)?),
             None => None,
         };
 
         // Decide on an in-memory tree so a refusal writes nothing.
-        let plan = self.plan_tree_from_index(&anchors.git)?;
+        let plan = self.plan_tree_from_index(&anchors)?;
         let tree = plan.root;
         if !request.allow_empty && parent_tree.unwrap_or_else(|| ObjectId::empty_tree(hash)) == tree
         {
@@ -218,6 +217,26 @@ impl Repository {
             reference,
             parent,
         })
+    }
+
+    /// The tree of commit `id`: a loose commit is read and verified only
+    /// through the objects anchor; a packed one through Gitoxide after the
+    /// anchored pack check.
+    fn parent_tree(&self, anchors: &RefAnchors, id: ObjectId) -> Result<ObjectId, Error> {
+        let objects = anchors.common.sub(b"objects")?;
+        match super::object::read_loose(&objects, &id)? {
+            Some((ObjectKind::Commit, data)) => {
+                Ok(gix::objs::CommitRef::from_bytes(&data, self.inner.object_hash())?.tree())
+            }
+            Some((actual, _)) => Err(Error::UnexpectedKind {
+                expected: ObjectKind::Commit,
+                actual,
+            }),
+            None => {
+                self.require_kind(anchors, id, ObjectKind::Commit)?;
+                Ok(self.inner.find_object(id)?.try_to_commit_ref()?.tree())
+            }
+        }
     }
 
     fn refuse_in_progress(&self, git: &Anchor) -> Result<(), Error> {

@@ -203,6 +203,7 @@ impl Repository {
             git: self.git_dir_anchor()?,
             common: self.common_anchor()?,
         };
+        super::object::check_object_store(&anchors.common)?;
         // The in-progress markers Gitoxide's `Repository::state` looks for,
         // checked through the Git directory anchor (no path lookups).
         for marker in [

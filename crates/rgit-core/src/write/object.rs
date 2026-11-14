@@ -9,6 +9,16 @@
 //! directory is synced before returning, so an object is durable before any
 //! index or reference names it. An entry already present under the object's
 //! name counts as the object only after its content is inflated and hashed.
+//!
+//! Reads on write paths: a loose object is opened only through the objects
+//! anchor (no-follow, non-blocking, regular files only), so a loose file
+//! swapped for a FIFO or symlink is refused rather than waited on or
+//! followed. Packed objects and alternates are still read by Gitoxide, by
+//! path, after [`check_object_store`] verified through the anchor that every
+//! pack, index, reverse index, mtimes and multi-pack-index entry and
+//! `objects/info/alternates` is a regular file: packs and alternates are
+//! opened by Gitoxide by path after an anchored kind check, and a swap after
+//! that check is not covered.
 
 use std::fs::File;
 use std::io::Write;
@@ -32,7 +42,9 @@ impl Repository {
         kind: ObjectKind,
         data: &[u8],
     ) -> Result<ObjectId, Error> {
-        self.write_loose_object_at(&self.common_anchor()?, kind, data)
+        let common = self.common_anchor()?;
+        check_object_store(&common)?;
+        self.write_loose_object_at(&common, kind, data)
     }
 
     /// [`Self::write_loose_object`] relative to an already opened common
@@ -153,6 +165,138 @@ fn sync_read_only(file: &File) -> Result<(), Error> {
     #[cfg(not(unix))]
     let _ = file;
     Ok(())
+}
+
+/// Largest loose object a write path reads fully into memory (commits,
+/// trees); larger objects are refused rather than buffered.
+const LOOSE_READ_LIMIT: u64 = 64 * 1024 * 1024;
+
+/// Open the loose copy of `id` below `objects`, or `None` if there is none
+/// (it may be packed). The entry must be a regular file, both on the no-follow
+/// `lstat` and on the opened (non-blocking) handle.
+fn open_loose(objects: &Anchor, id: &ObjectId) -> Result<Option<File>, Error> {
+    let special = || Error::UnsupportedCapability("symlink or special loose object file");
+    let rel = loose_rel(id);
+    match objects.lstat(&rel)? {
+        None => return Ok(None),
+        Some(meta) if matches!(meta.kind, Kind::File { .. }) => {}
+        Some(_) => return Err(special()),
+    }
+    super::failpoint("object.before-read")?;
+    match objects.open_read(&rel) {
+        Ok((file, _)) => Ok(Some(file)),
+        Err(Error::UnsupportedCapability(_)) => Err(special()),
+        // Swapped meanwhile: removed (for example packed by gc) is looked up
+        // as packed; a symlink (ELOOP) or other non-file is refused.
+        Err(error) => match objects.lstat(&rel)? {
+            None => Ok(None),
+            Some(meta) if !matches!(meta.kind, Kind::File { .. }) => Err(special()),
+            Some(_) => Err(error),
+        },
+    }
+}
+
+fn corrupt_loose() -> Error {
+    gix::error::corruption("a loose object file is not a valid object")
+        .corrupted_error()
+        .into()
+}
+
+/// Kind and size of the loose copy of `id`, from its header only (as
+/// Gitoxide's `find_header` does), or `None` if it is not loose.
+pub(super) fn loose_header(
+    objects: &Anchor,
+    id: &ObjectId,
+) -> Result<Option<(ObjectKind, u64)>, Error> {
+    let Some(file) = open_loose(objects, id)? else {
+        return Ok(None);
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut state = gix::zlib::Decompress::new();
+    let mut head = [0u8; 64];
+    let read = gix::zlib::stream::inflate::read(&mut reader, &mut state, &mut head)
+        .map_err(|_| corrupt_loose())?;
+    let (kind, size, _) =
+        gix::objs::decode::loose_header(&head[..read]).map_err(|_| corrupt_loose())?;
+    Ok(Some((kind, size)))
+}
+
+/// The loose copy of `id` (kind and content), or `None` if it is not loose.
+/// It is inflated in a streaming fashion up to [`LOOSE_READ_LIMIT`] and must
+/// hash to `id`.
+pub(super) fn read_loose(
+    objects: &Anchor,
+    id: &ObjectId,
+) -> Result<Option<(ObjectKind, Vec<u8>)>, Error> {
+    let Some(file) = open_loose(objects, id)? else {
+        return Ok(None);
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut state = gix::zlib::Decompress::new();
+    let mut hasher = gix::hash::hasher(id.kind());
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut inflated: Vec<u8> = Vec::new();
+    let mut header: Option<(ObjectKind, u64, usize)> = None;
+    loop {
+        let written = gix::zlib::stream::inflate::read(&mut reader, &mut state, &mut chunk)
+            .map_err(|_| corrupt_loose())?;
+        if written == 0 {
+            break;
+        }
+        hasher.update(&chunk[..written]);
+        inflated.extend_from_slice(&chunk[..written]);
+        if header.is_none() && (inflated.contains(&0) || inflated.len() >= 64) {
+            let parsed = gix::objs::decode::loose_header(&inflated).map_err(|_| corrupt_loose())?;
+            if parsed.1 > LOOSE_READ_LIMIT {
+                return Err(Error::UnsupportedCapability(
+                    "loose object larger than the write-path read limit",
+                ));
+            }
+            header = Some(parsed);
+        }
+        if let Some((_, size, header_len)) = header
+            && inflated.len() as u64 > header_len as u64 + size
+        {
+            return Err(corrupt_loose());
+        }
+    }
+    let (kind, size, header_len) = header.ok_or_else(corrupt_loose)?;
+    if inflated.len() as u64 != header_len as u64 + size
+        || hasher.try_finalize().map_err(gix::Error::from_error)? != *id
+    {
+        return Err(corrupt_loose());
+    }
+    inflated.drain(..header_len);
+    Ok(Some((kind, inflated)))
+}
+
+/// Before Gitoxide reads the object database by path in a write operation,
+/// verify through the common-directory anchor that `objects/pack` is a real
+/// directory whose pack-related entries are regular files and that
+/// `objects/info/alternates` is a regular file if present. This narrows, but
+/// does not close, the window in which Gitoxide could open a swapped file.
+pub(crate) fn check_object_store(common: &Anchor) -> Result<(), Error> {
+    let special = || Error::UnsupportedCapability("symlink or special pack or alternates file");
+    match common.lstat(b"objects/pack")? {
+        None => {}
+        Some(meta) if meta.kind == Kind::Dir => {
+            for (name, kind) in common.read_dir(b"objects/pack")? {
+                let packed = [&b".idx"[..], b".pack", b".rev", b".mtimes"]
+                    .iter()
+                    .any(|suffix| name.ends_with(suffix))
+                    || name.starts_with(b"multi-pack-index");
+                if packed && !matches!(kind, Kind::File { .. }) {
+                    return Err(special());
+                }
+            }
+        }
+        Some(_) => return Err(special()),
+    }
+    match common.lstat(b"objects/info/alternates")? {
+        None => Ok(()),
+        Some(meta) if matches!(meta.kind, Kind::File { .. }) => Ok(()),
+        Some(_) => Err(special()),
+    }
 }
 
 /// Unique-per-process temporary names; `create_new` guarantees exclusivity.
