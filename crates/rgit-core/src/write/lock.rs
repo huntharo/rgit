@@ -24,6 +24,23 @@ pub(crate) struct LockFile {
 impl LockFile {
     /// Create `<target>.lock` with `O_CREAT|O_EXCL`; an existing lock (or any
     /// entry, including a symlink, at that path) yields [`Error::Locked`].
+    /// Anchored form (decision 0004): acquire `<rel>.lock` inside `anchor`.
+    /// Baseline delegates to the path form; WP2 replaces it with a
+    /// handle-relative implementation that keeps identity checks anchored.
+    #[allow(dead_code)]
+    pub(crate) fn acquire_at(anchor: &crate::fsx::Anchor, rel: &[u8]) -> Result<Self, Error> {
+        #[cfg(unix)]
+        let rel_path = {
+            use std::os::unix::ffi::OsStrExt;
+            std::path::PathBuf::from(std::ffi::OsStr::from_bytes(rel))
+        };
+        #[cfg(not(unix))]
+        let rel_path = std::path::PathBuf::from(
+            std::str::from_utf8(rel).map_err(|_| Error::InvalidPath(rel.to_vec()))?,
+        );
+        Self::acquire(&anchor.display_path().join(rel_path))
+    }
+
     pub(crate) fn acquire(target: &Path) -> Result<Self, Error> {
         let mut lock_name = target
             .file_name()
